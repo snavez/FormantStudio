@@ -623,10 +623,10 @@ class SpectrogramCanvas(FigureCanvas):
 
     def _setup_empty_axes(self):
         self.ax.set_facecolor("#1a1a2e")
-        self.ax.set_xlabel("Time (s)", color="#cccccc", fontsize=9)
-        self.ax.set_ylabel("Frequency (Hz)", color="#cccccc", fontsize=9)
-        self.ax.tick_params(colors="#999999", labelsize=8)
-        self.ax.set_title("Open a WAV file to begin", color="#cccccc", fontsize=11)
+        self.ax.set_xlabel("Time (s)", color="#eeeeee", fontsize=9)
+        self.ax.set_ylabel("Frequency (Hz)", color="#eeeeee", fontsize=9)
+        self.ax.tick_params(colors="#cccccc", labelsize=8)
+        self.ax.set_title("Open a WAV file to begin", color="#eeeeee", fontsize=11)
         self.fig.tight_layout()
         self.draw()
 
@@ -746,8 +746,8 @@ class SpectrogramCanvas(FigureCanvas):
 
         self.ax.set_xlim(self.view_start, self.view_end)
         self.ax.set_ylim(0, self.max_freq)
-        self.ax.set_ylabel("Frequency (Hz)", color="#cccccc", fontsize=9)
-        self.ax.tick_params(colors="#999999", labelsize=8)
+        self.ax.set_ylabel("Frequency (Hz)", color="#eeeeee", fontsize=9)
+        self.ax.tick_params(colors="#cccccc", labelsize=8)
         self.ax.set_facecolor("#1a1a2e")
 
         # Draw formants
@@ -759,7 +759,7 @@ class SpectrogramCanvas(FigureCanvas):
             self._draw_textgrid()
         else:
             # No tiers — spectrogram shows its own x-axis label
-            self.ax.set_xlabel("Time (s)", color="#cccccc", fontsize=9)
+            self.ax.set_xlabel("Time (s)", color="#eeeeee", fontsize=9)
 
         # Title with edit mode indicator
         title = os.path.basename(self._filepath) if hasattr(self, "_filepath") else ""
@@ -769,7 +769,7 @@ class SpectrogramCanvas(FigureCanvas):
             title += f"  |  EDIT MODE — Drawing {FORMANT_LABELS[fn]}"
             self.ax.set_title(title, color=color, fontsize=11, fontweight="bold")
         else:
-            self.ax.set_title(title, color="#cccccc", fontsize=11)
+            self.ax.set_title(title, color="#eeeeee", fontsize=11)
 
         if self.tier_axes:
             self.fig.subplots_adjust(
@@ -908,8 +908,15 @@ class SpectrogramCanvas(FigureCanvas):
             is_active = (self.edit_mode and f_idx == self.active_formant)
 
             if is_active:
-                # In edit mode for this formant: only show edited points
-                # so the user sees their corrections against the clean spectrogram
+                # In edit mode for this formant: show original track dimmed
+                # so the user can see where adjustments are needed
+                unedited_mask = valid & ~edited
+                if np.any(unedited_mask):
+                    self.ax.scatter(
+                        fd.times[unedited_mask], vals[unedited_mask],
+                        c=color, s=2, alpha=0.3, zorder=3,
+                    )
+                # Show edited points prominently
                 edited_valid = valid & edited
                 if np.any(edited_valid):
                     self.ax.scatter(
@@ -2166,7 +2173,7 @@ class MainWindow(QMainWindow):
             QMainWindow { background-color: #1e1e2e; }
             QMenuBar { background-color: #252535; color: #cccccc; }
             QMenuBar::item:selected { background-color: #445566; }
-            QStatusBar { background-color: #252535; color: #999999; }
+            QStatusBar { background-color: #252535; color: #dddddd; font-size: 13px; }
         """)
 
         self._filepath = None
