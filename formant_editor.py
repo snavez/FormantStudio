@@ -604,6 +604,10 @@ class SpectrogramCanvas(FigureCanvas):
         self._label_render_timer.setInterval(100)
         self._label_render_timer.timeout.connect(self._debounced_render)
 
+        # Overlay blit state (selection/boundary highlights without full render)
+        self._overlay_bg = None       # cached base content (no selection overlays)
+        self._overlay_artists = []    # current overlay artists (for cleanup)
+
         # Crosshair state
         self._crosshair_h = None  # horizontal line artist
         self._crosshair_v = None  # vertical line artist
@@ -615,8 +619,6 @@ class SpectrogramCanvas(FigureCanvas):
         self.mpl_connect("button_release_event", self._on_mouse_release)
         self.mpl_connect("motion_notify_event", self._on_mouse_move)
         self.mpl_connect("scroll_event", self._on_scroll)
-        self.mpl_connect("draw_event", self._on_draw_complete)
-
         self._setup_empty_axes()
 
     def _setup_empty_axes(self):
@@ -628,17 +630,6 @@ class SpectrogramCanvas(FigureCanvas):
         self.fig.tight_layout()
         self.draw()
 
-    def _on_draw_complete(self, event):
-        """Cache blit background after any canvas draw completes.
-
-        Never create artists here — that marks the figure dirty and can
-        trigger cascading redraws.  Crosshair artists are created in
-        render() before the draw call.
-        """
-        if self.spectrogram_data is None or self.ax is None:
-            return
-        if self._crosshair_h is not None:
-            self._crosshair_bg = self.fig.canvas.copy_from_bbox(self.ax.bbox)
 
     def load_sound(self, filepath):
         """Load audio and compute spectrogram."""
@@ -703,17 +694,8 @@ class SpectrogramCanvas(FigureCanvas):
         """Slot for debounce timers — just calls render()."""
         self.render()
 
-    def render(self, full=False):
-        """Full re-render of spectrogram + formants + TextGrid tiers.
-
-        Args:
-            full: If True, calls self.draw() synchronously and rebuilds
-                  crosshair/blit caches immediately. Needed when the caller
-                  does copy_from_bbox() right after, or on structural changes
-                  (new axes, file load). If False (default), calls
-                  self.draw_idle() for deferred non-blocking redraw;
-                  crosshair caches are rebuilt lazily via draw-event callback.
-        """
+    def render(self):
+        """Full re-render of spectrogram + formants + TextGrid tiers."""
         if self._playback_playing:
             self.stop_playback()
         self.ax.clear()
@@ -772,13 +754,6 @@ class SpectrogramCanvas(FigureCanvas):
         if self.show_formants and self.formant_data is not None:
             self._draw_formants()
 
-        # Draw time selection highlight (spectrogram)
-        if self._selection_start is not None and self._selection_end is not None:
-            self.ax.axvspan(
-                self._selection_start, self._selection_end,
-                color="#3366cc", alpha=0.25, zorder=5,
-            )
-
         # Draw TextGrid tiers
         if self.textgrid_data is not None and len(self.tier_axes) > 0:
             self._draw_textgrid()
@@ -817,14 +792,100 @@ class SpectrogramCanvas(FigureCanvas):
         )
         self._crosshair_visible = False
 
-        if full:
-            # Synchronous draw — caller needs blit caches immediately
-            self.draw()
-            self._crosshair_bg = self.fig.canvas.copy_from_bbox(self.ax.bbox)
-        else:
-            # Deferred draw — _on_draw_complete will cache the background
-            self._crosshair_bg = None
-            self.draw_idle()
+        self.draw()
+
+        # Cache base content for overlay blitting (before selection overlays)
+        self._overlay_bg = self.fig.canvas.copy_from_bbox(self.fig.bbox)
+
+        # Draw selection/boundary overlays on top via blitting
+        self._draw_selection_overlay()
+
+    def _draw_selection_overlay(self):
+        """Draw selection/boundary highlights via blitting over cached base.
+
+        This avoids a full render() for click interactions that only change
+        which interval/boundary/time-range is highlighted.
+        """
+        # Remove previous overlay artists
+        for a in self._overlay_artists:
+            a.remove()
+        self._overlay_artists = []
+
+        if self._overlay_bg is None:
+            return
+
+        self.fig.canvas.restore_region(self._overlay_bg)
+
+        # --- Time selection highlight (spectrogram + tier axes) ---
+        if self._selection_start is not None and self._selection_end is not None:
+            a = self.ax.axvspan(
+                self._selection_start, self._selection_end,
+                color="#3366cc", alpha=0.25, zorder=5,
+            )
+            self._overlay_artists.append(a)
+            for tier_ax in self.tier_axes:
+                a = tier_ax.axvspan(
+                    self._selection_start, self._selection_end,
+                    color="#3366cc", alpha=0.15, zorder=0,
+                )
+                self._overlay_artists.append(a)
+
+        # --- Selected interval highlight ---
+        if self._selected_interval is not None:
+            sel_tier_idx, sel_i = self._selected_interval
+            if (self.textgrid_data is not None
+                    and 0 <= sel_tier_idx < len(self.textgrid_data.tiers)):
+                tier = self.textgrid_data.tiers[sel_tier_idx]
+                if (tier.tier_class == "IntervalTier"
+                        and sel_i < len(tier.intervals)):
+                    iv = tier.intervals[sel_i]
+                    if sel_tier_idx < len(self.tier_axes):
+                        a = self.tier_axes[sel_tier_idx].axvspan(
+                            iv.xmin, iv.xmax,
+                            color="#3366cc", alpha=0.25, zorder=0)
+                        self._overlay_artists.append(a)
+
+        # --- Selected boundary highlight + shadow boundaries ---
+        if self._selected_boundary is not None:
+            sel_tier, sel_time = self._selected_boundary
+            view_start = self.view_start
+            view_end = self.view_end
+            if view_start <= sel_time <= view_end:
+                # Red highlight on spectrogram
+                a = self.ax.axvline(sel_time, color="#ff0000", linewidth=2.5,
+                                    alpha=0.9, zorder=6)
+                self._overlay_artists.append(a)
+                # Red highlight on the selected tier
+                if 0 <= sel_tier < len(self.tier_axes):
+                    a = self.tier_axes[sel_tier].axvline(
+                        sel_time, color="#ff0000", linewidth=2.5,
+                        alpha=0.9, zorder=6)
+                    self._overlay_artists.append(a)
+
+                # Shadow boundaries on OTHER tiers
+                for other_idx, other_ax in enumerate(self.tier_axes):
+                    if other_idx == sel_tier:
+                        continue
+                    # Dashed gray line
+                    a = other_ax.axvline(sel_time, color="#888888",
+                                         linewidth=1.0, linestyle="--",
+                                         alpha=0.6, zorder=4)
+                    self._overlay_artists.append(a)
+                    # Clickable circle
+                    a = other_ax.scatter(
+                        [sel_time], [0.5], s=40, c="#6688cc",
+                        edgecolors="white", linewidths=1.0, zorder=5,
+                    )
+                    self._overlay_artists.append(a)
+
+        # Draw all overlay artists via blit
+        for a in self._overlay_artists:
+            a.axes.draw_artist(a)
+
+        self.fig.canvas.blit(self.fig.bbox)
+
+        # Recapture crosshair bg to include overlays
+        self._crosshair_bg = self.fig.canvas.copy_from_bbox(self.ax.bbox)
 
     def _draw_formants(self):
         """Draw formant overlay on the spectrogram."""
@@ -945,22 +1006,6 @@ class SpectrogramCanvas(FigureCanvas):
                 spine.set_color("#999999")
                 spine.set_linewidth(0.5)
 
-            # Draw time selection on tier axes
-            if self._selection_start is not None and self._selection_end is not None:
-                tier_ax.axvspan(
-                    self._selection_start, self._selection_end,
-                    color="#3366cc", alpha=0.15, zorder=0,
-                )
-
-            # Draw selected interval highlight
-            if (self._selected_interval is not None
-                    and self._selected_interval[0] == tier_idx):
-                sel_i = self._selected_interval[1]
-                if tier.tier_class == "IntervalTier" and sel_i < len(tier.intervals):
-                    iv = tier.intervals[sel_i]
-                    tier_ax.axvspan(iv.xmin, iv.xmax,
-                                    color="#3366cc", alpha=0.25, zorder=0)
-
             if tier.tier_class == "IntervalTier":
                 # Filter to visible intervals
                 vis = [iv for iv in tier.intervals
@@ -1029,32 +1074,6 @@ class SpectrogramCanvas(FigureCanvas):
                            0, self.max_freq,
                            colors="#ff6622", linewidths=1.2,
                            linestyles="--", alpha=0.7, zorder=2)
-
-        # Draw selected boundary highlight + shadow boundaries
-        if self._selected_boundary is not None:
-            sel_tier, sel_time = self._selected_boundary
-            if view_start <= sel_time <= view_end:
-                # Red highlight on spectrogram
-                self.ax.axvline(sel_time, color="#ff0000", linewidth=2.5,
-                                alpha=0.9, zorder=6)
-                # Red highlight on the selected tier
-                if 0 <= sel_tier < len(self.tier_axes):
-                    self.tier_axes[sel_tier].axvline(
-                        sel_time, color="#ff0000", linewidth=2.5,
-                        alpha=0.9, zorder=6)
-
-                # Shadow boundaries on OTHER tiers
-                for other_idx, other_ax in enumerate(self.tier_axes):
-                    if other_idx == sel_tier:
-                        continue
-                    # Dashed gray line
-                    other_ax.axvline(sel_time, color="#888888", linewidth=1.0,
-                                     linestyle="--", alpha=0.6, zorder=4)
-                    # Clickable circle
-                    other_ax.scatter(
-                        [sel_time], [0.5], s=40, c="#6688cc",
-                        edgecolors="white", linewidths=1.0, zorder=5,
-                    )
 
         # Hide x-axis labels on all but the bottom tier
         self.ax.tick_params(labelbottom=False)
@@ -1293,6 +1312,7 @@ class SpectrogramCanvas(FigureCanvas):
         if self.textgrid_data is not None:
             tier_idx = self._tier_index_for_axes(event.inaxes)
             if tier_idx is not None and event.xdata is not None:
+                old_active = self._active_tier
                 self._active_tier = tier_idx  # always set active tier
 
                 if event.dblclick:
@@ -1301,7 +1321,10 @@ class SpectrogramCanvas(FigureCanvas):
                     if self._label_edit is not None:
                         self._label_edit.setFocus()
                         self._label_edit.selectAll()
-                    self.render()
+                    if old_active != tier_idx:
+                        self.render()
+                    else:
+                        self._draw_selection_overlay()
                     return
 
                 # Check if clicking on a shadow boundary circle (other tiers)
@@ -1333,7 +1356,7 @@ class SpectrogramCanvas(FigureCanvas):
                         self._drag_tier_index = tier_idx
                         self._drag_original_time = bt
                         self._compute_drag_constraints(tier_idx, bt)
-                        self.render(full=True)
+                        self.render()
                         self._drag_bg = self.fig.canvas.copy_from_bbox(
                             self.fig.bbox)
                         self._drag_line_spec = self.ax.axvline(
@@ -1354,7 +1377,10 @@ class SpectrogramCanvas(FigureCanvas):
                         if self._label_edit is not None:
                             self._label_edit.setEnabled(False)
                             self._label_edit.clear()
-                        self.render()
+                        if old_active != tier_idx:
+                            self.render()
+                        else:
+                            self._draw_selection_overlay()
                     return
 
                 # IntervalTier boundary/interval click
@@ -1367,7 +1393,10 @@ class SpectrogramCanvas(FigureCanvas):
                     if tier.tier_class == "IntervalTier" and (bt == tier.xmin or bt == tier.xmax):
                         # Can't drag tier start/end
                         self._selected_boundary = (tier_idx, bt)
-                        self.render()
+                        if old_active != tier_idx:
+                            self.render()
+                        else:
+                            self._draw_selection_overlay()
                         return
                     # Select and prepare for drag (blitting)
                     self._selected_boundary = None  # render without highlight
@@ -1376,7 +1405,7 @@ class SpectrogramCanvas(FigureCanvas):
                     self._drag_tier_index = tier_idx
                     self._drag_original_time = bt
                     self._compute_drag_constraints(tier_idx, bt)
-                    self.render(full=True)  # clean background (no red line)
+                    self.render()  # clean background (no red line)
                     # Cache bg BEFORE creating overlay artists
                     self._drag_bg = self.fig.canvas.copy_from_bbox(
                         self.fig.bbox)
@@ -1397,7 +1426,10 @@ class SpectrogramCanvas(FigureCanvas):
                 else:
                     # Click in interval body: select interval
                     self._select_interval(tier_idx, event.xdata)
-                    self.render()
+                    if old_active != tier_idx:
+                        self.render()
+                    else:
+                        self._draw_selection_overlay()
                     return
 
         # --- Spectrogram click/drag (non-edit mode) ---
@@ -1496,7 +1528,7 @@ class SpectrogramCanvas(FigureCanvas):
                     self._selection_start = None
                     self._selection_end = None
             self._spec_drag_start = None
-            self.render()
+            self._draw_selection_overlay()
             return
 
         if not self.is_drawing:
@@ -1537,7 +1569,7 @@ class SpectrogramCanvas(FigureCanvas):
         if self._spec_dragging and event.xdata is not None:
             # Lazy init: render + create artists on first move
             if self._drag_bg is None:
-                self.render(full=True)  # clean background
+                self.render()  # clean background
                 self._drag_bg = self.fig.canvas.copy_from_bbox(
                     self.fig.bbox)
                 ymin, ymax = self.ax.get_ylim()
@@ -2332,7 +2364,7 @@ class MainWindow(QMainWindow):
     def _on_label_escape(self):
         """Escape pressed in label editor — clear selection."""
         self.canvas._clear_selection()
-        self.canvas.render()
+        self.canvas._draw_selection_overlay()
         self.status.showMessage("Selection cleared")
 
     def keyPressEvent(self, event):
@@ -2366,7 +2398,7 @@ class MainWindow(QMainWindow):
                     or self.canvas._selection_start is not None):
                 self.canvas._clear_selection()
                 self.label_edit.clearFocus()
-                self.canvas.render()
+                self.canvas._draw_selection_overlay()
                 self.status.showMessage("Selection cleared")
                 event.accept()
                 return
@@ -2433,7 +2465,7 @@ class MainWindow(QMainWindow):
             self.canvas.load_sound(filepath)
             self._run_formant_analysis()
             self._update_scrollbar()
-            self.canvas.render(full=True)
+            self.canvas.render()
             self.status.showMessage(
                 f"Loaded: {os.path.basename(filepath)} "
                 f"({self.canvas.sound.duration:.2f}s, "
@@ -2469,7 +2501,7 @@ class MainWindow(QMainWindow):
                 if tg is not None:
                     self.canvas.textgrid_data = tg
                     self.canvas._setup_axes()
-                    self.canvas.render(full=True)
+                    self.canvas.render()
                     tier_desc = ", ".join(t.name for t in tg.tiers)
                     self.status.showMessage(
                         f"Created TextGrid "
@@ -2522,7 +2554,7 @@ class MainWindow(QMainWindow):
             self._textgrid_path = filepath
             self.canvas.textgrid_data = tg
             self.canvas._setup_axes()
-            self.canvas.render(full=True)
+            self.canvas.render()
             tier_desc = ", ".join(t.name for t in tg.tiers)
             self.status.showMessage(
                 f"TextGrid: {os.path.basename(filepath)} "
@@ -2581,7 +2613,7 @@ class MainWindow(QMainWindow):
                     and pos <= self.canvas._active_tier):
                 self.canvas._active_tier += 1
             self.canvas._setup_axes()
-            self.canvas.render(full=True)
+            self.canvas.render()
             self.status.showMessage(f"Added tier \"{new_tier.name}\"")
 
     # -------------------------------------------------------------------
@@ -2611,7 +2643,7 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Re-analysing formants...")
         QApplication.processEvents()
         self._run_formant_analysis()
-        self.canvas.render(full=True)
+        self.canvas.render()
         n = self.controls.num_formants_combo.currentData()
         self.status.showMessage(
             f"Re-analysed: {self.canvas.formant_data.n_frames} frames, "
@@ -2665,7 +2697,7 @@ class MainWindow(QMainWindow):
         ms = self.controls.spec_window_slider.value()
         self.canvas.spec_window_length = ms / 1000.0
         self.canvas._compute_spectrogram()
-        self.canvas.render(full=True)
+        self.canvas.render()
 
     def _on_max_freq_changed(self, val):
         self.canvas.max_freq = val
@@ -2673,7 +2705,7 @@ class MainWindow(QMainWindow):
 
     def _do_max_freq_update(self):
         self.canvas._compute_spectrogram()
-        self.canvas.render(full=True)
+        self.canvas.render()
 
     def _on_show_formants_toggled(self, checked):
         self.canvas.show_formants = checked
@@ -2686,7 +2718,7 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Re-analysing formants (pre-emphasis changed)...")
         QApplication.processEvents()
         self._run_formant_analysis()
-        self.canvas.render(full=True)
+        self.canvas.render()
         self.status.showMessage(
             f"Pre-emphasis: {self.controls.contrast_slider.value()} Hz"
         )
