@@ -1,0 +1,4 @@
+praat-parselmouth>=0.4.3
+PyQt6>=6.5
+matplotlib>=3.7
+numpy>=1.24

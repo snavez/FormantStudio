@@ -1,0 +1,1 @@
+After every significant change, do a git commit with an informative message
