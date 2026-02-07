@@ -591,9 +591,6 @@ class SpectrogramCanvas(FigureCanvas):
         self._spec_sel_artist = None        # spec drag: axvspan on spectrogram
         self._spec_sel_tier_artists = []    # spec drag: axvspan on each tier
 
-        # Persistent spectrogram image artist (reused across renders)
-        self._spec_img = None
-
         # Active tier state
         self._active_tier = None  # int index of the active/selected tier
 
@@ -632,20 +629,16 @@ class SpectrogramCanvas(FigureCanvas):
         self.draw()
 
     def _on_draw_complete(self, event):
-        """Rebuild crosshair artists + blit cache after any canvas draw."""
+        """Cache blit background after any canvas draw completes.
+
+        Never create artists here — that marks the figure dirty and can
+        trigger cascading redraws.  Crosshair artists are created in
+        render() before the draw call.
+        """
         if self.spectrogram_data is None or self.ax is None:
             return
-        if self._crosshair_h is None:
-            self._crosshair_h = self.ax.axhline(
-                y=0, color="#00ffcc", linewidth=0.7, alpha=0.8,
-                linestyle="-", visible=False, zorder=10,
-            )
-            self._crosshair_v = self.ax.axvline(
-                x=0, color="#00ffcc", linewidth=0.7, alpha=0.8,
-                linestyle="-", visible=False, zorder=10,
-            )
-            self._crosshair_visible = False
-        self._crosshair_bg = self.fig.canvas.copy_from_bbox(self.ax.bbox)
+        if self._crosshair_h is not None:
+            self._crosshair_bg = self.fig.canvas.copy_from_bbox(self.ax.bbox)
 
     def load_sound(self, filepath):
         """Load audio and compute spectrogram."""
@@ -670,7 +663,6 @@ class SpectrogramCanvas(FigureCanvas):
         self.spectrogram_data = spec_obj.values  # shape: (n_freq, n_time)
         self.spec_freqs = np.array(spec_obj.ys())
         self.spec_times = np.array(spec_obj.xs())
-        self._spec_img = None  # data shape may change, recreate artist
 
     @property
     def view_width(self):
@@ -711,30 +703,6 @@ class SpectrogramCanvas(FigureCanvas):
         """Slot for debounce timers — just calls render()."""
         self.render()
 
-    def _clear_axes_preserve_spectrogram(self):
-        """Remove all artists except the persistent spectrogram image."""
-        ax = self.ax
-        # Remove lines, texts, collections, patches — but keep _spec_img
-        for artist in list(ax.lines):
-            artist.remove()
-        for artist in list(ax.texts):
-            artist.remove()
-        for artist in list(ax.collections):
-            artist.remove()
-        for artist in list(ax.patches):
-            if artist is not self._spec_img:
-                artist.remove()
-        # Keep images list clean: remove all images except _spec_img
-        for artist in list(ax.images):
-            if artist is not self._spec_img:
-                artist.remove()
-        # Reset axes properties
-        ax.set_xlim(self.view_start, self.view_end)
-        ax.set_ylim(0, self.max_freq)
-        ax.set_facecolor("#1a1a2e")
-        ax.set_ylabel("Frequency (Hz)", color="#cccccc", fontsize=9)
-        ax.tick_params(colors="#999999", labelsize=8)
-
     def render(self, full=False):
         """Full re-render of spectrogram + formants + TextGrid tiers.
 
@@ -748,7 +716,7 @@ class SpectrogramCanvas(FigureCanvas):
         """
         if self._playback_playing:
             self.stop_playback()
-        self._clear_axes_preserve_spectrogram()
+        self.ax.clear()
         self._bg_cache = None
 
         if self.spectrogram_data is None:
@@ -771,31 +739,18 @@ class SpectrogramCanvas(FigureCanvas):
                 vmax = peak_db + self.brightness
                 vmin = vmax - self.dynamic_range
 
-                if self._spec_img is not None:
-                    self._spec_img.set_data(power_db)
-                    self._spec_img.set_extent([vis_times[0], vis_times[-1],
-                                               self.spec_freqs[0],
-                                               self.spec_freqs[-1]])
-                    self._spec_img.set_clim(vmin, vmax)
-                    self._spec_img.set_visible(True)
-                else:
-                    self._spec_img = self.ax.imshow(
-                        power_db,
-                        aspect="auto",
-                        origin="lower",
-                        cmap="gray_r",
-                        vmin=vmin, vmax=vmax,
-                        extent=[vis_times[0], vis_times[-1],
-                                self.spec_freqs[0], self.spec_freqs[-1]],
-                        interpolation="bilinear",
-                    )
-            else:
-                if self._spec_img is not None:
-                    self._spec_img.set_visible(False)
+                self.ax.imshow(
+                    power_db,
+                    aspect="auto",
+                    origin="lower",
+                    cmap="gray_r",
+                    vmin=vmin, vmax=vmax,
+                    extent=[vis_times[0], vis_times[-1],
+                            self.spec_freqs[0], self.spec_freqs[-1]],
+                    interpolation="bilinear",
+                )
         else:
-            # View too wide for spectrogram — hide image and show message
-            if self._spec_img is not None:
-                self._spec_img.set_visible(False)
+            # View too wide for spectrogram — show message
             mid_t = (self.view_start + self.view_end) / 2
             mid_f = self.max_freq / 2
             self.ax.text(
@@ -806,6 +761,12 @@ class SpectrogramCanvas(FigureCanvas):
                 ha="center", va="center", color="#666688",
                 fontsize=13, fontstyle="italic",
             )
+
+        self.ax.set_xlim(self.view_start, self.view_end)
+        self.ax.set_ylim(0, self.max_freq)
+        self.ax.set_ylabel("Frequency (Hz)", color="#cccccc", fontsize=9)
+        self.ax.tick_params(colors="#999999", labelsize=8)
+        self.ax.set_facecolor("#1a1a2e")
 
         # Draw formants
         if self.show_formants and self.formant_data is not None:
@@ -844,24 +805,24 @@ class SpectrogramCanvas(FigureCanvas):
                 left=0.12, right=0.98, top=0.94, bottom=0.10
             )
 
+        # Create crosshair artists (invisible) before draw so they are
+        # part of the artist tree but don't trigger extra redraws.
+        self._crosshair_h = self.ax.axhline(
+            y=0, color="#00ffcc", linewidth=0.7, alpha=0.8,
+            linestyle="-", visible=False, zorder=10,
+        )
+        self._crosshair_v = self.ax.axvline(
+            x=0, color="#00ffcc", linewidth=0.7, alpha=0.8,
+            linestyle="-", visible=False, zorder=10,
+        )
+        self._crosshair_visible = False
+
         if full:
             # Synchronous draw — caller needs blit caches immediately
             self.draw()
-            self._crosshair_h = self.ax.axhline(
-                y=0, color="#00ffcc", linewidth=0.7, alpha=0.8,
-                linestyle="-", visible=False, zorder=10,
-            )
-            self._crosshair_v = self.ax.axvline(
-                x=0, color="#00ffcc", linewidth=0.7, alpha=0.8,
-                linestyle="-", visible=False, zorder=10,
-            )
-            self._crosshair_visible = False
             self._crosshair_bg = self.fig.canvas.copy_from_bbox(self.ax.bbox)
         else:
-            # Deferred draw — crosshair rebuilt lazily via _on_draw_complete
-            self._crosshair_h = None
-            self._crosshair_v = None
-            self._crosshair_visible = False
+            # Deferred draw — _on_draw_complete will cache the background
             self._crosshair_bg = None
             self.draw_idle()
 
@@ -927,7 +888,6 @@ class SpectrogramCanvas(FigureCanvas):
 
         self.fig.clear()
         self.tier_axes = []
-        self._spec_img = None  # axes destroyed, artist is gone
 
         tg = self.textgrid_data
         if tg is None or len(tg.tiers) == 0:
