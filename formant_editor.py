@@ -904,7 +904,7 @@ class SpectrogramCanvas(FigureCanvas):
             tier_ax.set_yticks([])
             tier_ax.tick_params(colors="#555555", labelsize=8)
             tier_ax.set_ylabel(tier.name,
-                               color="#cc2200" if is_active else "#6699cc",
+                               color="#cc2200" if is_active else "#99bbdd",
                                fontsize=10,
                                fontweight="bold" if is_active else "normal",
                                rotation=0, ha="right", va="center",
@@ -1930,9 +1930,15 @@ class _TabPlayFilter(QObject):
 _TIER_TYPE_DISPLAY = {"Interval Tier": "IntervalTier", "Point Tier": "TextTier"}
 _TIER_TYPE_LABELS = list(_TIER_TYPE_DISPLAY.keys())
 
-_DIALOG_FIELD_STYLE = (
-    "QLineEdit, QComboBox { background-color: #ffffff; color: #000000; }"
-)
+_DIALOG_FIELD_STYLE = """
+    QLineEdit, QComboBox {
+        background-color: #ffffff; color: #000000;
+    }
+    QComboBox QAbstractItemView {
+        background-color: #ffffff; color: #000000;
+        selection-background-color: #d0d0d0; selection-color: #000000;
+    }
+"""
 
 
 class CreateTextGridDialog(QDialog):
