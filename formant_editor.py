@@ -908,13 +908,13 @@ class SpectrogramCanvas(FigureCanvas):
             is_active = (self.edit_mode and f_idx == self.active_formant)
 
             if is_active:
-                # In edit mode for this formant: show original track dimmed
+                # In edit mode for this formant: show original track
                 # so the user can see where adjustments are needed
                 unedited_mask = valid & ~edited
                 if np.any(unedited_mask):
                     self.ax.scatter(
                         fd.times[unedited_mask], vals[unedited_mask],
-                        c=color, s=2, alpha=0.3, zorder=3,
+                        c=color, s=2, alpha=0.7, zorder=3,
                     )
                 # Show edited points prominently
                 edited_valid = valid & edited
@@ -1087,8 +1087,8 @@ class SpectrogramCanvas(FigureCanvas):
         for tier_ax in self.tier_axes[:-1]:
             tier_ax.tick_params(labelbottom=False)
         # Bottom tier shows time axis
-        self.tier_axes[-1].set_xlabel("Time (s)", color="#333333", fontsize=9)
-        self.tier_axes[-1].tick_params(colors="#555555", labelsize=8)
+        self.tier_axes[-1].set_xlabel("Time (s)", color="#eeeeee", fontsize=9)
+        self.tier_axes[-1].tick_params(colors="#cccccc", labelsize=8)
 
     # -------------------------------------------------------------------
     # TextGrid editing helpers
