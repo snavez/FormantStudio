@@ -67,6 +67,12 @@ MAX_SPECTROGRAM_VIEW = 10.0    # seconds — hide spectrogram beyond this
 MIN_VIEW_WIDTH = 0.1           # seconds — maximum zoom
 ZOOM_FACTOR = 1.3              # per scroll wheel notch
 
+# Undo system
+from collections import namedtuple
+UndoEntry = namedtuple('UndoEntry', ['description', 'changes'])
+# changes = list of (formant_idx, frame_idx, old_value, old_mask, new_value, new_mask)
+MAX_UNDO_STEPS = 100
+
 
 # ---------------------------------------------------------------------------
 # Formant data container
@@ -551,10 +557,16 @@ class SpectrogramCanvas(FigureCanvas):
         self.active_formant = 0  # 0-indexed (0 = F1)
         self.is_drawing = False
         self._last_frame_idx = -1
+        self._last_frame_freq = None
         self._bg_cache = None
         self._stroke_scatter = None
         self._stroke_times = []
         self._stroke_freqs = []
+
+        # Undo/redo stacks
+        self._undo_stack = []
+        self._redo_stack = []
+        self._stroke_changes = []  # accumulates per-frame changes during a stroke
 
         # Playback state
         self._playback_playing = False
@@ -1665,8 +1677,10 @@ class SpectrogramCanvas(FigureCanvas):
             return
         self.is_drawing = True
         self._last_frame_idx = -1
+        self._last_frame_freq = None
         self._stroke_times = []
         self._stroke_freqs = []
+        self._stroke_changes = []
 
         # Cache background for blitting
         self.fig.canvas.draw()
@@ -1754,6 +1768,7 @@ class SpectrogramCanvas(FigureCanvas):
             return
         self.is_drawing = False
         self._last_frame_idx = -1
+        self._last_frame_freq = None
 
         # Clean up stroke artist
         if self._stroke_scatter is not None:
@@ -1764,6 +1779,14 @@ class SpectrogramCanvas(FigureCanvas):
         self._bg_cache = None
 
         if self.edit_mode:
+            # Push undo entry for this stroke
+            if self._stroke_changes:
+                entry = UndoEntry("Draw", list(self._stroke_changes))
+                self._undo_stack.append(entry)
+                self._redo_stack.clear()
+                if len(self._undo_stack) > MAX_UNDO_STEPS:
+                    self._undo_stack.pop(0)
+                self._stroke_changes = []
             if self._on_formant_edited is not None:
                 self._on_formant_edited()
             self.render()
@@ -2060,15 +2083,44 @@ class SpectrogramCanvas(FigureCanvas):
             return
 
         fd = self.formant_data
+        f_idx = self.active_formant
         # Find nearest frame
         frame_idx = np.argmin(np.abs(fd.times - time_s))
 
         # Avoid re-editing the exact same frame in one drag
         if frame_idx == self._last_frame_idx:
             return
-        self._last_frame_idx = frame_idx
 
-        fd.set_value(self.active_formant, frame_idx, freq_hz)
+        # --- Interpolate skipped frames ---
+        if (self._last_frame_idx >= 0
+                and abs(frame_idx - self._last_frame_idx) > 1
+                and self._last_frame_freq is not None):
+            prev_fi = self._last_frame_idx
+            prev_freq = self._last_frame_freq
+            step = 1 if frame_idx > prev_fi else -1
+            n_steps = abs(frame_idx - prev_fi)
+            for k in range(1, n_steps):
+                mid_fi = prev_fi + k * step
+                t = k / n_steps
+                mid_freq = prev_freq + t * (freq_hz - prev_freq)
+                # Capture old value for undo
+                old_val = float(fd.values[f_idx, mid_fi])
+                old_mask = bool(fd.edited_mask[f_idx, mid_fi])
+                fd.set_value(f_idx, mid_fi, mid_freq)
+                self._stroke_changes.append(
+                    (f_idx, mid_fi, old_val, old_mask, mid_freq, True))
+                self._quick_draw_edit_point(mid_fi, mid_freq)
+
+        # Capture old value for undo
+        old_val = float(fd.values[f_idx, frame_idx])
+        old_mask = bool(fd.edited_mask[f_idx, frame_idx])
+
+        fd.set_value(f_idx, frame_idx, freq_hz)
+        self._stroke_changes.append(
+            (f_idx, frame_idx, old_val, old_mask, freq_hz, True))
+
+        self._last_frame_idx = frame_idx
+        self._last_frame_freq = freq_hz
 
         # Quick incremental draw via blitting
         self._quick_draw_edit_point(frame_idx, freq_hz)
@@ -2090,6 +2142,36 @@ class SpectrogramCanvas(FigureCanvas):
         self.fig.canvas.restore_region(self._bg_cache)
         self.ax.draw_artist(self._stroke_scatter)
         self.fig.canvas.blit(self.ax.bbox)
+
+    # -------------------------------------------------------------------
+    # Undo / Redo
+    # -------------------------------------------------------------------
+
+    def undo(self):
+        """Undo the last formant edit. Returns True if an action was undone."""
+        if not self._undo_stack or self.formant_data is None:
+            return False
+        entry = self._undo_stack.pop()
+        fd = self.formant_data
+        for f_idx, frame_idx, old_val, old_mask, new_val, new_mask in entry.changes:
+            fd.values[f_idx, frame_idx] = old_val
+            fd.edited_mask[f_idx, frame_idx] = old_mask
+        self._redo_stack.append(entry)
+        self.render()
+        return True
+
+    def redo(self):
+        """Redo the last undone formant edit. Returns True if an action was redone."""
+        if not self._redo_stack or self.formant_data is None:
+            return False
+        entry = self._redo_stack.pop()
+        fd = self.formant_data
+        for f_idx, frame_idx, old_val, old_mask, new_val, new_mask in entry.changes:
+            fd.values[f_idx, frame_idx] = new_val
+            fd.edited_mask[f_idx, frame_idx] = new_mask
+        self._undo_stack.append(entry)
+        self.render()
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -2637,6 +2719,16 @@ class MainWindow(QMainWindow):
 
         view_menu.addSeparator()
 
+        undo_ref = QAction("Undo\tCtrl+Z", self)
+        undo_ref.setEnabled(False)
+        view_menu.addAction(undo_ref)
+
+        redo_ref = QAction("Redo\tCtrl+Y", self)
+        redo_ref.setEnabled(False)
+        view_menu.addAction(redo_ref)
+
+        view_menu.addSeparator()
+
         for text, shortcut in [
             ("Play Selection", "Tab"),
             ("Add Boundary", "Enter"),
@@ -2821,6 +2913,24 @@ class MainWindow(QMainWindow):
             if key == Qt.Key.Key_E:
                 # Toggle formant edit mode
                 self.controls.edit_btn.toggle()
+                event.accept()
+                return
+            if key == Qt.Key.Key_Z:
+                # Undo
+                if self.canvas.undo():
+                    self.status.showMessage("Undo")
+                    self._formants_dirty = True
+                else:
+                    self.status.showMessage("Nothing to undo")
+                event.accept()
+                return
+            if key == Qt.Key.Key_Y:
+                # Redo
+                if self.canvas.redo():
+                    self.status.showMessage("Redo")
+                    self._formants_dirty = True
+                else:
+                    self.status.showMessage("Nothing to redo")
                 event.accept()
                 return
 
@@ -3189,16 +3299,49 @@ class MainWindow(QMainWindow):
     def _reset_current_formant(self):
         if self.canvas.formant_data is None:
             return
+        fd = self.canvas.formant_data
         f_idx = self.canvas.active_formant
-        self.canvas.formant_data.reset_to_original(f_idx)
+        # Capture changes for undo
+        changes = []
+        for fi in range(fd.n_frames):
+            old_val = float(fd.values[f_idx, fi])
+            old_mask = bool(fd.edited_mask[f_idx, fi])
+            new_val = float(fd.original_values[f_idx, fi])
+            if old_val != new_val or old_mask:
+                changes.append((f_idx, fi, old_val, old_mask, new_val, False))
+        if changes:
+            self.canvas._undo_stack.append(
+                UndoEntry("Reset formant", changes))
+            self.canvas._redo_stack.clear()
+            if len(self.canvas._undo_stack) > MAX_UNDO_STEPS:
+                self.canvas._undo_stack.pop(0)
+        fd.reset_to_original(f_idx)
         self.canvas.render()
+        self._formants_dirty = True
         self.status.showMessage(f"Reset {FORMANT_LABELS[f_idx + 1]} to original")
 
     def _reset_all_formants(self):
         if self.canvas.formant_data is None:
             return
-        self.canvas.formant_data.reset_to_original()
+        fd = self.canvas.formant_data
+        # Capture changes for undo
+        changes = []
+        for f_idx in range(fd.n_formants):
+            for fi in range(fd.n_frames):
+                old_val = float(fd.values[f_idx, fi])
+                old_mask = bool(fd.edited_mask[f_idx, fi])
+                new_val = float(fd.original_values[f_idx, fi])
+                if old_val != new_val or old_mask:
+                    changes.append((f_idx, fi, old_val, old_mask, new_val, False))
+        if changes:
+            self.canvas._undo_stack.append(
+                UndoEntry("Reset all formants", changes))
+            self.canvas._redo_stack.clear()
+            if len(self.canvas._undo_stack) > MAX_UNDO_STEPS:
+                self.canvas._undo_stack.pop(0)
+        fd.reset_to_original()
         self.canvas.render()
+        self._formants_dirty = True
         self.status.showMessage("Reset all formants to original")
 
     # -------------------------------------------------------------------
