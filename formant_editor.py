@@ -2216,7 +2216,7 @@ class ControlPanel(QWidget):
         edit_group = QGroupBox("Formant Editing")
         edit_layout = QVBoxLayout(edit_group)
 
-        self.edit_btn = QPushButton("✏  EDIT MODE")
+        self.edit_btn = QPushButton("✏  EDIT MODE  (Ctrl+E)")
         self.edit_btn.setCheckable(True)
         self.edit_btn.setStyleSheet("""
             QPushButton {
@@ -2598,6 +2598,81 @@ class MainWindow(QMainWindow):
         quit_action.setShortcut(QKeySequence("Ctrl+Q"))
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
+
+        # View menu — keyboard shortcuts reference
+        # Shortcuts are displayed via \t text (not bound via setShortcut)
+        # so they don't conflict with keyPressEvent handling.
+        view_menu = menubar.addMenu("&View")
+
+        zoom_in_action = QAction("Zoom &In\tCtrl+I", self)
+        zoom_in_action.triggered.connect(lambda: self._menu_action(
+            lambda: self.canvas.zoom(1.0 / ZOOM_FACTOR)))
+        view_menu.addAction(zoom_in_action)
+
+        zoom_out_action = QAction("Zoom &Out\tCtrl+O", self)
+        zoom_out_action.triggered.connect(lambda: self._menu_action(
+            lambda: self.canvas.zoom(ZOOM_FACTOR)))
+        view_menu.addAction(zoom_out_action)
+
+        zoom_sel_action = QAction("Zoom to &Selection\tCtrl+N", self)
+        zoom_sel_action.triggered.connect(self._menu_zoom_to_selection)
+        view_menu.addAction(zoom_sel_action)
+
+        zoom_all_action = QAction("Zoom &All\tCtrl+A", self)
+        zoom_all_action.triggered.connect(lambda: self._menu_action(
+            lambda: self.canvas.set_view(0, self.canvas.total_duration)))
+        view_menu.addAction(zoom_all_action)
+
+        view_menu.addSeparator()
+
+        edit_mode_action = QAction("Toggle &Edit Mode\tCtrl+E", self)
+        edit_mode_action.triggered.connect(self.controls.edit_btn.toggle)
+        view_menu.addAction(edit_mode_action)
+
+        toggle_formants_action = QAction("Toggle &Formant Display\tF", self)
+        toggle_formants_action.triggered.connect(
+            lambda: self.controls.show_formants_cb.setChecked(
+                not self.controls.show_formants_cb.isChecked()))
+        view_menu.addAction(toggle_formants_action)
+
+        view_menu.addSeparator()
+
+        for text, shortcut in [
+            ("Play Selection", "Tab"),
+            ("Add Boundary", "Enter"),
+            ("Delete Boundary", "Del"),
+            ("Stop / Clear Selection", "Esc"),
+        ]:
+            a = QAction(f"{text}\t{shortcut}", self)
+            a.setEnabled(False)
+            view_menu.addAction(a)
+
+        view_menu.addSeparator()
+
+        ref_fkeys = QAction("Select F1\u2013F5 (edit mode)\tF1\u2013F5", self)
+        ref_fkeys.setEnabled(False)
+        view_menu.addAction(ref_fkeys)
+
+        ref_shift = QAction("Drag aligned boundaries\tShift+Drag", self)
+        ref_shift.setEnabled(False)
+        view_menu.addAction(ref_shift)
+
+    def _menu_action(self, fn):
+        """Run fn then re-render + update scrollbar (for View menu actions)."""
+        if self.canvas.sound is not None:
+            fn()
+            self.canvas.render()
+            self._update_scrollbar()
+
+    def _menu_zoom_to_selection(self):
+        """Zoom to selection triggered from View menu."""
+        c = self.canvas
+        if c.sound is not None and c._selection_start is not None and c._selection_end is not None:
+            sel_width = c._selection_end - c._selection_start
+            pad = sel_width * 0.05
+            c.set_view(c._selection_start - pad, c._selection_end + pad)
+            c.render()
+            self._update_scrollbar()
 
     def _connect_signals(self):
         ctrl = self.controls
