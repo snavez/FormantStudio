@@ -2729,36 +2729,32 @@ class MainWindow(QMainWindow):
                 background: #667788; border-radius: 4px;
                 min-width: 30px;
             }
-            QScrollBar::add-line:horizontal {
-                background: #3a3a4e; width: 18px;
-                subcontrol-position: right;
-                subcontrol-origin: margin;
-                border: 1px solid #556677; border-radius: 3px;
-            }
-            QScrollBar::sub-line:horizontal {
-                background: #3a3a4e; width: 18px;
-                subcontrol-position: left;
-                subcontrol-origin: margin;
-                border: 1px solid #556677; border-radius: 3px;
-            }
-            QScrollBar::left-arrow:horizontal {
-                width: 10px; height: 10px;
-                image: none;
-                border-left: 2px solid #aabbcc;
-                border-bottom: 2px solid #aabbcc;
-                margin: 3px;
-            }
-            QScrollBar::right-arrow:horizontal {
-                width: 10px; height: 10px;
-                image: none;
-                border-right: 2px solid #aabbcc;
-                border-top: 2px solid #aabbcc;
-                margin: 3px;
-            }
+            QScrollBar::add-line, QScrollBar::sub-line { width: 0; }
             QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 background: #3a3a4e;
             }
         """)
+
+        _arrow_style = """
+            QPushButton {
+                background: #3a3a4e; color: #aabbcc;
+                border: 1px solid #556677; border-radius: 3px;
+                font-size: 14px; font-weight: bold;
+                padding: 0px;
+            }
+            QPushButton:hover { background: #4a4a5e; }
+            QPushButton:pressed { background: #556677; }
+        """
+        self._scroll_back_btn = QPushButton("\u25C0")
+        self._scroll_back_btn.setFixedSize(22, 18)
+        self._scroll_back_btn.setStyleSheet(_arrow_style)
+        self._scroll_back_btn.setAutoRepeat(True)
+        self._scroll_back_btn.setAutoRepeatInterval(150)
+        self._scroll_fwd_btn = QPushButton("\u25B6")
+        self._scroll_fwd_btn.setFixedSize(22, 18)
+        self._scroll_fwd_btn.setStyleSheet(_arrow_style)
+        self._scroll_fwd_btn.setAutoRepeat(True)
+        self._scroll_fwd_btn.setAutoRepeatInterval(150)
 
         canvas_layout.addWidget(self.canvas, 1)
         label_row = QHBoxLayout()
@@ -2766,7 +2762,13 @@ class MainWindow(QMainWindow):
         label_row.addWidget(self.label_edit)
         label_row.addStretch(1)
         canvas_layout.addLayout(label_row)
-        canvas_layout.addWidget(self.scrollbar)
+        scroll_row = QHBoxLayout()
+        scroll_row.setContentsMargins(0, 0, 0, 0)
+        scroll_row.setSpacing(0)
+        scroll_row.addWidget(self._scroll_back_btn)
+        scroll_row.addWidget(self.scrollbar, 1)
+        scroll_row.addWidget(self._scroll_fwd_btn)
+        canvas_layout.addLayout(scroll_row)
 
         # Control panel
         self.controls = ControlPanel()
@@ -2940,8 +2942,10 @@ class MainWindow(QMainWindow):
         ctrl.reset_all_btn.clicked.connect(self._reset_all_formants)
         ctrl.interpolate_btn.clicked.connect(self._interpolate_formant)
 
-        # Scrollbar
+        # Scrollbar + arrow buttons
         self.scrollbar.valueChanged.connect(self._on_scrollbar_changed)
+        self._scroll_back_btn.clicked.connect(self._scroll_backward)
+        self._scroll_fwd_btn.clicked.connect(self._scroll_forward)
 
     # -------------------------------------------------------------------
     # Key events — F1–F5 for formant selection
@@ -3383,6 +3387,28 @@ class MainWindow(QMainWindow):
         width = c.view_width
         c.set_view(new_start, new_start + width)
         c._render_timer.start()  # debounced render
+
+    def _scroll_backward(self):
+        """Arrow button: scroll backward by 2/3 of visible window."""
+        c = self.canvas
+        if c.sound is None:
+            return
+        shift = c.view_width * 2 / 3
+        new_start = max(0, c.view_start - shift)
+        c.set_view(new_start, new_start + c.view_width)
+        c.render()
+        self._update_scrollbar()
+
+    def _scroll_forward(self):
+        """Arrow button: scroll forward by 2/3 of visible window."""
+        c = self.canvas
+        if c.sound is None:
+            return
+        shift = c.view_width * 2 / 3
+        new_start = min(c.total_duration - c.view_width, c.view_start + shift)
+        c.set_view(new_start, new_start + c.view_width)
+        c.render()
+        self._update_scrollbar()
 
     # -------------------------------------------------------------------
     # UI callbacks
