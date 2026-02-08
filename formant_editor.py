@@ -56,7 +56,7 @@ DEFAULT_PRE_EMPHASIS = 50.0    # Hz — Praat default
 
 # Spectrogram display defaults
 DEFAULT_DYNAMIC_RANGE = 70.0   # dB
-DEFAULT_SPEC_MAX_FREQ = 5500.0
+DEFAULT_SPEC_MAX_FREQ = 8000.0
 DEFAULT_SPEC_WINDOW = 0.005    # seconds — spectrogram analysis window
 
 # View limits
@@ -480,7 +480,9 @@ class LabelEdit(QLineEdit):
                 border: 1px solid #aaaaaa;
                 border-radius: 4px;
                 padding: 4px 8px;
+                font-family: "Segoe UI", "Arial Unicode MS", "Noto Sans", sans-serif;
                 font-size: 16px;
+                font-weight: bold;
             }
             QLineEdit:disabled {
                 background-color: #f0f0f0;
@@ -700,7 +702,7 @@ class SpectrogramCanvas(QWidget):
         self._spec_plot.setLabel('left', 'Frequency (Hz)')
         self._spec_plot.getViewBox().setBackgroundColor('#1a1a2e')
         t = pg.TextItem("Open a WAV file to begin", color='#eeeeee', anchor=(0.5, 0.5))
-        t.setFont(QFont("", 11))
+        t.setFont(QFont("Segoe UI", 11))
         self._spec_plot.addItem(t)
         t.setPos(0.5, 0.5)
         self._spec_plot.setXRange(0, 1)
@@ -780,8 +782,11 @@ class SpectrogramCanvas(QWidget):
                 self._configure_plot(tp, '#ffffff')
                 tp.setXLink(self._spec_plot)
                 tp.setYRange(0, 1, padding=0)
-                tp.getAxis('left').setWidth(60)
-                tp.hideAxis('left')
+                # Show tier name as left axis label (no tick marks)
+                left_ax = tp.getAxis('left')
+                left_ax.setWidth(60)
+                left_ax.setTicks([])  # no tick marks
+                left_ax.setStyle(showValues=False)
                 # Only show x-axis on bottom tier
                 if i < n_tiers - 1:
                     tp.getAxis('bottom').setStyle(showValues=False)
@@ -1027,7 +1032,7 @@ class SpectrogramCanvas(QWidget):
                 f"Use Ctrl+I to zoom in",
                 color='#666688', anchor=(0.5, 0.5),
             )
-            self._zoom_text.setFont(QFont("", 13))
+            self._zoom_text.setFont(QFont("Segoe UI", 13))
             self._spec_plot.addItem(self._zoom_text)
             self._zoom_text.setPos(mid_t, mid_f)
 
@@ -1154,7 +1159,7 @@ class SpectrogramCanvas(QWidget):
             if np.any(unedited_mask):
                 sc = pg.ScatterPlotItem(
                     x=fd.times[unedited_mask], y=vals[unedited_mask],
-                    size=3, pen=pg.mkPen(None),
+                    size=2, pen=pg.mkPen(None),
                     brush=pg.mkBrush(qcolor.red(), qcolor.green(), qcolor.blue(), 180),
                 )
                 self._spec_plot.addItem(sc)
@@ -1165,7 +1170,7 @@ class SpectrogramCanvas(QWidget):
             if np.any(edited_valid):
                 sc = pg.ScatterPlotItem(
                     x=fd.times[edited_valid], y=vals[edited_valid],
-                    size=8,
+                    size=4,
                     pen=pg.mkPen('white', width=0.3),
                     brush=pg.mkBrush(qcolor.red(), qcolor.green(), qcolor.blue(), 255),
                 )
@@ -1198,18 +1203,14 @@ class SpectrogramCanvas(QWidget):
             tier_plot.getViewBox().setBackgroundColor('#fff8c4' if is_active else '#ffffff')
             tier_plot.setYRange(0, 1, padding=0)
 
-            # Tier label
-            tier_label = pg.TextItem(
-                tier.name,
-                color='#cc2200' if is_active else '#99bbdd',
-                anchor=(1.0, 0.5),
-            )
-            font = QFont("", 10)
-            if is_active:
-                font.setBold(True)
-            tier_label.setFont(font)
-            tier_label.setPos(view_start, 0.5)
-            self._add_transient(tier_label, tier_plot)
+            # Tier name as left axis label
+            label_color = '#cc2200' if is_active else '#5577aa'
+            label_weight = 'bold' if is_active else 'normal'
+            tier_plot.setLabel('left', tier.name, **{
+                'color': label_color,
+                'font-size': '10pt',
+                'font-weight': label_weight,
+            })
 
             if tier.tier_class == "IntervalTier":
                 vis = [iv for iv in tier.intervals
@@ -1241,7 +1242,7 @@ class SpectrogramCanvas(QWidget):
                             mid_t = (iv.xmin + iv.xmax) / 2.0
                             if view_start <= mid_t <= view_end:
                                 t = pg.TextItem(iv.text, color='#000000', anchor=(0.5, 0.5))
-                                t.setFont(QFont("", 10))
+                                t.setFont(QFont("Segoe UI", 10))
                                 t.setPos(mid_t, 0.5)
                                 self._add_transient(t, tier_plot)
 
@@ -1272,7 +1273,7 @@ class SpectrogramCanvas(QWidget):
                     for pt in vis:
                         if pt.mark:
                             t = pg.TextItem("  " + pt.mark, color='#000000', anchor=(0.0, 0.5))
-                            t.setFont(QFont("", 10, QFont.Weight.Bold))
+                            t.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
                             t.setPos(pt.time, 0.5)
                             self._add_transient(t, tier_plot)
 
@@ -1318,7 +1319,7 @@ class SpectrogramCanvas(QWidget):
 
         target = self._wave_plot if self._wave_plot is not None else self._spec_plot
         self._title_item = pg.TextItem(title, color=color, anchor=(0.5, 1.0))
-        font = QFont("", 11)
+        font = QFont("Segoe UI", 11)
         if self.edit_mode:
             font.setBold(True)
         self._title_item.setFont(font)
@@ -1819,7 +1820,7 @@ class SpectrogramCanvas(QWidget):
         color = "#888888" if self._is_erasing else FORMANT_COLORS.get(fn, "#ffffff")
         qc = QColor(color)
         self._stroke_scatter = pg.ScatterPlotItem(
-            size=12, pen=pg.mkPen('white', width=0.3),
+            size=5, pen=pg.mkPen('white', width=0.3),
             brush=pg.mkBrush(qc.red(), qc.green(), qc.blue(), 255),
         )
         self._spec_plot.addItem(self._stroke_scatter)
@@ -2663,8 +2664,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("FormantStudio — Manual Formant Editor")
-        self.setMinimumSize(1100, 600)
-        self.resize(1400, 700)
+        self.setMinimumSize(1200, 700)
+        self.resize(1800, 950)
 
         # Dark theme
         self.setStyleSheet("""
