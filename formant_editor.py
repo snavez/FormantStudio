@@ -1121,6 +1121,10 @@ class SpectrogramCanvas(FigureCanvas):
 
         view_start = self.view_start
         view_end = self.view_end
+        view_width = view_end - view_start
+
+        # Pixel width of tier axes for text LOD (skip tiny unreadable labels)
+        ax_width_px = self.tier_axes[0].get_window_extent().width if self.tier_axes else 0
 
         # Collect all boundary times for a single batch vlines on spectrogram
         spec_interval_boundaries = set()
@@ -1161,9 +1165,13 @@ class SpectrogramCanvas(FigureCanvas):
                     tier_ax.vlines(sorted(boundaries), 0, 1,
                                    colors="#4444aa", linewidths=0.8, zorder=1)
 
-                    # Labels — black text, larger font
+                    # Labels — black text, larger font (skip if interval < 20px)
                     for iv in vis:
                         if iv.text:
+                            if ax_width_px > 0 and view_width > 0:
+                                px_w = (iv.xmax - iv.xmin) / view_width * ax_width_px
+                                if px_w < 20:
+                                    continue
                             mid_t = (iv.xmin + iv.xmax) / 2.0
                             if view_start <= mid_t <= view_end:
                                 tier_ax.text(
@@ -1427,9 +1435,9 @@ class SpectrogramCanvas(FigureCanvas):
             self.zoom(1.0 / ZOOM_FACTOR, center_time=event.xdata)
         else:
             self.zoom(ZOOM_FACTOR, center_time=event.xdata)
-        self.render()
         if self._on_view_changed_callback:
             self._on_view_changed_callback()
+        self._render_timer.start()  # debounce: coalesce rapid scroll events
 
     # -------------------------------------------------------------------
     # Mouse interaction for formant editing
