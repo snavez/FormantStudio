@@ -2345,6 +2345,70 @@ class SpectrogramCanvas(FigureCanvas):
         self.render()
         return True
 
+    def interpolate_formant(self, formant_idx, start_time=None, end_time=None):
+        """Linearly interpolate between consecutive edited points.
+
+        For the given formant, finds pairs of edited points and fills
+        intermediate frames with linear interpolation. Respects
+        start_time/end_time range if provided.
+
+        Returns the number of frames interpolated.
+        """
+        if self.formant_data is None:
+            return 0
+
+        fd = self.formant_data
+        f_idx = formant_idx
+
+        # Determine frame range
+        if start_time is not None and end_time is not None:
+            fi_start = np.argmin(np.abs(fd.times - start_time))
+            fi_end = np.argmin(np.abs(fd.times - end_time))
+            if fi_start > fi_end:
+                fi_start, fi_end = fi_end, fi_start
+        else:
+            fi_start = 0
+            fi_end = fd.n_frames - 1
+
+        # Find edited points in range
+        edited_frames = []
+        for fi in range(fi_start, fi_end + 1):
+            if fd.edited_mask[f_idx, fi] and not np.isnan(fd.values[f_idx, fi]):
+                edited_frames.append(fi)
+
+        if len(edited_frames) < 2:
+            return 0
+
+        changes = []
+        count = 0
+
+        # Interpolate between each consecutive pair
+        for i in range(len(edited_frames) - 1):
+            a = edited_frames[i]
+            b = edited_frames[i + 1]
+            if b - a <= 1:
+                continue  # adjacent, nothing to interpolate
+            val_a = fd.values[f_idx, a]
+            val_b = fd.values[f_idx, b]
+            for fi in range(a + 1, b):
+                t = (fi - a) / (b - a)
+                new_val = val_a + t * (val_b - val_a)
+                old_val = float(fd.values[f_idx, fi])
+                old_mask = bool(fd.edited_mask[f_idx, fi])
+                fd.set_value(f_idx, fi, new_val)
+                changes.append((f_idx, fi, old_val, old_mask, new_val, True))
+                count += 1
+
+        if changes:
+            entry = UndoEntry("Interpolate", changes)
+            self._undo_stack.append(entry)
+            self._redo_stack.clear()
+            if len(self._undo_stack) > MAX_UNDO_STEPS:
+                self._undo_stack.pop(0)
+            self.render()
+
+        return count
+
 
 # ---------------------------------------------------------------------------
 # Control Panel (sliders, settings)
@@ -2498,6 +2562,10 @@ class ControlPanel(QWidget):
         self.reset_all_btn = QPushButton("Reset All Edits")
         edit_layout.addWidget(self.reset_current_btn)
         edit_layout.addWidget(self.reset_all_btn)
+
+        # Interpolate button
+        self.interpolate_btn = QPushButton("Interpolate Between Points")
+        edit_layout.addWidget(self.interpolate_btn)
 
         layout.addWidget(edit_group)
 
@@ -2963,6 +3031,7 @@ class MainWindow(QMainWindow):
         ctrl.edit_btn.toggled.connect(self._on_edit_toggled)
         ctrl.reset_current_btn.clicked.connect(self._reset_current_formant)
         ctrl.reset_all_btn.clicked.connect(self._reset_all_formants)
+        ctrl.interpolate_btn.clicked.connect(self._interpolate_formant)
 
         # Scrollbar
         self.scrollbar.valueChanged.connect(self._on_scrollbar_changed)
@@ -3467,6 +3536,25 @@ class MainWindow(QMainWindow):
         else:
             self.status.showMessage("Edit mode off")
         self.canvas.render()
+
+    def _interpolate_formant(self):
+        """Interpolate between edited points for the active formant."""
+        if self.canvas.formant_data is None:
+            self.status.showMessage("No formant data loaded")
+            return
+        c = self.canvas
+        f_idx = c.active_formant
+        start_time = c._selection_start
+        end_time = c._selection_end
+        count = c.interpolate_formant(f_idx, start_time, end_time)
+        if count > 0:
+            fn = FORMANT_LABELS[f_idx + 1]
+            self._formants_dirty = True
+            self.status.showMessage(
+                f"Interpolated {count} frames for {fn}")
+        else:
+            self.status.showMessage(
+                "Need at least 2 edited points to interpolate")
 
     def _reset_current_formant(self):
         if self.canvas.formant_data is None:
