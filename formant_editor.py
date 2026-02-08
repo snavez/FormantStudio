@@ -2616,6 +2616,11 @@ class MainWindow(QMainWindow):
                     self._update_scrollbar()
                     event.accept()
                     return
+            if key == Qt.Key.Key_E:
+                # Toggle formant edit mode
+                self.controls.edit_btn.toggle()
+                event.accept()
+                return
 
         # Escape — stop playback, clear selection, defocus label editor
         if key == Qt.Key.Key_Escape:
