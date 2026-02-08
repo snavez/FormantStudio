@@ -574,6 +574,8 @@ class SpectrogramCanvas(FigureCanvas):
         self._drag_original_time = None
         self._drag_min_time = 0.0
         self._drag_max_time = 0.0
+        self._drag_aligned = []       # [(tier_idx, original_time), ...] for multi-tier drag
+        self._drag_lines_aligned = [] # [(tier_idx, axvline_artist), ...] for visual feedback
 
         # Interval/point selection state
         self._selected_interval = None      # (tier_idx, interval_idx) or None
@@ -1350,6 +1352,41 @@ class SpectrogramCanvas(FigureCanvas):
             self._drag_min_time = prev_time + epsilon
             self._drag_max_time = next_time - epsilon
 
+    def _find_aligned_boundaries(self, source_tier_idx, boundary_time):
+        """Find boundaries on other tiers at exactly the same time."""
+        aligned = []
+        for i, tier in enumerate(self.textgrid_data.tiers):
+            if i == source_tier_idx:
+                continue
+            if tier.tier_class == "IntervalTier":
+                for iv in tier.intervals:
+                    if iv.xmin == boundary_time and iv.xmin != tier.xmin:
+                        aligned.append((i, boundary_time))
+                        break
+                    if iv.xmax == boundary_time and iv.xmax != tier.xmax:
+                        aligned.append((i, boundary_time))
+                        break
+            elif tier.tier_class == "TextTier":
+                for pt in tier.points:
+                    if pt.time == boundary_time:
+                        aligned.append((i, boundary_time))
+                        break
+        return aligned
+
+    def _compute_multi_drag_constraints(self, all_tiers_times):
+        """Compute drag constraints as intersection across multiple tiers.
+
+        all_tiers_times: list of (tier_idx, boundary_time) including primary.
+        """
+        overall_min = -float('inf')
+        overall_max = float('inf')
+        for tier_idx, bt in all_tiers_times:
+            self._compute_drag_constraints(tier_idx, bt)
+            overall_min = max(overall_min, self._drag_min_time)
+            overall_max = min(overall_max, self._drag_max_time)
+        self._drag_min_time = overall_min
+        self._drag_max_time = overall_max
+
     # -------------------------------------------------------------------
     # Mouse scroll — zoom
     # -------------------------------------------------------------------
@@ -1463,7 +1500,17 @@ class SpectrogramCanvas(FigureCanvas):
                         self._dragging_boundary = True
                         self._drag_tier_index = tier_idx
                         self._drag_original_time = bt
-                        self._compute_drag_constraints(tier_idx, bt)
+                        # Shift-click: find aligned boundaries across tiers
+                        shift = 'shift' in getattr(event, 'modifiers', frozenset())
+                        if shift:
+                            aligned = self._find_aligned_boundaries(tier_idx, bt)
+                            self._drag_aligned = aligned
+                            self._compute_multi_drag_constraints(
+                                [(tier_idx, bt)] + aligned)
+                        else:
+                            self._drag_aligned = []
+                            self._drag_lines_aligned = []
+                            self._compute_drag_constraints(tier_idx, bt)
                         self.render()
                         self._drag_bg = self.fig.canvas.copy_from_bbox(
                             self.fig.bbox)
@@ -1485,6 +1532,14 @@ class SpectrogramCanvas(FigureCanvas):
                         self.tier_axes[tier_idx].draw_artist(self._drag_line_tier)
                         if self._drag_line_wave is not None:
                             self.wave_ax.draw_artist(self._drag_line_wave)
+                        # Create aligned drag lines on other tiers
+                        self._drag_lines_aligned = []
+                        for a_tier_idx, _ in self._drag_aligned:
+                            line = self.tier_axes[a_tier_idx].axvline(
+                                bt, color="#ff0000", linewidth=2.5,
+                                alpha=0.9, zorder=6)
+                            self._drag_lines_aligned.append((a_tier_idx, line))
+                            self.tier_axes[a_tier_idx].draw_artist(line)
                         self.fig.canvas.blit(self.fig.bbox)
                     else:
                         # Click away from any point: just set active tier
@@ -1520,7 +1575,17 @@ class SpectrogramCanvas(FigureCanvas):
                     self._dragging_boundary = True
                     self._drag_tier_index = tier_idx
                     self._drag_original_time = bt
-                    self._compute_drag_constraints(tier_idx, bt)
+                    # Shift-click: find aligned boundaries across tiers
+                    shift = 'shift' in getattr(event, 'modifiers', frozenset())
+                    if shift:
+                        aligned = self._find_aligned_boundaries(tier_idx, bt)
+                        self._drag_aligned = aligned
+                        self._compute_multi_drag_constraints(
+                            [(tier_idx, bt)] + aligned)
+                    else:
+                        self._drag_aligned = []
+                        self._drag_lines_aligned = []
+                        self._compute_drag_constraints(tier_idx, bt)
                     self.render()  # clean background (no red line)
                     # Cache bg BEFORE creating overlay artists
                     self._drag_bg = self.fig.canvas.copy_from_bbox(
@@ -1545,6 +1610,14 @@ class SpectrogramCanvas(FigureCanvas):
                     self.tier_axes[tier_idx].draw_artist(self._drag_line_tier)
                     if self._drag_line_wave is not None:
                         self.wave_ax.draw_artist(self._drag_line_wave)
+                    # Create aligned drag lines on other tiers
+                    self._drag_lines_aligned = []
+                    for a_tier_idx, _ in self._drag_aligned:
+                        line = self.tier_axes[a_tier_idx].axvline(
+                            bt, color="#ff0000", linewidth=2.5,
+                            alpha=0.9, zorder=6)
+                        self._drag_lines_aligned.append((a_tier_idx, line))
+                        self.tier_axes[a_tier_idx].draw_artist(line)
                     self.fig.canvas.blit(self.fig.bbox)
                     return
                 else:
@@ -1620,6 +1693,9 @@ class SpectrogramCanvas(FigureCanvas):
             # Commit data model change once
             self._move_boundary(self._drag_tier_index,
                                 self._drag_original_time, final_time)
+            # Also move aligned boundaries on other tiers
+            for a_tier_idx, a_time in self._drag_aligned:
+                self._move_boundary(a_tier_idx, a_time, final_time)
             self._selected_boundary = (self._drag_tier_index, final_time)
             if self._on_textgrid_edited is not None:
                 self._on_textgrid_edited()
@@ -1633,6 +1709,10 @@ class SpectrogramCanvas(FigureCanvas):
             if self._drag_line_wave is not None:
                 self._drag_line_wave.remove()
                 self._drag_line_wave = None
+            for _, a_line in self._drag_lines_aligned:
+                a_line.remove()
+            self._drag_lines_aligned = []
+            self._drag_aligned = []
             self._drag_bg = None
             self._dragging_boundary = False
             self._drag_tier_index = None
@@ -1706,6 +1786,9 @@ class SpectrogramCanvas(FigureCanvas):
                     self._drag_line_tier.set_xdata([new_time])
                     ta = self.tier_axes[self._drag_tier_index]
                     ta.draw_artist(self._drag_line_tier)
+                for a_tier_idx, a_line in self._drag_lines_aligned:
+                    a_line.set_xdata([new_time])
+                    self.tier_axes[a_tier_idx].draw_artist(a_line)
                 self.fig.canvas.blit(self.fig.bbox)
             return
 
