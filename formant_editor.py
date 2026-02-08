@@ -817,7 +817,7 @@ class SpectrogramCanvas(QWidget):
             ax = plot.getAxis(axis_name)
             ax.setPen('#cccccc')
             ax.setTextPen('#cccccc')
-            ax.setStyle(tickFont=QFont("", 8))
+            ax.setStyle(tickTextOffset=4)
 
     def _setup_crosshair(self):
         """Create crosshair InfiniteLine items on spec and wave plots."""
