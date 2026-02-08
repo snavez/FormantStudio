@@ -563,6 +563,9 @@ class SpectrogramCanvas(FigureCanvas):
         self._stroke_times = []
         self._stroke_freqs = []
 
+        # Eraser state (right-click drag in edit mode)
+        self._is_erasing = False
+
         # Undo/redo stacks
         self._undo_stack = []
         self._redo_stack = []
@@ -1460,11 +1463,16 @@ class SpectrogramCanvas(FigureCanvas):
             self._label_edit.clear()
 
     def _on_mouse_press(self, event):
-        if event.button != 1:
+        # Right-click: only allowed in edit mode for eraser tool
+        if event.button == 3:
+            if not self.edit_mode:
+                return
+            # Jump directly to edit mode drawing/erasing section below
+        elif event.button != 1:
             return
 
-        # --- TextGrid tier click detection (works in ALL modes) ---
-        if self.textgrid_data is not None:
+        # --- TextGrid tier click detection (works in ALL modes, left-click only) ---
+        if event.button == 1 and self.textgrid_data is not None:
             tier_idx = self._tier_index_for_axes(event.inaxes)
             if tier_idx is not None and event.xdata is not None:
                 old_active = self._active_tier
@@ -1672,10 +1680,11 @@ class SpectrogramCanvas(FigureCanvas):
                         )
             return
 
-        # --- Edit mode: formant drawing (only on spectrogram axes) ---
+        # --- Edit mode: formant drawing / erasing (only on spectrogram axes) ---
         if event.inaxes != self.ax:
             return
         self.is_drawing = True
+        self._is_erasing = (event.button == 3)
         self._last_frame_idx = -1
         self._last_frame_freq = None
         self._stroke_times = []
@@ -1688,7 +1697,7 @@ class SpectrogramCanvas(FigureCanvas):
 
         # Create a scatter artist for the stroke
         fn = self.active_formant + 1
-        color = FORMANT_COLORS.get(fn, "#ffffff")
+        color = "#888888" if self._is_erasing else FORMANT_COLORS.get(fn, "#ffffff")
         self._stroke_scatter = self.ax.scatter(
             [], [], c=color, s=12, edgecolors="white",
             linewidths=0.3, zorder=5,
@@ -1781,12 +1790,14 @@ class SpectrogramCanvas(FigureCanvas):
         if self.edit_mode:
             # Push undo entry for this stroke
             if self._stroke_changes:
-                entry = UndoEntry("Draw", list(self._stroke_changes))
+                desc = "Erase" if self._is_erasing else "Draw"
+                entry = UndoEntry(desc, list(self._stroke_changes))
                 self._undo_stack.append(entry)
                 self._redo_stack.clear()
                 if len(self._undo_stack) > MAX_UNDO_STEPS:
                     self._undo_stack.pop(0)
                 self._stroke_changes = []
+            self._is_erasing = False
             if self._on_formant_edited is not None:
                 self._on_formant_edited()
             self.render()
@@ -2091,7 +2102,39 @@ class SpectrogramCanvas(FigureCanvas):
         if frame_idx == self._last_frame_idx:
             return
 
-        # --- Interpolate skipped frames ---
+        if self._is_erasing:
+            # --- Eraser: revert to original values ---
+            # Interpolate skipped frames (each gets its own original)
+            if (self._last_frame_idx >= 0
+                    and abs(frame_idx - self._last_frame_idx) > 1):
+                prev_fi = self._last_frame_idx
+                step = 1 if frame_idx > prev_fi else -1
+                n_steps = abs(frame_idx - prev_fi)
+                for k in range(1, n_steps):
+                    mid_fi = prev_fi + k * step
+                    old_val = float(fd.values[f_idx, mid_fi])
+                    old_mask = bool(fd.edited_mask[f_idx, mid_fi])
+                    new_val = float(fd.original_values[f_idx, mid_fi])
+                    fd.values[f_idx, mid_fi] = new_val
+                    fd.edited_mask[f_idx, mid_fi] = False
+                    self._stroke_changes.append(
+                        (f_idx, mid_fi, old_val, old_mask, new_val, False))
+                    self._quick_draw_edit_point(mid_fi, new_val)
+
+            old_val = float(fd.values[f_idx, frame_idx])
+            old_mask = bool(fd.edited_mask[f_idx, frame_idx])
+            new_val = float(fd.original_values[f_idx, frame_idx])
+            fd.values[f_idx, frame_idx] = new_val
+            fd.edited_mask[f_idx, frame_idx] = False
+            self._stroke_changes.append(
+                (f_idx, frame_idx, old_val, old_mask, new_val, False))
+            self._last_frame_idx = frame_idx
+            self._last_frame_freq = new_val
+            self._quick_draw_edit_point(frame_idx, new_val)
+            return
+
+        # --- Normal drawing ---
+        # Interpolate skipped frames
         if (self._last_frame_idx >= 0
                 and abs(frame_idx - self._last_frame_idx) > 1
                 and self._last_frame_freq is not None):
