@@ -1202,17 +1202,30 @@ class SpectrogramCanvas(FigureCanvas):
 
         # Single batch vlines call on spectrogram for interval boundaries
         if spec_interval_boundaries:
-            self.ax.vlines(sorted(spec_interval_boundaries),
+            sorted_ibs = sorted(spec_interval_boundaries)
+            self.ax.vlines(sorted_ibs,
                            0, self.max_freq,
-                           colors="#4488ff", linewidths=1.0,
+                           colors="#4488ff", linewidths=1.5,
                            linestyles="--", alpha=0.7, zorder=2)
+            if self.wave_ax is not None:
+                wymin, wymax = self.wave_ax.get_ylim()
+                self.wave_ax.vlines(sorted_ibs,
+                                    wymin, wymax,
+                                    colors="#4488ff", linewidths=1.5,
+                                    linestyles="--", alpha=0.7, zorder=2)
 
         # Single batch vlines call on spectrogram for point markers
         if spec_point_times:
             self.ax.vlines(spec_point_times,
                            0, self.max_freq,
-                           colors="#ff6622", linewidths=1.2,
+                           colors="#ff6622", linewidths=0.7,
                            linestyles="--", alpha=0.7, zorder=2)
+            if self.wave_ax is not None:
+                wymin, wymax = self.wave_ax.get_ylim()
+                self.wave_ax.vlines(spec_point_times,
+                                    wymin, wymax,
+                                    colors="#ff6622", linewidths=0.7,
+                                    linestyles="--", alpha=0.7, zorder=2)
 
         # Hide x-axis labels on all but the bottom tier
         self.ax.tick_params(labelbottom=False)
