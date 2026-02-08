@@ -989,10 +989,6 @@ class SpectrogramCanvas(FigureCanvas):
         vis_samples = samples[i_start:i_end]
         n_vis = len(vis_samples)
 
-        # Compute actual sample times from indices (not view bounds)
-        t_start = i_start / sr
-        t_end = i_end / sr
-
         # Determine target chunk count (~2x pixel width)
         try:
             ax_width_px = self.wave_ax.get_window_extent().width
@@ -1001,8 +997,8 @@ class SpectrogramCanvas(FigureCanvas):
             target_chunks = 600
 
         if n_vis <= target_chunks * 2:
-            # Few enough samples to plot directly
-            times = np.linspace(t_start, t_end, n_vis)
+            # Few enough samples — compute exact time per sample from index
+            times = (i_start + np.arange(n_vis)) / sr
             self.wave_ax.plot(times, vis_samples, color="#66ccff",
                               linewidth=0.5, alpha=0.9)
         else:
@@ -1012,7 +1008,9 @@ class SpectrogramCanvas(FigureCanvas):
             reshaped = vis_samples[:n_usable].reshape(target_chunks, chunk_size)
             env_min = reshaped.min(axis=1)
             env_max = reshaped.max(axis=1)
-            chunk_times = np.linspace(t_start, t_end, target_chunks)
+            # Center time of each chunk, computed from sample indices
+            chunk_times = (i_start + (np.arange(target_chunks) + 0.5)
+                           * chunk_size) / sr
             self.wave_ax.fill_between(chunk_times, env_min, env_max,
                                        color="#66ccff", alpha=0.7)
 
