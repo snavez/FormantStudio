@@ -30,12 +30,9 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QFormLayout, QGridLayout
 )
 from PyQt6.QtCore import Qt, QTimer, QEvent, QObject, pyqtSignal
-from PyQt6.QtGui import QAction, QKeySequence, QColor, QFont
+from PyQt6.QtGui import QAction, QKeySequence, QColor, QFont, QTransform
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
-from matplotlib.patches import Rectangle as MplRectangle
-import matplotlib.pyplot as plt
+import pyqtgraph as pg
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -510,24 +507,87 @@ class LabelEdit(QLineEdit):
 
 
 # ---------------------------------------------------------------------------
-# Spectrogram Canvas (matplotlib embedded in Qt)
+# Spectrogram Canvas (pyqtgraph embedded in Qt)
 # ---------------------------------------------------------------------------
 
-class SpectrogramCanvas(FigureCanvas):
+class _GLW(pg.GraphicsLayoutWidget):
+    """Inner GraphicsLayoutWidget that forwards mouse events to the canvas."""
+
+    def __init__(self, canvas, parent=None):
+        super().__init__(parent)
+        self._canvas = canvas
+        self.setBackground("#1e1e1e")
+        self.setMouseTracking(True)
+
+    def mousePressEvent(self, event):
+        self._canvas._on_mouse_press(event)
+
+    def mouseReleaseEvent(self, event):
+        self._canvas._on_mouse_release(event)
+
+    def mouseMoveEvent(self, event):
+        self._canvas._on_mouse_move(event)
+
+    def wheelEvent(self, event):
+        self._canvas._on_scroll(event)
+
+    def mouseDoubleClickEvent(self, event):
+        self._canvas._on_mouse_double_click(event)
+
+
+class SpectrogramCanvas(QWidget):
     """
-    Matplotlib canvas displaying:
+    pyqtgraph-based canvas displaying:
       - Spectrogram (with adjustable display settings)
       - Formant overlay (color-coded dots/lines)
-      - Interactive editing with blitting for responsiveness
+      - Interactive editing — no blitting needed (scene graph handles repaints)
     """
 
     def __init__(self, parent=None):
-        self.fig = Figure(figsize=(14, 5), dpi=100)
-        self.fig.set_facecolor("#1e1e1e")
-        self.ax = self.fig.add_subplot(111)
-        super().__init__(self.fig)
-        self.setParent(parent)
+        super().__init__(parent)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        # Layout
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._glw = _GLW(self)
+        layout.addWidget(self._glw)
+
+        # Plot items (created in _setup_axes)
+        self._spec_plot = None   # PlotItem for spectrogram
+        self._wave_plot = None   # PlotItem for waveform
+        self._tier_plots = []    # list of PlotItem for TextGrid tiers
+
+        # pyqtgraph items (persistent, updated in-place)
+        self._spec_image = None       # pg.ImageItem for spectrogram
+        self._wave_line = None        # pg.PlotDataItem for waveform
+        self._wave_zero = None        # pg.InfiniteLine for zero line
+        self._wave_fill_pos = None    # pg.PlotDataItem for envelope
+        self._wave_fill_neg = None    # pg.PlotDataItem for envelope
+        self._formant_scatters = {}   # {f_idx: pg.ScatterPlotItem}
+        self._transient_items = []    # items cleared each render
+        self._overlay_items = []      # selection/boundary overlay items
+
+        # Crosshair items
+        self._crosshair_v = None      # InfiniteLine on spec
+        self._crosshair_h = None      # InfiniteLine on spec
+        self._crosshair_wave_v = None # InfiniteLine on wave
+        self._crosshair_visible = False
+
+        # Playback cursor items
+        self._playback_cursors = []   # list of InfiniteLine on all plots
+
+        # Greyscale LUT (reversed: dark=high intensity)
+        self._gray_r_lut = np.zeros((256, 4), dtype=np.ubyte)
+        for i in range(256):
+            v = 255 - i
+            self._gray_r_lut[i] = [v, v, v, 255]
+
+        # Title label
+        self._title_item = None
+
+        # "Zoom in" text for when spectrogram is hidden
+        self._zoom_text = None
 
         # Data
         self.sound = None
@@ -536,8 +596,8 @@ class SpectrogramCanvas(FigureCanvas):
         self.spec_freqs = None
         self.formant_data = None
         self.textgrid_data = None   # TextGrid object or None
-        self.tier_axes = []         # list of axes for TextGrid tiers
-        self.wave_ax = None         # waveform axes (above spectrogram)
+        self.tier_axes = []         # kept for API compat (list, same length as _tier_plots)
+        self.wave_ax = None         # kept for API compat
 
         # Display settings
         self.dynamic_range = DEFAULT_DYNAMIC_RANGE
@@ -558,7 +618,6 @@ class SpectrogramCanvas(FigureCanvas):
         self.is_drawing = False
         self._last_frame_idx = -1
         self._last_frame_freq = None
-        self._bg_cache = None
         self._stroke_scatter = None
         self._stroke_times = []
         self._stroke_freqs = []
@@ -573,46 +632,36 @@ class SpectrogramCanvas(FigureCanvas):
 
         # Playback state
         self._playback_playing = False
-        self._playback_start_time = 0.0   # audio time where playback starts
-        self._playback_start_wall = 0.0   # wall-clock time at playback start
-        self._playback_end_time = 0.0     # audio time where playback ends
-        self._playback_cursor = None      # axvline artist
-        self._playback_timer = None       # QTimer for cursor animation
-        self._playback_cursor_bg = None   # blit cache
-        self._click_time = None           # last left-click position
-        self._hover_time = None           # current mouse hover time on spectrogram
+        self._playback_start_time = 0.0
+        self._playback_start_wall = 0.0
+        self._playback_end_time = 0.0
+        self._playback_timer = None
+        self._click_time = None
+        self._hover_time = None
 
         # TextGrid editing state
-        self._selected_boundary = None      # (tier_index, time) or None
+        self._selected_boundary = None
         self._dragging_boundary = False
         self._drag_tier_index = None
         self._drag_original_time = None
         self._drag_min_time = 0.0
         self._drag_max_time = 0.0
-        self._drag_aligned = []       # [(tier_idx, original_time), ...] for multi-tier drag
-        self._drag_lines_aligned = [] # [(tier_idx, axvline_artist), ...] for visual feedback
+        self._drag_aligned = []
+        self._drag_lines = []         # InfiniteLine items for drag feedback
 
         # Interval/point selection state
-        self._selected_interval = None      # (tier_idx, interval_idx) or None
-        self._label_edit = None             # set by MainWindow (LabelEdit widget)
+        self._selected_interval = None
+        self._label_edit = None
 
         # Spectrogram drag selection state
-        self._selection_start = None        # time range start
-        self._selection_end = None          # time range end
-        self._spec_dragging = False         # currently drag-selecting on spectrogram
-        self._spec_drag_start = None        # start time of spectrogram drag
-
-        # Blit state for drag operations (avoid full render per frame)
-        self._drag_bg = None                # cached figure background
-        self._drag_line_spec = None         # boundary drag: axvline on spectrogram
-        self._drag_line_tier = None         # boundary drag: axvline on tier
-        self._spec_sel_artist = None        # spec drag: axvspan on spectrogram
-        self._spec_sel_tier_artists = []    # spec drag: axvspan on each tier
-        self._spec_sel_wave_artist = None   # spec drag: axvspan on waveform
-        self._drag_line_wave = None         # boundary drag: axvline on waveform
+        self._selection_start = None
+        self._selection_end = None
+        self._spec_dragging = False
+        self._spec_drag_start = None
+        self._spec_sel_regions = []   # LinearRegionItem items for drag selection
 
         # Active tier state
-        self._active_tier = None  # int index of the active/selected tier
+        self._active_tier = None
 
         # Debounce timers
         self._render_timer = QTimer()
@@ -624,35 +673,171 @@ class SpectrogramCanvas(FigureCanvas):
         self._label_render_timer.setInterval(100)
         self._label_render_timer.timeout.connect(self._debounced_render)
 
-        # Overlay blit state (selection/boundary highlights without full render)
-        self._overlay_bg = None       # cached base content (no selection overlays)
-        self._overlay_artists = []    # current overlay artists (for cleanup)
+        # Callbacks
+        self._status_callback = None
+        self._on_formant_edited = None
+        self._on_textgrid_edited = None
+        self._on_view_changed_callback = None
 
-        # Crosshair state
-        self._crosshair_h = None  # horizontal line artist (spectrogram)
-        self._crosshair_v = None  # vertical line artist (spectrogram)
-        self._crosshair_wave_v = None  # vertical line artist (waveform)
-        self._crosshair_visible = False
-        self._status_callback = None  # set by MainWindow
-        self._on_formant_edited = None  # callback when formant edit stroke ends
-        self._on_textgrid_edited = None  # callback when textgrid data changes
-
-        # Connect mouse events
-        self.mpl_connect("button_press_event", self._on_mouse_press)
-        self.mpl_connect("button_release_event", self._on_mouse_release)
-        self.mpl_connect("motion_notify_event", self._on_mouse_move)
-        self.mpl_connect("scroll_event", self._on_scroll)
         self._setup_empty_axes()
 
-    def _setup_empty_axes(self):
-        self.ax.set_facecolor("#1a1a2e")
-        self.ax.set_xlabel("Time (s)", color="#eeeeee", fontsize=9)
-        self.ax.set_ylabel("Frequency (Hz)", color="#eeeeee", fontsize=9)
-        self.ax.tick_params(colors="#cccccc", labelsize=8)
-        self.ax.set_title("Open a WAV file to begin", color="#eeeeee", fontsize=11)
-        self.fig.tight_layout()
-        self.draw()
+    # -------------------------------------------------------------------
+    # Axes layout
+    # -------------------------------------------------------------------
 
+    def _setup_empty_axes(self):
+        """Show an empty canvas with a message."""
+        self._glw.clear()
+        self._spec_plot = self._glw.addPlot(row=0, col=0)
+        self._spec_plot.setMouseEnabled(x=False, y=False)
+        self._spec_plot.hideButtons()
+        self._spec_plot.setMenuEnabled(False)
+        self._spec_plot.getAxis('bottom').setPen('#cccccc')
+        self._spec_plot.getAxis('left').setPen('#cccccc')
+        self._spec_plot.getAxis('bottom').setTextPen('#cccccc')
+        self._spec_plot.getAxis('left').setTextPen('#cccccc')
+        self._spec_plot.setLabel('bottom', 'Time (s)')
+        self._spec_plot.setLabel('left', 'Frequency (Hz)')
+        self._spec_plot.getViewBox().setBackgroundColor('#1a1a2e')
+        t = pg.TextItem("Open a WAV file to begin", color='#eeeeee', anchor=(0.5, 0.5))
+        t.setFont(QFont("", 11))
+        self._spec_plot.addItem(t)
+        t.setPos(0.5, 0.5)
+        self._spec_plot.setXRange(0, 1)
+        self._spec_plot.setYRange(0, 1)
+        self._wave_plot = None
+        self._tier_plots = []
+        self.tier_axes = []
+        self.wave_ax = None
+
+    def _setup_axes(self):
+        """Recreate plot layout based on loaded data."""
+        self._glw.clear()
+        self._tier_plots = []
+        self.tier_axes = []
+        self._wave_plot = None
+        self.wave_ax = None
+        self._spec_image = None
+        self._wave_line = None
+        self._wave_zero = None
+        self._wave_fill_pos = None
+        self._wave_fill_neg = None
+        self._formant_scatters = {}
+        self._transient_items = []
+        self._overlay_items = []
+        self._crosshair_v = None
+        self._crosshair_h = None
+        self._crosshair_wave_v = None
+        self._playback_cursors = []
+        self._title_item = None
+        self._zoom_text = None
+        self._stroke_scatter = None
+
+        has_wave = self.sound is not None
+        tg = self.textgrid_data
+        has_tiers = tg is not None and len(tg.tiers) > 0
+
+        if not has_wave and not has_tiers:
+            self._spec_plot = self._glw.addPlot(row=0, col=0)
+            self._configure_plot(self._spec_plot, '#1a1a2e')
+            return
+
+        # Build layout with row stretch factors
+        row = 0
+
+        if has_wave:
+            # Waveform on top
+            self._wave_plot = self._glw.addPlot(row=row, col=0)
+            self._configure_plot(self._wave_plot, '#1a1a2e')
+            self._wave_plot.getAxis('bottom').setStyle(showValues=False)
+            self._wave_plot.getAxis('bottom').setHeight(0)
+            self._wave_plot.setLabel('left', 'Amp', **{'font-size': '8pt', 'color': '#eeeeee'})
+            self._glw.ci.layout.setRowStretchFactor(row, 15)
+            self.wave_ax = self._wave_plot  # API compat
+            row += 1
+
+        # Spectrogram
+        if has_tiers:
+            spec_stretch = 50
+        else:
+            spec_stretch = 85 if has_wave else 100
+        self._spec_plot = self._glw.addPlot(row=row, col=0)
+        self._configure_plot(self._spec_plot, '#1a1a2e')
+        self._spec_plot.setLabel('left', 'Frequency (Hz)', **{'font-size': '9pt', 'color': '#eeeeee'})
+        self._glw.ci.layout.setRowStretchFactor(row, spec_stretch)
+        row += 1
+
+        # Link wave X to spec
+        if self._wave_plot is not None:
+            self._wave_plot.setXLink(self._spec_plot)
+
+        # Tier plots
+        if has_tiers:
+            n_tiers = len(tg.tiers)
+            tier_share = max(3, 35 // n_tiers)
+            for i in range(n_tiers):
+                tp = self._glw.addPlot(row=row + i, col=0)
+                self._configure_plot(tp, '#ffffff')
+                tp.setXLink(self._spec_plot)
+                tp.setYRange(0, 1, padding=0)
+                tp.getAxis('left').setWidth(60)
+                tp.hideAxis('left')
+                # Only show x-axis on bottom tier
+                if i < n_tiers - 1:
+                    tp.getAxis('bottom').setStyle(showValues=False)
+                    tp.getAxis('bottom').setHeight(0)
+                else:
+                    tp.setLabel('bottom', 'Time (s)', **{'font-size': '9pt', 'color': '#eeeeee'})
+                self._glw.ci.layout.setRowStretchFactor(row + i, tier_share)
+                self._tier_plots.append(tp)
+            # Hide x-axis on spectrogram when tiers present
+            self._spec_plot.getAxis('bottom').setStyle(showValues=False)
+            self._spec_plot.getAxis('bottom').setHeight(0)
+        else:
+            # No tiers — spec shows its own x-axis
+            self._spec_plot.setLabel('bottom', 'Time (s)', **{'font-size': '9pt', 'color': '#eeeeee'})
+
+        self.tier_axes = list(self._tier_plots)  # API compat
+
+        # Create persistent items
+        self._spec_image = pg.ImageItem()
+        self._spec_image.setLookupTable(self._gray_r_lut)
+        self._spec_plot.addItem(self._spec_image)
+
+        # Crosshair
+        self._setup_crosshair()
+
+    def _configure_plot(self, plot, bg_color):
+        """Apply common configuration to a PlotItem."""
+        plot.setMouseEnabled(x=False, y=False)
+        plot.hideButtons()
+        plot.setMenuEnabled(False)
+        plot.getViewBox().setBackgroundColor(bg_color)
+        for axis_name in ('bottom', 'left'):
+            ax = plot.getAxis(axis_name)
+            ax.setPen('#cccccc')
+            ax.setTextPen('#cccccc')
+            ax.setStyle(tickFont=QFont("", 8))
+
+    def _setup_crosshair(self):
+        """Create crosshair InfiniteLine items on spec and wave plots."""
+        pen = pg.mkPen('#00ffcc', width=0.7, style=Qt.PenStyle.SolidLine)
+        self._crosshair_v = pg.InfiniteLine(angle=90, pen=pen)
+        self._crosshair_h = pg.InfiniteLine(angle=0, pen=pen)
+        self._crosshair_v.setVisible(False)
+        self._crosshair_h.setVisible(False)
+        self._spec_plot.addItem(self._crosshair_v)
+        self._spec_plot.addItem(self._crosshair_h)
+        self._crosshair_wave_v = None
+        if self._wave_plot is not None:
+            self._crosshair_wave_v = pg.InfiniteLine(angle=90, pen=pen)
+            self._crosshair_wave_v.setVisible(False)
+            self._wave_plot.addItem(self._crosshair_wave_v)
+        self._crosshair_visible = False
+
+    # -------------------------------------------------------------------
+    # Data loading
+    # -------------------------------------------------------------------
 
     def load_sound(self, filepath):
         """Load audio and compute spectrogram."""
@@ -667,14 +852,12 @@ class SpectrogramCanvas(FigureCanvas):
         """Compute spectrogram using Praat."""
         if self.sound is None:
             return
-
         spec_obj = self.sound.to_spectrogram(
             window_length=self.spec_window_length,
             maximum_frequency=self.max_freq,
             time_step=0.002,
             frequency_step=20.0,
         )
-
         self.spectrogram_data = spec_obj.values  # shape: (n_freq, n_time)
         self.spec_freqs = np.array(spec_obj.ys())
         self.spec_times = np.array(spec_obj.xs())
@@ -699,20 +882,20 @@ class SpectrogramCanvas(FigureCanvas):
         """Zoom in/out by factor, centered on center_time."""
         if center_time is None:
             center_time = (self.view_start + self.view_end) / 2.0
-
         old_width = self.view_width
         new_width = old_width * factor
         new_width = max(MIN_VIEW_WIDTH, min(new_width, self.total_duration))
-
-        # Keep center_time at the same relative position in the view
         if old_width > 0:
             ratio = (center_time - self.view_start) / old_width
         else:
             ratio = 0.5
         ratio = max(0.0, min(1.0, ratio))
-
         new_start = center_time - ratio * new_width
         self.set_view(new_start, new_start + new_width)
+
+    # -------------------------------------------------------------------
+    # Render
+    # -------------------------------------------------------------------
 
     def _debounced_render(self):
         """Slot for debounce timers — just calls render()."""
@@ -722,20 +905,84 @@ class SpectrogramCanvas(FigureCanvas):
         """Full re-render of spectrogram + formants + TextGrid tiers."""
         if self._playback_playing:
             self.stop_playback()
-        self.ax.clear()
-        if self.wave_ax is not None:
-            self.wave_ax.clear()
-        self._bg_cache = None
 
         if self.spectrogram_data is None:
             self._setup_empty_axes()
             return
 
+        # Clear transient items from previous render
+        self._clear_transient_items()
+        self._clear_overlay_items()
+
+        # Set view range (propagates via X link)
+        self._spec_plot.setXRange(self.view_start, self.view_end, padding=0)
+        self._spec_plot.setYRange(0, self.max_freq, padding=0)
+
+        # Draw components
+        self._draw_spectrogram()
+        if self._wave_plot is not None:
+            self._draw_waveform()
+        if self.show_formants and self.formant_data is not None:
+            self._draw_formants()
+        if self.textgrid_data is not None and len(self._tier_plots) > 0:
+            self._draw_textgrid()
+
+        # Title
+        self._update_title()
+
+        # Selection/boundary overlays
+        self._draw_selection_overlay()
+
+    def _clear_transient_items(self):
+        """Remove transient items from all plots."""
+        for item, plot in self._transient_items:
+            try:
+                plot.removeItem(item)
+            except Exception:
+                pass
+        self._transient_items = []
+
+    def _clear_overlay_items(self):
+        """Remove overlay items (selection/boundary highlights)."""
+        for item, plot in self._overlay_items:
+            try:
+                plot.removeItem(item)
+            except Exception:
+                pass
+        self._overlay_items = []
+
+    def _add_transient(self, item, plot):
+        """Add a transient item to a plot, tracked for cleanup."""
+        plot.addItem(item)
+        self._transient_items.append((item, plot))
+
+    def _add_overlay(self, item, plot):
+        """Add an overlay item to a plot, tracked for cleanup."""
+        plot.addItem(item)
+        self._overlay_items.append((item, plot))
+
+    # -------------------------------------------------------------------
+    # Spectrogram drawing
+    # -------------------------------------------------------------------
+
+    def _draw_spectrogram(self):
+        """Render spectrogram image into the spec plot."""
+        if self._spec_image is None:
+            return
+
         view_width = self.view_width
         show_spectrogram = view_width <= MAX_SPECTROGRAM_VIEW
 
+        # Remove old zoom text if any
+        if self._zoom_text is not None:
+            try:
+                self._spec_plot.removeItem(self._zoom_text)
+            except Exception:
+                pass
+            self._zoom_text = None
+
         if show_spectrogram:
-            # Slice spectrogram to visible time range for performance
+            # Slice spectrogram to visible time range
             t_mask = ((self.spec_times >= self.view_start) &
                       (self.spec_times <= self.view_end))
             vis_times = self.spec_times[t_mask]
@@ -747,204 +994,151 @@ class SpectrogramCanvas(FigureCanvas):
                 vmax = peak_db + self.brightness
                 vmin = vmax - self.dynamic_range
 
-                self.ax.imshow(
-                    power_db,
-                    aspect="auto",
-                    origin="lower",
-                    cmap="gray_r",
-                    vmin=vmin, vmax=vmax,
-                    extent=[vis_times[0], vis_times[-1],
-                            self.spec_freqs[0], self.spec_freqs[-1]],
-                    interpolation="bilinear",
-                )
+                # Normalize to 0-255 uint8 for LUT
+                img = np.clip((power_db - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
+
+                # ImageItem expects (width, height) = (n_time, n_freq)
+                self._spec_image.setImage(img.T, autoLevels=False)
+                self._spec_image.setLookupTable(self._gray_r_lut)
+
+                # Position: translate to (t0, f0), scale to fill time/freq range
+                t0 = vis_times[0]
+                f0 = self.spec_freqs[0] if len(self.spec_freqs) > 0 else 0
+                n_time = img.shape[1]
+                n_freq = img.shape[0]
+                dt = (vis_times[-1] - vis_times[0]) if n_time > 1 else 1.0
+                df = (self.spec_freqs[-1] - self.spec_freqs[0]) if n_freq > 1 else self.max_freq
+
+                tr = QTransform()
+                tr.translate(t0, f0)
+                tr.scale(dt / max(n_time, 1), df / max(n_freq, 1))
+                self._spec_image.setTransform(tr)
+                self._spec_image.setVisible(True)
+            else:
+                self._spec_image.setVisible(False)
         else:
-            # View too wide for spectrogram — show message
+            self._spec_image.setVisible(False)
+            # Show zoom message
             mid_t = (self.view_start + self.view_end) / 2
             mid_f = self.max_freq / 2
-            self.ax.text(
-                mid_t, mid_f,
+            self._zoom_text = pg.TextItem(
                 f"Zoom in to view spectrogram\n"
                 f"(current view: {view_width:.1f}s, max: {MAX_SPECTROGRAM_VIEW:.0f}s)\n\n"
                 f"Use Ctrl+I to zoom in",
-                ha="center", va="center", color="#666688",
-                fontsize=13, fontstyle="italic",
+                color='#666688', anchor=(0.5, 0.5),
             )
+            self._zoom_text.setFont(QFont("", 13))
+            self._spec_plot.addItem(self._zoom_text)
+            self._zoom_text.setPos(mid_t, mid_f)
 
-        self.ax.set_xlim(self.view_start, self.view_end)
-        self.ax.set_ylim(0, self.max_freq)
-        self.ax.set_ylabel("Frequency (Hz)", color="#eeeeee", fontsize=9)
-        self.ax.tick_params(colors="#cccccc", labelsize=8)
-        self.ax.set_facecolor("#1a1a2e")
+    # -------------------------------------------------------------------
+    # Waveform drawing
+    # -------------------------------------------------------------------
 
-        # Draw waveform
-        if self.wave_ax is not None:
-            self._draw_waveform()
-
-        # Draw formants
-        if self.show_formants and self.formant_data is not None:
-            self._draw_formants()
-
-        # Draw TextGrid tiers
-        if self.textgrid_data is not None and len(self.tier_axes) > 0:
-            self._draw_textgrid()
-        else:
-            # No tiers — spectrogram shows its own x-axis label
-            self.ax.set_xlabel("Time (s)", color="#eeeeee", fontsize=9)
-
-        # Title with edit mode indicator (on topmost axes)
-        title_ax = self.wave_ax if self.wave_ax is not None else self.ax
-        title = os.path.basename(self._filepath) if hasattr(self, "_filepath") else ""
-        if self.edit_mode:
-            fn = self.active_formant + 1
-            color = FORMANT_COLORS.get(fn, "#ffffff")
-            title += f"  |  EDIT MODE — Drawing {FORMANT_LABELS[fn]}"
-            title_ax.set_title(title, color=color, fontsize=11, fontweight="bold")
-        else:
-            title_ax.set_title(title, color="#eeeeee", fontsize=11)
-
-        if self.tier_axes:
-            self.fig.subplots_adjust(
-                left=0.12, right=0.98, top=0.94, bottom=0.08, hspace=0.05
-            )
-        else:
-            self.fig.subplots_adjust(
-                left=0.12, right=0.98, top=0.94, bottom=0.10
-            )
-
-        # Create crosshair artists (invisible) before draw so they are
-        # part of the artist tree but don't trigger extra redraws.
-        self._crosshair_h = self.ax.axhline(
-            y=0, color="#00ffcc", linewidth=0.7, alpha=0.8,
-            linestyle="-", visible=False, zorder=10,
-        )
-        self._crosshair_v = self.ax.axvline(
-            x=0, color="#00ffcc", linewidth=0.7, alpha=0.8,
-            linestyle="-", visible=False, zorder=10,
-        )
-        self._crosshair_wave_v = None
-        if self.wave_ax is not None:
-            self._crosshair_wave_v = self.wave_ax.axvline(
-                x=0, color="#00ffcc", linewidth=0.7, alpha=0.8,
-                linestyle="-", visible=False, zorder=10,
-            )
-        self._crosshair_visible = False
-
-        self.draw()
-
-        # Cache base content for overlay blitting (before selection overlays)
-        self._overlay_bg = self.fig.canvas.copy_from_bbox(self.fig.bbox)
-
-        # Draw selection/boundary overlays on top via blitting
-        self._draw_selection_overlay()
-
-    def _draw_selection_overlay(self):
-        """Draw selection/boundary highlights via blitting over cached base.
-
-        This avoids a full render() for click interactions that only change
-        which interval/boundary/time-range is highlighted.
-        """
-        # Remove previous overlay artists
-        for a in self._overlay_artists:
-            a.remove()
-        self._overlay_artists = []
-
-        if self._overlay_bg is None:
+    def _draw_waveform(self):
+        """Draw waveform into the wave plot."""
+        if self._wave_plot is None or self.sound is None:
             return
 
-        self.fig.canvas.restore_region(self._overlay_bg)
+        # Remove old waveform items
+        if self._wave_line is not None:
+            try:
+                self._wave_plot.removeItem(self._wave_line)
+            except Exception:
+                pass
+            self._wave_line = None
+        if self._wave_fill_pos is not None:
+            try:
+                self._wave_plot.removeItem(self._wave_fill_pos)
+            except Exception:
+                pass
+            self._wave_fill_pos = None
+        if self._wave_fill_neg is not None:
+            try:
+                self._wave_plot.removeItem(self._wave_fill_neg)
+            except Exception:
+                pass
+            self._wave_fill_neg = None
+        if self._wave_zero is not None:
+            try:
+                self._wave_plot.removeItem(self._wave_zero)
+            except Exception:
+                pass
+            self._wave_zero = None
 
-        # --- Time selection highlight (spectrogram + waveform + tier axes) ---
-        if self._selection_start is not None and self._selection_end is not None:
-            a = self.ax.axvspan(
-                self._selection_start, self._selection_end,
-                color="#3366cc", alpha=0.25, zorder=5,
+        samples = self.sound.values[0]
+        sr = self.sound.sampling_frequency
+        total_samples = len(samples)
+
+        i_start = max(0, int(self.view_start * sr))
+        i_end = min(total_samples, int(self.view_end * sr))
+        if i_end <= i_start:
+            return
+
+        vis_samples = samples[i_start:i_end]
+        n_vis = len(vis_samples)
+
+        # Target ~2000 points for performance
+        target_chunks = 1000
+
+        if n_vis <= target_chunks * 2:
+            times = (i_start + np.arange(n_vis)) / sr
+            self._wave_line = self._wave_plot.plot(
+                times, vis_samples,
+                pen=pg.mkPen('#66ccff', width=0.5),
             )
-            self._overlay_artists.append(a)
-            if self.wave_ax is not None:
-                a = self.wave_ax.axvspan(
-                    self._selection_start, self._selection_end,
-                    color="#3366cc", alpha=0.25, zorder=5,
-                )
-                self._overlay_artists.append(a)
-            for tier_ax in self.tier_axes:
-                a = tier_ax.axvspan(
-                    self._selection_start, self._selection_end,
-                    color="#3366cc", alpha=0.15, zorder=0,
-                )
-                self._overlay_artists.append(a)
+        else:
+            # Min/max envelope downsampling
+            chunk_size = n_vis // target_chunks
+            n_usable = chunk_size * target_chunks
+            reshaped = vis_samples[:n_usable].reshape(target_chunks, chunk_size)
+            env_min = reshaped.min(axis=1)
+            env_max = reshaped.max(axis=1)
+            chunk_times = (i_start + (np.arange(target_chunks) + 0.5) * chunk_size) / sr
 
-        # --- Selected interval highlight ---
-        if self._selected_interval is not None:
-            sel_tier_idx, sel_i = self._selected_interval
-            if (self.textgrid_data is not None
-                    and 0 <= sel_tier_idx < len(self.textgrid_data.tiers)):
-                tier = self.textgrid_data.tiers[sel_tier_idx]
-                if (tier.tier_class == "IntervalTier"
-                        and sel_i < len(tier.intervals)):
-                    iv = tier.intervals[sel_i]
-                    if sel_tier_idx < len(self.tier_axes):
-                        a = self.tier_axes[sel_tier_idx].axvspan(
-                            iv.xmin, iv.xmax,
-                            color="#3366cc", alpha=0.25, zorder=0)
-                        self._overlay_artists.append(a)
+            # Fill between using two curves
+            self._wave_fill_pos = pg.PlotDataItem(chunk_times, env_max, pen=pg.mkPen(None))
+            self._wave_fill_neg = pg.PlotDataItem(chunk_times, env_min, pen=pg.mkPen(None))
+            fill = pg.FillBetweenItem(self._wave_fill_pos, self._wave_fill_neg,
+                                       brush=pg.mkBrush(102, 204, 255, 180))
+            self._wave_plot.addItem(self._wave_fill_pos)
+            self._wave_plot.addItem(self._wave_fill_neg)
+            self._wave_plot.addItem(fill)
+            # Track fill for cleanup
+            self._wave_line = fill  # reuse for removal
 
-        # --- Selected boundary highlight + shadow boundaries ---
-        if self._selected_boundary is not None:
-            sel_tier, sel_time = self._selected_boundary
-            view_start = self.view_start
-            view_end = self.view_end
-            if view_start <= sel_time <= view_end:
-                # Red highlight on spectrogram
-                a = self.ax.axvline(sel_time, color="#ff0000", linewidth=2.5,
-                                    alpha=0.9, zorder=6)
-                self._overlay_artists.append(a)
-                # Red highlight on waveform
-                if self.wave_ax is not None:
-                    a = self.wave_ax.axvline(sel_time, color="#ff0000",
-                                             linewidth=2.5, alpha=0.9, zorder=6)
-                    self._overlay_artists.append(a)
-                # Red highlight on the selected tier
-                if 0 <= sel_tier < len(self.tier_axes):
-                    a = self.tier_axes[sel_tier].axvline(
-                        sel_time, color="#ff0000", linewidth=2.5,
-                        alpha=0.9, zorder=6)
-                    self._overlay_artists.append(a)
+        # Zero line
+        self._wave_zero = pg.InfiniteLine(
+            pos=0, angle=0,
+            pen=pg.mkPen('#555577', width=0.5, style=Qt.PenStyle.SolidLine),
+        )
+        self._wave_plot.addItem(self._wave_zero)
 
-                # Shadow boundaries on OTHER tiers
-                for other_idx, other_ax in enumerate(self.tier_axes):
-                    if other_idx == sel_tier:
-                        continue
-                    # Dashed gray line
-                    a = other_ax.axvline(sel_time, color="#888888",
-                                         linewidth=1.0, linestyle="--",
-                                         alpha=0.6, zorder=4)
-                    self._overlay_artists.append(a)
-                    # Clickable circle
-                    a = other_ax.scatter(
-                        [sel_time], [0.5], s=40, c="#6688cc",
-                        edgecolors="white", linewidths=1.0, zorder=5,
-                    )
-                    self._overlay_artists.append(a)
+        # Y limits
+        vis_max = max(abs(vis_samples.min()), abs(vis_samples.max()), 0.01)
+        self._wave_plot.setYRange(-vis_max, vis_max, padding=0)
 
-        # Draw all overlay artists via blit
-        for a in self._overlay_artists:
-            a.axes.draw_artist(a)
-
-        self.fig.canvas.blit(self.fig.bbox)
-
-        # Recapture crosshair bg to include overlays (full figure for wave+spec)
-        self._crosshair_bg = self.fig.canvas.copy_from_bbox(self.fig.bbox)
+    # -------------------------------------------------------------------
+    # Formant drawing
+    # -------------------------------------------------------------------
 
     def _draw_formants(self):
         """Draw formant overlay on the spectrogram."""
-        fd = self.formant_data
+        # Remove old formant scatters
+        for key, sc in self._formant_scatters.items():
+            try:
+                self._spec_plot.removeItem(sc)
+            except Exception:
+                pass
+        self._formant_scatters = {}
 
-        # Only draw points within the visible time range
+        fd = self.formant_data
         t_mask = ((fd.times >= self.view_start) & (fd.times <= self.view_end))
 
         for f_idx in range(self.display_n_formants):
             fn = f_idx + 1
             color = FORMANT_COLORS.get(fn, "#ffffff")
+            qcolor = QColor(color)
 
             vals = fd.values[f_idx]
             edited = fd.edited_mask[f_idx]
@@ -955,217 +1149,89 @@ class SpectrogramCanvas(FigureCanvas):
 
             is_active = (self.edit_mode and f_idx == self.active_formant)
 
-            if is_active:
-                # In edit mode for this formant: show original track
-                # so the user can see where adjustments are needed
-                unedited_mask = valid & ~edited
-                if np.any(unedited_mask):
-                    self.ax.scatter(
-                        fd.times[unedited_mask], vals[unedited_mask],
-                        c=color, s=2, alpha=0.7, zorder=3,
-                    )
-                # Show edited points prominently
-                edited_valid = valid & edited
-                if np.any(edited_valid):
-                    self.ax.scatter(
-                        fd.times[edited_valid], vals[edited_valid],
-                        c=color, s=8, alpha=1.0, zorder=4,
-                        edgecolors="white", linewidths=0.3,
-                    )
-            else:
-                # Draw unedited points as small dots
-                unedited_mask = valid & ~edited
-                if np.any(unedited_mask):
-                    self.ax.scatter(
-                        fd.times[unedited_mask], vals[unedited_mask],
-                        c=color, s=2, alpha=0.7, zorder=3,
-                    )
+            # Unedited points: small
+            unedited_mask = valid & ~edited
+            if np.any(unedited_mask):
+                sc = pg.ScatterPlotItem(
+                    x=fd.times[unedited_mask], y=vals[unedited_mask],
+                    size=3, pen=pg.mkPen(None),
+                    brush=pg.mkBrush(qcolor.red(), qcolor.green(), qcolor.blue(), 180),
+                )
+                self._spec_plot.addItem(sc)
+                self._formant_scatters[(f_idx, 'unedited')] = sc
 
-                # Draw edited points as slightly larger, brighter dots
-                edited_valid = valid & edited
-                if np.any(edited_valid):
-                    self.ax.scatter(
-                        fd.times[edited_valid], vals[edited_valid],
-                        c=color, s=8, alpha=1.0, zorder=4,
-                        edgecolors="white", linewidths=0.3,
-                    )
-
-    def _draw_waveform(self):
-        """Draw waveform envelope into the wave_ax axes."""
-        if self.wave_ax is None or self.sound is None:
-            return
-
-        self.wave_ax.clear()
-        self.wave_ax.set_facecolor("#1a1a2e")
-        self.wave_ax.tick_params(colors="#cccccc", labelsize=8, labelbottom=False)
-        self.wave_ax.set_ylabel("Amp", color="#eeeeee", fontsize=8)
-
-        samples = self.sound.values[0]
-        sr = self.sound.sampling_frequency
-        total_samples = len(samples)
-
-        # Slice to visible time range
-        i_start = max(0, int(self.view_start * sr))
-        i_end = min(total_samples, int(self.view_end * sr))
-        if i_end <= i_start:
-            return
-
-        vis_samples = samples[i_start:i_end]
-        n_vis = len(vis_samples)
-
-        # Determine target chunk count (~2x pixel width)
-        try:
-            ax_width_px = self.wave_ax.get_window_extent().width
-            target_chunks = max(100, int(ax_width_px * 2))
-        except Exception:
-            target_chunks = 600
-
-        if n_vis <= target_chunks * 2:
-            # Few enough samples — compute exact time per sample from index
-            times = (i_start + np.arange(n_vis)) / sr
-            self.wave_ax.plot(times, vis_samples, color="#66ccff",
-                              linewidth=0.5, alpha=0.9)
-        else:
-            # Min/max envelope downsampling
-            chunk_size = n_vis // target_chunks
-            n_usable = chunk_size * target_chunks
-            reshaped = vis_samples[:n_usable].reshape(target_chunks, chunk_size)
-            env_min = reshaped.min(axis=1)
-            env_max = reshaped.max(axis=1)
-            # Center time of each chunk, computed from sample indices
-            chunk_times = (i_start + (np.arange(target_chunks) + 0.5)
-                           * chunk_size) / sr
-            self.wave_ax.fill_between(chunk_times, env_min, env_max,
-                                       color="#66ccff", alpha=0.7)
-
-        # Zero line
-        self.wave_ax.axhline(0, color="#555577", linewidth=0.5, alpha=0.5)
-
-        # Set y-limits symmetrically around zero
-        vis_max = max(abs(vis_samples.min()), abs(vis_samples.max()), 0.01)
-        self.wave_ax.set_ylim(-vis_max, vis_max)
+            # Edited points: larger with white edge
+            edited_valid = valid & edited
+            if np.any(edited_valid):
+                sc = pg.ScatterPlotItem(
+                    x=fd.times[edited_valid], y=vals[edited_valid],
+                    size=8,
+                    pen=pg.mkPen('white', width=0.3),
+                    brush=pg.mkBrush(qcolor.red(), qcolor.green(), qcolor.blue(), 255),
+                )
+                self._spec_plot.addItem(sc)
+                self._formant_scatters[(f_idx, 'edited')] = sc
 
     # -------------------------------------------------------------------
-    # TextGrid axes layout and drawing
+    # TextGrid drawing
     # -------------------------------------------------------------------
-
-    def _setup_axes(self):
-        """
-        Recreate figure axes layout based on loaded data.
-        Always includes waveform (if sound loaded) above spectrogram.
-        With TextGrid: adds one axes per tier below, all sharing x-axis.
-        """
-        from matplotlib.gridspec import GridSpec
-
-        self.fig.clear()
-        self.tier_axes = []
-        self.wave_ax = None
-
-        has_wave = self.sound is not None
-        tg = self.textgrid_data
-        has_tiers = tg is not None and len(tg.tiers) > 0
-
-        if not has_wave and not has_tiers:
-            # No sound loaded yet — simple single axes
-            self.ax = self.fig.add_subplot(111)
-            return
-
-        # Build height ratios: [wave, spec, tier1, tier2, ...]
-        ratios = []
-        n_rows = 0
-
-        if has_wave:
-            ratios.append(15)   # waveform 15%
-            n_rows += 1
-
-        if has_tiers:
-            ratios.append(50)   # spectrogram 50%
-        else:
-            ratios.append(85)   # spectrogram 85% (no tiers)
-        n_rows += 1
-
-        if has_tiers:
-            n_tiers = len(tg.tiers)
-            tier_share = max(3, 35 // n_tiers)
-            ratios.extend([tier_share] * n_tiers)
-            n_rows += n_tiers
-
-        gs = GridSpec(n_rows, 1, height_ratios=ratios, hspace=0.05,
-                      figure=self.fig)
-
-        row = 0
-        if has_wave:
-            # Spectrogram axes first (owns xlim), then waveform shares
-            self.ax = self.fig.add_subplot(gs[1])
-            self.wave_ax = self.fig.add_subplot(gs[0], sharex=self.ax)
-            self.wave_ax.tick_params(labelbottom=False)
-            row = 2
-        else:
-            self.ax = self.fig.add_subplot(gs[0])
-            row = 1
-
-        if has_tiers:
-            for i in range(len(tg.tiers)):
-                tier_ax = self.fig.add_subplot(gs[row + i], sharex=self.ax)
-                self.tier_axes.append(tier_ax)
 
     def _draw_textgrid(self):
-        """Render TextGrid tiers into their axes and boundary lines on spectrogram.
-
-        Uses batch draw calls (vlines, broken_barh, scatter) instead of
-        per-interval artists to stay fast with large TextGrids.
-        """
+        """Render TextGrid tiers into their plots."""
         tg = self.textgrid_data
-        if tg is None or len(self.tier_axes) == 0:
+        if tg is None or len(self._tier_plots) == 0:
             return
 
         view_start = self.view_start
         view_end = self.view_end
         view_width = view_end - view_start
 
-        # Pixel width of tier axes for text LOD (skip tiny unreadable labels)
-        ax_width_px = self.tier_axes[0].get_window_extent().width if self.tier_axes else 0
+        # Pixel width for text LOD
+        vb = self._tier_plots[0].getViewBox()
+        ax_width_px = vb.width() if vb is not None else 0
 
-        # Collect all boundary times for a single batch vlines on spectrogram
         spec_interval_boundaries = set()
         spec_point_times = []
 
-        for tier_idx, (tier, tier_ax) in enumerate(zip(tg.tiers, self.tier_axes)):
-            tier_ax.clear()
+        for tier_idx, (tier, tier_plot) in enumerate(zip(tg.tiers, self._tier_plots)):
             is_active = (tier_idx == self._active_tier)
-            tier_ax.set_facecolor("#fff8c4" if is_active else "#ffffff")
-            tier_ax.set_xlim(view_start, view_end)
-            tier_ax.set_ylim(0, 1)
-            tier_ax.set_yticks([])
-            tier_ax.tick_params(colors="#555555", labelsize=8)
-            tier_ax.set_ylabel(tier.name,
-                               color="#cc2200" if is_active else "#99bbdd",
-                               fontsize=10,
-                               fontweight="bold" if is_active else "normal",
-                               rotation=0, ha="right", va="center",
-                               labelpad=10)
-            # Subtle border around tier
-            for spine in tier_ax.spines.values():
-                spine.set_color("#999999")
-                spine.set_linewidth(0.5)
+            tier_plot.getViewBox().setBackgroundColor('#fff8c4' if is_active else '#ffffff')
+            tier_plot.setYRange(0, 1, padding=0)
+
+            # Tier label
+            tier_label = pg.TextItem(
+                tier.name,
+                color='#cc2200' if is_active else '#99bbdd',
+                anchor=(1.0, 0.5),
+            )
+            font = QFont("", 10)
+            if is_active:
+                font.setBold(True)
+            tier_label.setFont(font)
+            tier_label.setPos(view_start, 0.5)
+            self._add_transient(tier_label, tier_plot)
 
             if tier.tier_class == "IntervalTier":
-                # Filter to visible intervals
                 vis = [iv for iv in tier.intervals
                        if iv.xmax > view_start and iv.xmin < view_end]
 
                 if vis:
-                    # Batch boundary lines on tier axes (one vlines call)
                     boundaries = set()
                     for iv in vis:
                         boundaries.add(iv.xmin)
                         boundaries.add(iv.xmax)
                         spec_interval_boundaries.add(iv.xmin)
                         spec_interval_boundaries.add(iv.xmax)
-                    tier_ax.vlines(sorted(boundaries), 0, 1,
-                                   colors="#4444aa", linewidths=0.8, zorder=1)
 
-                    # Labels — black text, larger font (skip if interval < 20px)
+                    # Boundary lines on tier
+                    for bt in sorted(boundaries):
+                        line = pg.InfiniteLine(
+                            pos=bt, angle=90,
+                            pen=pg.mkPen('#4444aa', width=0.8),
+                        )
+                        self._add_transient(line, tier_plot)
+
+                    # Labels
                     for iv in vis:
                         if iv.text:
                             if ax_width_px > 0 and view_width > 0:
@@ -1174,12 +1240,10 @@ class SpectrogramCanvas(FigureCanvas):
                                     continue
                             mid_t = (iv.xmin + iv.xmax) / 2.0
                             if view_start <= mid_t <= view_end:
-                                tier_ax.text(
-                                    mid_t, 0.5, iv.text,
-                                    ha="center", va="center",
-                                    color="#000000", fontsize=10,
-                                    clip_on=True, zorder=2,
-                                )
+                                t = pg.TextItem(iv.text, color='#000000', anchor=(0.5, 0.5))
+                                t.setFont(QFont("", 10))
+                                t.setPos(mid_t, 0.5)
+                                self._add_transient(t, tier_plot)
 
             elif tier.tier_class == "TextTier":
                 vis = [pt for pt in tier.points
@@ -1189,77 +1253,173 @@ class SpectrogramCanvas(FigureCanvas):
                     times = [pt.time for pt in vis]
                     spec_point_times.extend(times)
 
-                    # Batch marker lines on tier axes
-                    tier_ax.vlines(times, 0, 1,
-                                   colors="#cc4400", linewidths=1.0, zorder=1)
+                    for pt_time in times:
+                        line = pg.InfiniteLine(
+                            pos=pt_time, angle=90,
+                            pen=pg.mkPen('#cc4400', width=1.0),
+                        )
+                        self._add_transient(line, tier_plot)
 
-                    # Batch diamond markers — centered at 0.5
-                    tier_ax.scatter(times, [0.5] * len(vis), marker="D",
-                                   c="#cc4400", s=30, zorder=3)
+                    # Diamond markers
+                    sc = pg.ScatterPlotItem(
+                        x=times, y=[0.5] * len(vis),
+                        symbol='d', size=10,
+                        pen=pg.mkPen('#cc4400'), brush=pg.mkBrush('#cc4400'),
+                    )
+                    self._add_transient(sc, tier_plot)
 
-                    # Labels — centered on point line (va="center")
+                    # Labels
                     for pt in vis:
                         if pt.mark:
-                            tier_ax.text(
-                                pt.time, 0.5, "  " + pt.mark,
-                                ha="left", va="center",
-                                color="#000000", fontsize=10,
-                                fontweight="bold",
-                                clip_on=True, zorder=2,
-                            )
+                            t = pg.TextItem("  " + pt.mark, color='#000000', anchor=(0.0, 0.5))
+                            t.setFont(QFont("", 10, QFont.Weight.Bold))
+                            t.setPos(pt.time, 0.5)
+                            self._add_transient(t, tier_plot)
 
-        # Single batch vlines call on spectrogram for interval boundaries
-        if spec_interval_boundaries:
-            sorted_ibs = sorted(spec_interval_boundaries)
-            self.ax.vlines(sorted_ibs,
-                           0, self.max_freq,
-                           colors="#4488ff", linewidths=1.5,
-                           linestyles="--", alpha=0.7, zorder=2)
-            if self.wave_ax is not None:
-                wymin, wymax = self.wave_ax.get_ylim()
-                self.wave_ax.vlines(sorted_ibs,
-                                    wymin, wymax,
-                                    colors="#4488ff", linewidths=1.5,
-                                    linestyles="--", alpha=0.7, zorder=2)
+        # Boundary lines on spectrogram + waveform
+        bdry_pen = pg.mkPen('#4488ff', width=1.5, style=Qt.PenStyle.DashLine)
+        for bt in sorted(spec_interval_boundaries):
+            line = pg.InfiniteLine(pos=bt, angle=90, pen=bdry_pen)
+            self._add_transient(line, self._spec_plot)
+            if self._wave_plot is not None:
+                line2 = pg.InfiniteLine(pos=bt, angle=90, pen=bdry_pen)
+                self._add_transient(line2, self._wave_plot)
 
-        # Single batch vlines call on spectrogram for point markers
-        if spec_point_times:
-            self.ax.vlines(spec_point_times,
-                           0, self.max_freq,
-                           colors="#ff6622", linewidths=0.7,
-                           linestyles="--", alpha=0.7, zorder=2)
-            if self.wave_ax is not None:
-                wymin, wymax = self.wave_ax.get_ylim()
-                self.wave_ax.vlines(spec_point_times,
-                                    wymin, wymax,
-                                    colors="#ff6622", linewidths=0.7,
-                                    linestyles="--", alpha=0.7, zorder=2)
+        # Point markers on spectrogram + waveform
+        pt_pen = pg.mkPen('#ff6622', width=0.7, style=Qt.PenStyle.DashLine)
+        for pt_time in spec_point_times:
+            line = pg.InfiniteLine(pos=pt_time, angle=90, pen=pt_pen)
+            self._add_transient(line, self._spec_plot)
+            if self._wave_plot is not None:
+                line2 = pg.InfiniteLine(pos=pt_time, angle=90, pen=pt_pen)
+                self._add_transient(line2, self._wave_plot)
 
-        # Hide x-axis labels on all but the bottom tier
-        self.ax.tick_params(labelbottom=False)
-        for tier_ax in self.tier_axes[:-1]:
-            tier_ax.tick_params(labelbottom=False)
-        # Bottom tier shows time axis
-        self.tier_axes[-1].set_xlabel("Time (s)", color="#eeeeee", fontsize=9)
-        self.tier_axes[-1].tick_params(colors="#cccccc", labelsize=8)
+    # -------------------------------------------------------------------
+    # Title
+    # -------------------------------------------------------------------
+
+    def _update_title(self):
+        """Update title text on the topmost plot."""
+        if self._title_item is not None:
+            target = self._wave_plot if self._wave_plot is not None else self._spec_plot
+            try:
+                target.removeItem(self._title_item)
+            except Exception:
+                pass
+            self._title_item = None
+
+        title = os.path.basename(self._filepath) if hasattr(self, "_filepath") else ""
+        if self.edit_mode:
+            fn = self.active_formant + 1
+            color = FORMANT_COLORS.get(fn, "#ffffff")
+            title += f"  |  EDIT MODE — Drawing {FORMANT_LABELS[fn]}"
+        else:
+            color = "#eeeeee"
+
+        target = self._wave_plot if self._wave_plot is not None else self._spec_plot
+        self._title_item = pg.TextItem(title, color=color, anchor=(0.5, 1.0))
+        font = QFont("", 11)
+        if self.edit_mode:
+            font.setBold(True)
+        self._title_item.setFont(font)
+        target.addItem(self._title_item)
+        # Position at top-center of view
+        vr = target.viewRange()
+        mid_x = (vr[0][0] + vr[0][1]) / 2
+        top_y = vr[1][1]
+        self._title_item.setPos(mid_x, top_y)
+
+    # -------------------------------------------------------------------
+    # Selection overlay
+    # -------------------------------------------------------------------
+
+    def _draw_selection_overlay(self):
+        """Draw selection/boundary highlights."""
+        self._clear_overlay_items()
+
+        # Time selection highlight
+        if self._selection_start is not None and self._selection_end is not None:
+            for plot in [self._spec_plot, self._wave_plot] + self._tier_plots:
+                if plot is not None:
+                    alpha = 40 if plot in self._tier_plots else 65
+                    region = pg.LinearRegionItem(
+                        values=[self._selection_start, self._selection_end],
+                        movable=False,
+                        brush=pg.mkBrush(51, 102, 204, alpha),
+                        pen=pg.mkPen(None),
+                    )
+                    self._add_overlay(region, plot)
+
+        # Selected interval highlight
+        if self._selected_interval is not None:
+            sel_tier_idx, sel_i = self._selected_interval
+            if (self.textgrid_data is not None
+                    and 0 <= sel_tier_idx < len(self.textgrid_data.tiers)):
+                tier = self.textgrid_data.tiers[sel_tier_idx]
+                if (tier.tier_class == "IntervalTier"
+                        and sel_i < len(tier.intervals)):
+                    iv = tier.intervals[sel_i]
+                    if sel_tier_idx < len(self._tier_plots):
+                        region = pg.LinearRegionItem(
+                            values=[iv.xmin, iv.xmax],
+                            movable=False,
+                            brush=pg.mkBrush(51, 102, 204, 65),
+                            pen=pg.mkPen(None),
+                        )
+                        self._add_overlay(region, self._tier_plots[sel_tier_idx])
+
+        # Selected boundary highlight + shadows
+        if self._selected_boundary is not None:
+            sel_tier, sel_time = self._selected_boundary
+            if self.view_start <= sel_time <= self.view_end:
+                red_pen = pg.mkPen('#ff0000', width=2.5)
+                # On spectrogram
+                line = pg.InfiniteLine(pos=sel_time, angle=90, pen=red_pen)
+                self._add_overlay(line, self._spec_plot)
+                # On waveform
+                if self._wave_plot is not None:
+                    line2 = pg.InfiniteLine(pos=sel_time, angle=90, pen=red_pen)
+                    self._add_overlay(line2, self._wave_plot)
+                # On selected tier
+                if 0 <= sel_tier < len(self._tier_plots):
+                    line3 = pg.InfiniteLine(pos=sel_time, angle=90, pen=red_pen)
+                    self._add_overlay(line3, self._tier_plots[sel_tier])
+
+                # Shadow boundaries on OTHER tiers
+                for other_idx, other_plot in enumerate(self._tier_plots):
+                    if other_idx == sel_tier:
+                        continue
+                    dash_pen = pg.mkPen('#888888', width=1.0, style=Qt.PenStyle.DashLine)
+                    line = pg.InfiniteLine(pos=sel_time, angle=90, pen=dash_pen)
+                    self._add_overlay(line, other_plot)
+                    # Clickable circle
+                    sc = pg.ScatterPlotItem(
+                        x=[sel_time], y=[0.5], size=10,
+                        pen=pg.mkPen('white', width=1.0),
+                        brush=pg.mkBrush('#6688cc'),
+                    )
+                    self._add_overlay(sc, other_plot)
 
     # -------------------------------------------------------------------
     # TextGrid editing helpers
     # -------------------------------------------------------------------
 
-    def _tier_index_for_axes(self, axes):
-        """Return the tier index for a given axes, or None."""
-        for i, ta in enumerate(self.tier_axes):
-            if ta is axes:
+    def _tier_index_for_plot(self, plot):
+        """Return the tier index for a given PlotItem, or None."""
+        for i, tp in enumerate(self._tier_plots):
+            if tp is plot:
                 return i
         return None
+
+    # Keep the old name for backward compat with any internal usage
+    def _tier_index_for_axes(self, axes):
+        return self._tier_index_for_plot(axes)
 
     def _find_nearest_boundary(self, tier_idx, time):
         """Return (boundary_time, distance) for the nearest boundary in tier."""
         tier = self.textgrid_data.tiers[tier_idx]
         best_time = None
         best_dist = float('inf')
-
         if tier.tier_class == "IntervalTier":
             for iv in tier.intervals:
                 for bt in (iv.xmin, iv.xmax):
@@ -1273,34 +1433,27 @@ class SpectrogramCanvas(FigureCanvas):
                 if d < best_dist:
                     best_dist = d
                     best_time = pt.time
-
         return best_time, best_dist
 
     def _time_threshold_for_pixels(self, pixels=5):
         """Convert a pixel distance to time units for hit detection."""
-        if self.ax.get_xlim()[1] == self.ax.get_xlim()[0]:
-            return 0.01
-        ax_width_px = self.ax.get_window_extent().width
-        view_width = self.view_end - self.view_start
-        if ax_width_px <= 0:
-            return 0.01
-        return pixels * view_width / ax_width_px
+        vb = self._spec_plot.getViewBox()
+        r = vb.viewRange()
+        view_w = r[0][1] - r[0][0]
+        px_w = vb.width()
+        return pixels * view_w / px_w if px_w > 0 else 0.01
 
     def _add_boundary(self, tier_idx, time):
         """Add a boundary at the given time in the specified tier."""
         tier = self.textgrid_data.tiers[tier_idx]
-
         if tier.tier_class == "IntervalTier":
-            # Find the interval containing this time
             for i, iv in enumerate(tier.intervals):
                 if iv.xmin < time < iv.xmax:
-                    # Split: left keeps text, right gets ""
                     old_text = iv.text
                     tier.intervals[i] = Interval(iv.xmin, time, old_text)
                     tier.intervals.insert(i + 1, Interval(time, iv.xmax, ""))
                     return True
         elif tier.tier_class == "TextTier":
-            # Insert point in sorted order
             pt = Point(time, "")
             for i, existing in enumerate(tier.points):
                 if time < existing.time:
@@ -1308,13 +1461,11 @@ class SpectrogramCanvas(FigureCanvas):
                     return True
             tier.points.append(pt)
             return True
-
         return False
 
     def _move_boundary(self, tier_idx, old_time, new_time):
         """Move a boundary from old_time to new_time in the specified tier."""
         tier = self.textgrid_data.tiers[tier_idx]
-
         if tier.tier_class == "IntervalTier":
             for iv in tier.intervals:
                 if iv.xmax == old_time:
@@ -1328,14 +1479,11 @@ class SpectrogramCanvas(FigureCanvas):
                     break
 
     def _delete_boundary(self, tier_idx, boundary_time):
-        """Delete a boundary, merging adjacent intervals (left keeps text)."""
+        """Delete a boundary, merging adjacent intervals."""
         tier = self.textgrid_data.tiers[tier_idx]
-
         if tier.tier_class == "IntervalTier":
-            # Can't delete tier start/end boundaries
             if boundary_time == tier.xmin or boundary_time == tier.xmax:
                 return False
-            # Find the two intervals sharing this boundary
             left_idx = None
             right_idx = None
             for i, iv in enumerate(tier.intervals):
@@ -1344,7 +1492,6 @@ class SpectrogramCanvas(FigureCanvas):
                 if iv.xmin == boundary_time:
                     right_idx = i
             if left_idx is not None and right_idx is not None:
-                # Merge: extend left to cover right, keep left's text
                 tier.intervals[left_idx] = Interval(
                     tier.intervals[left_idx].xmin,
                     tier.intervals[right_idx].xmax,
@@ -1357,16 +1504,13 @@ class SpectrogramCanvas(FigureCanvas):
                 if pt.time == boundary_time:
                     tier.points.pop(i)
                     return True
-
         return False
 
     def _compute_drag_constraints(self, tier_idx, boundary_time):
         """Compute min/max times for dragging a boundary."""
         tier = self.textgrid_data.tiers[tier_idx]
         epsilon = 0.001
-
         if tier.tier_class == "IntervalTier":
-            # Find neighbors
             prev_boundary = tier.xmin
             next_boundary = tier.xmax
             for iv in tier.intervals:
@@ -1377,7 +1521,6 @@ class SpectrogramCanvas(FigureCanvas):
             self._drag_min_time = prev_boundary + epsilon
             self._drag_max_time = next_boundary - epsilon
         elif tier.tier_class == "TextTier":
-            # Points can move freely within tier bounds
             prev_time = tier.xmin
             next_time = tier.xmax
             for pt in tier.points:
@@ -1410,10 +1553,7 @@ class SpectrogramCanvas(FigureCanvas):
         return aligned
 
     def _compute_multi_drag_constraints(self, all_tiers_times):
-        """Compute drag constraints as intersection across multiple tiers.
-
-        all_tiers_times: list of (tier_idx, boundary_time) including primary.
-        """
+        """Compute drag constraints as intersection across multiple tiers."""
         overall_min = -float('inf')
         overall_max = float('inf')
         for tier_idx, bt in all_tiers_times:
@@ -1424,29 +1564,12 @@ class SpectrogramCanvas(FigureCanvas):
         self._drag_max_time = overall_max
 
     # -------------------------------------------------------------------
-    # Mouse scroll — zoom
-    # -------------------------------------------------------------------
-
-    def _on_scroll(self, event):
-        """Mouse wheel zoom — centered on cursor position."""
-        if self.sound is None or event.xdata is None:
-            return
-        if event.step > 0:
-            self.zoom(1.0 / ZOOM_FACTOR, center_time=event.xdata)
-        else:
-            self.zoom(ZOOM_FACTOR, center_time=event.xdata)
-        if self._on_view_changed_callback:
-            self._on_view_changed_callback()
-        self._render_timer.start()  # debounce: coalesce rapid scroll events
-
-    # -------------------------------------------------------------------
-    # Mouse interaction for formant editing
+    # Interval/point selection
     # -------------------------------------------------------------------
 
     def _select_interval(self, tier_idx, click_time):
         """Select the interval or point containing/nearest to click_time."""
         tier = self.textgrid_data.tiers[tier_idx]
-
         if tier.tier_class == "IntervalTier":
             for i, iv in enumerate(tier.intervals):
                 if iv.xmin <= click_time <= iv.xmax:
@@ -1454,13 +1577,11 @@ class SpectrogramCanvas(FigureCanvas):
                     self._selected_boundary = None
                     self._selection_start = iv.xmin
                     self._selection_end = iv.xmax
-                    # Populate label editor
                     if self._label_edit is not None:
                         self._label_edit.setEnabled(True)
                         self._label_edit.setText(iv.text)
                     return True
         elif tier.tier_class == "TextTier":
-            # Find nearest point
             threshold = self._time_threshold_for_pixels(10)
             best_pt_idx = None
             best_dist = float('inf')
@@ -1491,200 +1612,178 @@ class SpectrogramCanvas(FigureCanvas):
             self._label_edit.setEnabled(False)
             self._label_edit.clear()
 
+    # -------------------------------------------------------------------
+    # Mouse event coordinate mapping
+    # -------------------------------------------------------------------
+
+    def _map_event_to_data(self, event):
+        """Map a QMouseEvent to data coordinates.
+
+        Returns (plot_name, plot, time, y_value, tier_idx) or
+        (None, None, None, None, None) if outside all plots.
+
+        plot_name: 'spec', 'wave', or 'tier'
+        """
+        pos = event.position() if hasattr(event, 'position') else event.pos()
+        scene_pos = self._glw.mapToScene(pos.toPoint())
+
+        # Check each plot
+        for name, plot in self._iter_plots():
+            vb = plot.getViewBox()
+            if vb is None:
+                continue
+            scene_rect = vb.sceneBoundingRect()
+            if scene_rect.contains(scene_pos):
+                mouse_point = vb.mapSceneToView(scene_pos)
+                tier_idx = self._tier_index_for_plot(plot) if name == 'tier' else None
+                return name, plot, mouse_point.x(), mouse_point.y(), tier_idx
+
+        return None, None, None, None, None
+
+    def _iter_plots(self):
+        """Yield (name, plot) for all active plots."""
+        if self._wave_plot is not None:
+            yield ('wave', self._wave_plot)
+        if self._spec_plot is not None:
+            yield ('spec', self._spec_plot)
+        for tp in self._tier_plots:
+            yield ('tier', tp)
+
+    # -------------------------------------------------------------------
+    # Mouse scroll — zoom
+    # -------------------------------------------------------------------
+
+    def _on_scroll(self, event):
+        """Mouse wheel zoom — centered on cursor position."""
+        if self.sound is None:
+            return
+        _, _, time, _, _ = self._map_event_to_data(event)
+        if time is None:
+            return
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self.zoom(1.0 / ZOOM_FACTOR, center_time=time)
+        elif delta < 0:
+            self.zoom(ZOOM_FACTOR, center_time=time)
+        else:
+            return
+        if self._on_view_changed_callback:
+            self._on_view_changed_callback()
+        self._render_timer.start()
+
+    # -------------------------------------------------------------------
+    # Mouse double click
+    # -------------------------------------------------------------------
+
+    def _on_mouse_double_click(self, event):
+        """Handle double-click for label editing."""
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self.textgrid_data is None:
+            return
+        name, plot, time, y, tier_idx = self._map_event_to_data(event)
+        if name == 'tier' and tier_idx is not None and time is not None:
+            old_active = self._active_tier
+            self._active_tier = tier_idx
+            self._select_interval(tier_idx, time)
+            if self._label_edit is not None:
+                self._label_edit.setFocus()
+                self._label_edit.selectAll()
+            if old_active != tier_idx:
+                self.render()
+            else:
+                self._draw_selection_overlay()
+
+    # -------------------------------------------------------------------
+    # Mouse press
+    # -------------------------------------------------------------------
+
     def _on_mouse_press(self, event):
-        # Right-click: only allowed in edit mode for eraser tool
-        if event.button == 3:
+        is_right = (event.button() == Qt.MouseButton.RightButton)
+        is_left = (event.button() == Qt.MouseButton.LeftButton)
+
+        if is_right:
             if not self.edit_mode:
                 return
-            # Jump directly to edit mode drawing/erasing section below
-        elif event.button != 1:
+        elif not is_left:
             return
 
-        # --- TextGrid tier click detection (works in ALL modes, left-click only) ---
-        if event.button == 1 and self.textgrid_data is not None:
-            tier_idx = self._tier_index_for_axes(event.inaxes)
-            if tier_idx is not None and event.xdata is not None:
-                old_active = self._active_tier
-                self._active_tier = tier_idx  # always set active tier
+        name, plot, time, y, tier_idx = self._map_event_to_data(event)
 
-                if event.dblclick:
-                    # Double-click: select interval + focus label editor
-                    self._select_interval(tier_idx, event.xdata)
-                    if self._label_edit is not None:
-                        self._label_edit.setFocus()
-                        self._label_edit.selectAll()
+        # --- TextGrid tier click (left-click only) ---
+        if is_left and self.textgrid_data is not None and name == 'tier' and tier_idx is not None and time is not None:
+            old_active = self._active_tier
+            self._active_tier = tier_idx
+
+            # Check if clicking on a shadow boundary circle
+            if self._selected_boundary is not None:
+                sel_tier, sel_time = self._selected_boundary
+                if tier_idx != sel_tier:
+                    threshold = self._time_threshold_for_pixels(8)
+                    if abs(time - sel_time) <= threshold:
+                        if self._add_boundary(tier_idx, sel_time):
+                            if self._on_textgrid_edited is not None:
+                                self._on_textgrid_edited()
+                            self._selected_boundary = (tier_idx, sel_time)
+                            self._selected_interval = None
+                            self.render()
+                        return
+
+            # Check if near a boundary
+            tier = self.textgrid_data.tiers[tier_idx]
+            bt, dist = self._find_nearest_boundary(tier_idx, time)
+            threshold = self._time_threshold_for_pixels(5)
+
+            if tier.tier_class == "TextTier":
+                if bt is not None and dist <= threshold:
+                    self._select_interval(tier_idx, time)
+                    self._selected_boundary = None
+                    self._start_boundary_drag(tier_idx, bt, event)
                     if old_active != tier_idx:
                         self.render()
-                    else:
-                        self._draw_selection_overlay()
                     return
-
-                # Check if clicking on a shadow boundary circle (other tiers)
-                if self._selected_boundary is not None:
-                    sel_tier, sel_time = self._selected_boundary
-                    if tier_idx != sel_tier:
-                        threshold = self._time_threshold_for_pixels(8)
-                        if abs(event.xdata - sel_time) <= threshold:
-                            # Create aligned boundary at shadow time
-                            if self._add_boundary(tier_idx, sel_time):
-                                if self._on_textgrid_edited is not None:
-                                    self._on_textgrid_edited()
-                                self._selected_boundary = (tier_idx, sel_time)
-                                self._selected_interval = None
-                                self.render()
-                            return
-
-                # Single click: check if near a boundary
-                tier = self.textgrid_data.tiers[tier_idx]
-                bt, dist = self._find_nearest_boundary(tier_idx, event.xdata)
-                threshold = self._time_threshold_for_pixels(5)
-
-                # For TextTier, single-click always selects the point
-                # for label editing; drag is initiated separately
-                if tier.tier_class == "TextTier":
-                    if bt is not None and dist <= threshold:
-                        # Select point for label editing + prepare drag
-                        self._select_interval(tier_idx, event.xdata)
-                        self._selected_boundary = None
-                        self._dragging_boundary = True
-                        self._drag_tier_index = tier_idx
-                        self._drag_original_time = bt
-                        # Shift-click: find aligned boundaries across tiers
-                        shift = 'shift' in getattr(event, 'modifiers', frozenset())
-                        if shift:
-                            aligned = self._find_aligned_boundaries(tier_idx, bt)
-                            self._drag_aligned = aligned
-                            self._compute_multi_drag_constraints(
-                                [(tier_idx, bt)] + aligned)
-                        else:
-                            self._drag_aligned = []
-                            self._drag_lines_aligned = []
-                            self._compute_drag_constraints(tier_idx, bt)
-                        self.render()
-                        self._drag_bg = self.fig.canvas.copy_from_bbox(
-                            self.fig.bbox)
-                        self._drag_line_spec = self.ax.axvline(
-                            bt, color="#ff0000", linewidth=2.5,
-                            alpha=0.9, zorder=6,
-                        )
-                        self._drag_line_tier = self.tier_axes[tier_idx].axvline(
-                            bt, color="#ff0000", linewidth=2.5,
-                            alpha=0.9, zorder=6,
-                        )
-                        self._drag_line_wave = None
-                        if self.wave_ax is not None:
-                            self._drag_line_wave = self.wave_ax.axvline(
-                                bt, color="#ff0000", linewidth=2.5,
-                                alpha=0.9, zorder=6,
-                            )
-                        self.ax.draw_artist(self._drag_line_spec)
-                        self.tier_axes[tier_idx].draw_artist(self._drag_line_tier)
-                        if self._drag_line_wave is not None:
-                            self.wave_ax.draw_artist(self._drag_line_wave)
-                        # Create aligned drag lines on other tiers
-                        self._drag_lines_aligned = []
-                        for a_tier_idx, _ in self._drag_aligned:
-                            line = self.tier_axes[a_tier_idx].axvline(
-                                bt, color="#ff0000", linewidth=2.5,
-                                alpha=0.9, zorder=6)
-                            self._drag_lines_aligned.append((a_tier_idx, line))
-                            self.tier_axes[a_tier_idx].draw_artist(line)
-                        self.fig.canvas.blit(self.fig.bbox)
-                    else:
-                        # Click away from any point: just set active tier
-                        self._selected_interval = None
-                        self._selected_boundary = None
-                        if self._label_edit is not None:
-                            self._label_edit.setEnabled(False)
-                            self._label_edit.clear()
-                        if old_active != tier_idx:
-                            self.render()
-                        else:
-                            self._draw_selection_overlay()
-                    return
-
-                # IntervalTier boundary/interval click
-                if bt is not None and dist <= threshold:
-                    # Select boundary
+                else:
                     self._selected_interval = None
+                    self._selected_boundary = None
                     if self._label_edit is not None:
                         self._label_edit.setEnabled(False)
                         self._label_edit.clear()
-                    if tier.tier_class == "IntervalTier" and (bt == tier.xmin or bt == tier.xmax):
-                        # Can't drag tier start/end
-                        self._selected_boundary = (tier_idx, bt)
-                        if old_active != tier_idx:
-                            self.render()
-                        else:
-                            self._draw_selection_overlay()
-                        return
-                    # Select and prepare for drag (blitting)
-                    self._selected_boundary = None  # render without highlight
-                    self._selected_interval = None
-                    self._dragging_boundary = True
-                    self._drag_tier_index = tier_idx
-                    self._drag_original_time = bt
-                    # Shift-click: find aligned boundaries across tiers
-                    shift = 'shift' in getattr(event, 'modifiers', frozenset())
-                    if shift:
-                        aligned = self._find_aligned_boundaries(tier_idx, bt)
-                        self._drag_aligned = aligned
-                        self._compute_multi_drag_constraints(
-                            [(tier_idx, bt)] + aligned)
+                    if old_active != tier_idx:
+                        self.render()
                     else:
-                        self._drag_aligned = []
-                        self._drag_lines_aligned = []
-                        self._compute_drag_constraints(tier_idx, bt)
-                    self.render()  # clean background (no red line)
-                    # Cache bg BEFORE creating overlay artists
-                    self._drag_bg = self.fig.canvas.copy_from_bbox(
-                        self.fig.bbox)
-                    # Create movable line artists
-                    self._drag_line_spec = self.ax.axvline(
-                        bt, color="#ff0000", linewidth=2.5,
-                        alpha=0.9, zorder=6,
-                    )
-                    self._drag_line_tier = self.tier_axes[tier_idx].axvline(
-                        bt, color="#ff0000", linewidth=2.5,
-                        alpha=0.9, zorder=6,
-                    )
-                    self._drag_line_wave = None
-                    if self.wave_ax is not None:
-                        self._drag_line_wave = self.wave_ax.axvline(
-                            bt, color="#ff0000", linewidth=2.5,
-                            alpha=0.9, zorder=6,
-                        )
-                    # Show initial position via blit
-                    self.ax.draw_artist(self._drag_line_spec)
-                    self.tier_axes[tier_idx].draw_artist(self._drag_line_tier)
-                    if self._drag_line_wave is not None:
-                        self.wave_ax.draw_artist(self._drag_line_wave)
-                    # Create aligned drag lines on other tiers
-                    self._drag_lines_aligned = []
-                    for a_tier_idx, _ in self._drag_aligned:
-                        line = self.tier_axes[a_tier_idx].axvline(
-                            bt, color="#ff0000", linewidth=2.5,
-                            alpha=0.9, zorder=6)
-                        self._drag_lines_aligned.append((a_tier_idx, line))
-                        self.tier_axes[a_tier_idx].draw_artist(line)
-                    self.fig.canvas.blit(self.fig.bbox)
-                    return
-                else:
-                    # Click in interval body: select interval
-                    self._select_interval(tier_idx, event.xdata)
+                        self._draw_selection_overlay()
+                return
+
+            # IntervalTier
+            if bt is not None and dist <= threshold:
+                self._selected_interval = None
+                if self._label_edit is not None:
+                    self._label_edit.setEnabled(False)
+                    self._label_edit.clear()
+                if tier.tier_class == "IntervalTier" and (bt == tier.xmin or bt == tier.xmax):
+                    self._selected_boundary = (tier_idx, bt)
                     if old_active != tier_idx:
                         self.render()
                     else:
                         self._draw_selection_overlay()
                     return
+                # Draggable boundary
+                self._selected_boundary = None
+                self._start_boundary_drag(tier_idx, bt, event)
+                self.render()
+                return
+            else:
+                self._select_interval(tier_idx, time)
+                if old_active != tier_idx:
+                    self.render()
+                else:
+                    self._draw_selection_overlay()
+                return
 
-        # --- Spectrogram/waveform click/drag (non-edit mode) ---
+        # --- Spectrogram/waveform click (non-edit mode) ---
         if not self.edit_mode:
-            on_spec = (event.inaxes == self.ax)
-            on_wave = (self.wave_ax is not None and event.inaxes == self.wave_ax)
-            if (on_spec or on_wave) and event.xdata is not None:
-                self._click_time = event.xdata
-                # Clear interval/boundary selection but keep _active_tier
+            if name in ('spec', 'wave') and time is not None:
+                self._click_time = time
                 self._selected_interval = None
                 self._selected_boundary = None
                 self._selection_start = None
@@ -1695,106 +1794,121 @@ class SpectrogramCanvas(FigureCanvas):
                 if self._crosshair_visible:
                     self._hide_crosshair()
                 self._spec_dragging = True
-                self._spec_drag_start = event.xdata
-                self._drag_bg = None  # will be set up on first move
+                self._spec_drag_start = time
                 if self._status_callback:
-                    if on_spec:
+                    if name == 'spec':
                         self._status_callback(
-                            f"Time: {event.xdata:.4f} s  |  "
-                            f"Frequency: {event.ydata:.1f} Hz"
-                        )
+                            f"Time: {time:.4f} s  |  Frequency: {y:.1f} Hz")
                     else:
-                        self._status_callback(
-                            f"Time: {event.xdata:.4f} s"
-                        )
+                        self._status_callback(f"Time: {time:.4f} s")
             return
 
-        # --- Edit mode: formant drawing / erasing (only on spectrogram axes) ---
-        if event.inaxes != self.ax:
+        # --- Edit mode: formant drawing/erasing (only on spectrogram) ---
+        if name != 'spec' or time is None:
             return
         self.is_drawing = True
-        self._is_erasing = (event.button == 3)
+        self._is_erasing = is_right
         self._last_frame_idx = -1
         self._last_frame_freq = None
         self._stroke_times = []
         self._stroke_freqs = []
         self._stroke_changes = []
 
-        # Cache background for blitting
-        self.fig.canvas.draw()
-        self._bg_cache = self.fig.canvas.copy_from_bbox(self.ax.bbox)
-
-        # Create a scatter artist for the stroke
+        # Create stroke scatter
         fn = self.active_formant + 1
         color = "#888888" if self._is_erasing else FORMANT_COLORS.get(fn, "#ffffff")
-        self._stroke_scatter = self.ax.scatter(
-            [], [], c=color, s=12, edgecolors="white",
-            linewidths=0.3, zorder=5,
+        qc = QColor(color)
+        self._stroke_scatter = pg.ScatterPlotItem(
+            size=12, pen=pg.mkPen('white', width=0.3),
+            brush=pg.mkBrush(qc.red(), qc.green(), qc.blue(), 255),
         )
+        self._spec_plot.addItem(self._stroke_scatter)
+        self._apply_edit(time, y)
 
-        self._apply_edit(event.xdata, event.ydata)
+    def _start_boundary_drag(self, tier_idx, bt, event):
+        """Start a boundary drag operation."""
+        self._dragging_boundary = True
+        self._drag_tier_index = tier_idx
+        self._drag_original_time = bt
+
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        if shift:
+            aligned = self._find_aligned_boundaries(tier_idx, bt)
+            self._drag_aligned = aligned
+            self._compute_multi_drag_constraints([(tier_idx, bt)] + aligned)
+        else:
+            self._drag_aligned = []
+            self._compute_drag_constraints(tier_idx, bt)
+
+        # Create drag feedback lines
+        self._drag_lines = []
+        red_pen = pg.mkPen('#ff0000', width=2.5)
+        for p in [self._spec_plot, self._wave_plot]:
+            if p is not None:
+                line = pg.InfiniteLine(pos=bt, angle=90, pen=red_pen, movable=False)
+                p.addItem(line)
+                self._drag_lines.append((p, line))
+        if tier_idx < len(self._tier_plots):
+            line = pg.InfiniteLine(pos=bt, angle=90, pen=red_pen, movable=False)
+            self._tier_plots[tier_idx].addItem(line)
+            self._drag_lines.append((self._tier_plots[tier_idx], line))
+        for a_tier_idx, _ in self._drag_aligned:
+            if a_tier_idx < len(self._tier_plots):
+                line = pg.InfiniteLine(pos=bt, angle=90, pen=red_pen, movable=False)
+                self._tier_plots[a_tier_idx].addItem(line)
+                self._drag_lines.append((self._tier_plots[a_tier_idx], line))
+
+    # -------------------------------------------------------------------
+    # Mouse release
+    # -------------------------------------------------------------------
 
     def _on_mouse_release(self, event):
-        # --- End boundary drag (blit-based) ---
+        # --- End boundary drag ---
         if self._dragging_boundary:
-            # Compute final position
+            _, _, time, _, _ = self._map_event_to_data(event)
             final_time = self._drag_original_time
-            if event.xdata is not None:
+            if time is not None:
                 final_time = max(self._drag_min_time,
-                                 min(self._drag_max_time, event.xdata))
-            # Commit data model change once
+                                 min(self._drag_max_time, time))
             self._move_boundary(self._drag_tier_index,
                                 self._drag_original_time, final_time)
-            # Also move aligned boundaries on other tiers
             for a_tier_idx, a_time in self._drag_aligned:
                 self._move_boundary(a_tier_idx, a_time, final_time)
             self._selected_boundary = (self._drag_tier_index, final_time)
             if self._on_textgrid_edited is not None:
                 self._on_textgrid_edited()
-            # Clean up blit artists
-            if self._drag_line_spec is not None:
-                self._drag_line_spec.remove()
-                self._drag_line_spec = None
-            if self._drag_line_tier is not None:
-                self._drag_line_tier.remove()
-                self._drag_line_tier = None
-            if self._drag_line_wave is not None:
-                self._drag_line_wave.remove()
-                self._drag_line_wave = None
-            for _, a_line in self._drag_lines_aligned:
-                a_line.remove()
-            self._drag_lines_aligned = []
+            # Clean up drag lines
+            for p, line in self._drag_lines:
+                try:
+                    p.removeItem(line)
+                except Exception:
+                    pass
+            self._drag_lines = []
             self._drag_aligned = []
-            self._drag_bg = None
             self._dragging_boundary = False
             self._drag_tier_index = None
             self._drag_original_time = None
             self.render()
             return
 
-        # --- End spectrogram drag selection (blit-based) ---
+        # --- End spectrogram drag selection ---
         if self._spec_dragging:
             self._spec_dragging = False
-            # Clean up blit artists
-            if self._spec_sel_artist is not None:
-                self._spec_sel_artist.remove()
-                self._spec_sel_artist = None
-            for a in self._spec_sel_tier_artists:
-                a.remove()
-            self._spec_sel_tier_artists = []
-            if self._spec_sel_wave_artist is not None:
-                self._spec_sel_wave_artist.remove()
-                self._spec_sel_wave_artist = None
-            self._drag_bg = None
-            # Determine if real drag or just a click
-            if event.xdata is not None and self._spec_drag_start is not None:
-                drag_dist = abs(event.xdata - self._spec_drag_start)
+            # Remove drag selection regions
+            for p, region in self._spec_sel_regions:
+                try:
+                    p.removeItem(region)
+                except Exception:
+                    pass
+            self._spec_sel_regions = []
+            # Determine if real drag or just click
+            _, _, time, _, _ = self._map_event_to_data(event)
+            if time is not None and self._spec_drag_start is not None:
+                drag_dist = abs(time - self._spec_drag_start)
                 threshold = self._time_threshold_for_pixels(5)
                 if drag_dist > threshold:
-                    self._selection_start = min(self._spec_drag_start,
-                                                event.xdata)
-                    self._selection_end = max(self._spec_drag_start,
-                                              event.xdata)
+                    self._selection_start = min(self._spec_drag_start, time)
+                    self._selection_end = max(self._spec_drag_start, time)
                 else:
                     self._selection_start = None
                     self._selection_end = None
@@ -1802,22 +1916,23 @@ class SpectrogramCanvas(FigureCanvas):
             self._draw_selection_overlay()
             return
 
+        # --- End formant edit stroke ---
         if not self.is_drawing:
             return
         self.is_drawing = False
         self._last_frame_idx = -1
         self._last_frame_freq = None
 
-        # Clean up stroke artist
         if self._stroke_scatter is not None:
-            self._stroke_scatter.remove()
+            try:
+                self._spec_plot.removeItem(self._stroke_scatter)
+            except Exception:
+                pass
             self._stroke_scatter = None
         self._stroke_times = []
         self._stroke_freqs = []
-        self._bg_cache = None
 
         if self.edit_mode:
-            # Push undo entry for this stroke
             if self._stroke_changes:
                 desc = "Erase" if self._is_erasing else "Draw"
                 entry = UndoEntry(desc, list(self._stroke_changes))
@@ -1831,146 +1946,95 @@ class SpectrogramCanvas(FigureCanvas):
                 self._on_formant_edited()
             self.render()
 
+    # -------------------------------------------------------------------
+    # Mouse move
+    # -------------------------------------------------------------------
+
     def _on_mouse_move(self, event):
-        # --- Boundary drag (blit-based) ---
-        if self._dragging_boundary and event.xdata is not None:
-            new_time = max(self._drag_min_time,
-                           min(self._drag_max_time, event.xdata))
-            # Update visual only — no data mutation until release
-            if self._drag_bg is not None:
-                self.fig.canvas.restore_region(self._drag_bg)
-                if self._drag_line_spec is not None:
-                    self._drag_line_spec.set_xdata([new_time])
-                    self.ax.draw_artist(self._drag_line_spec)
-                if self._drag_line_wave is not None:
-                    self._drag_line_wave.set_xdata([new_time])
-                    self.wave_ax.draw_artist(self._drag_line_wave)
-                if self._drag_line_tier is not None:
-                    self._drag_line_tier.set_xdata([new_time])
-                    ta = self.tier_axes[self._drag_tier_index]
-                    ta.draw_artist(self._drag_line_tier)
-                for a_tier_idx, a_line in self._drag_lines_aligned:
-                    a_line.set_xdata([new_time])
-                    self.tier_axes[a_tier_idx].draw_artist(a_line)
-                self.fig.canvas.blit(self.fig.bbox)
+        # --- Boundary drag ---
+        if self._dragging_boundary:
+            _, _, time, _, _ = self._map_event_to_data(event)
+            if time is not None:
+                new_time = max(self._drag_min_time,
+                               min(self._drag_max_time, time))
+                for p, line in self._drag_lines:
+                    line.setValue(new_time)
             return
 
-        # --- Spectrogram drag selection (blit-based, lazy init) ---
-        if self._spec_dragging and event.xdata is not None:
-            # Lazy init: render + create artists on first move
-            if self._drag_bg is None:
-                self.render()  # clean background
-                self._drag_bg = self.fig.canvas.copy_from_bbox(
-                    self.fig.bbox)
-                ymin, ymax = self.ax.get_ylim()
-                self._spec_sel_artist = MplRectangle(
-                    (self._spec_drag_start, ymin), 0, ymax - ymin,
-                    color="#3366cc", alpha=0.25, zorder=5,
-                )
-                self.ax.add_patch(self._spec_sel_artist)
-                self._spec_sel_tier_artists = []
-                for tier_ax in self.tier_axes:
-                    r = MplRectangle(
-                        (self._spec_drag_start, 0), 0, 1,
-                        color="#3366cc", alpha=0.15, zorder=0,
-                    )
-                    tier_ax.add_patch(r)
-                    self._spec_sel_tier_artists.append(r)
-                # Waveform selection rectangle
-                self._spec_sel_wave_artist = None
-                if self.wave_ax is not None:
-                    wymin, wymax = self.wave_ax.get_ylim()
-                    self._spec_sel_wave_artist = MplRectangle(
-                        (self._spec_drag_start, wymin), 0, wymax - wymin,
-                        color="#3366cc", alpha=0.25, zorder=5,
-                    )
-                    self.wave_ax.add_patch(self._spec_sel_wave_artist)
-            # Update rectangles
-            x0 = min(self._spec_drag_start, event.xdata)
-            x1 = max(self._spec_drag_start, event.xdata)
-            self._spec_sel_artist.set_x(x0)
-            self._spec_sel_artist.set_width(x1 - x0)
-            for a in self._spec_sel_tier_artists:
-                a.set_x(x0)
-                a.set_width(x1 - x0)
-            if self._spec_sel_wave_artist is not None:
-                self._spec_sel_wave_artist.set_x(x0)
-                self._spec_sel_wave_artist.set_width(x1 - x0)
-            # Blit
-            self.fig.canvas.restore_region(self._drag_bg)
-            self.ax.draw_artist(self._spec_sel_artist)
-            for a, ta in zip(self._spec_sel_tier_artists,
-                             self.tier_axes):
-                ta.draw_artist(a)
-            if self._spec_sel_wave_artist is not None:
-                self.wave_ax.draw_artist(self._spec_sel_wave_artist)
-            self.fig.canvas.blit(self.fig.bbox)
+        # --- Spectrogram drag selection ---
+        if self._spec_dragging:
+            _, _, time, _, _ = self._map_event_to_data(event)
+            if time is not None:
+                # Lazy init regions on first move
+                if not self._spec_sel_regions:
+                    x0 = min(self._spec_drag_start, time)
+                    x1 = max(self._spec_drag_start, time)
+                    for plot in [self._spec_plot, self._wave_plot] + self._tier_plots:
+                        if plot is None:
+                            continue
+                        alpha = 40 if plot in self._tier_plots else 65
+                        region = pg.LinearRegionItem(
+                            values=[x0, x1], movable=False,
+                            brush=pg.mkBrush(51, 102, 204, alpha),
+                            pen=pg.mkPen(None),
+                        )
+                        plot.addItem(region)
+                        self._spec_sel_regions.append((plot, region))
+                else:
+                    x0 = min(self._spec_drag_start, time)
+                    x1 = max(self._spec_drag_start, time)
+                    for _, region in self._spec_sel_regions:
+                        region.setRegion([x0, x1])
             return
 
-        # --- Crosshair + readout (always active over spectrogram/waveform, not during playback) ---
+        # --- Crosshair + readout ---
         if self._playback_playing:
             return
-        if event.inaxes == self.ax and event.xdata is not None:
-            self._hover_time = event.xdata
-            self._update_crosshair(event.xdata, event.ydata, on_spectrogram=True)
+        name, plot, time, y, tier_idx = self._map_event_to_data(event)
+
+        if name == 'spec' and time is not None:
+            self._hover_time = time
+            self._update_crosshair(time, y, on_spectrogram=True)
             if self._status_callback and not self.is_drawing:
                 self._status_callback(
-                    f"Time: {event.xdata:.4f} s  |  "
-                    f"Frequency: {event.ydata:.1f} Hz"
-                )
-        elif (self.wave_ax is not None and event.inaxes == self.wave_ax
-              and event.xdata is not None):
-            self._hover_time = event.xdata
-            self._update_crosshair(event.xdata, event.ydata, on_spectrogram=False)
+                    f"Time: {time:.4f} s  |  Frequency: {y:.1f} Hz")
+        elif name == 'wave' and time is not None:
+            self._hover_time = time
+            self._update_crosshair(time, y, on_spectrogram=False)
             if self._status_callback and not self.is_drawing:
-                rms = self._get_rms_at_time(event.xdata)
+                rms = self._get_rms_at_time(time)
                 rms_db = 20 * np.log10(rms + 1e-20)
                 self._status_callback(
-                    f"Time: {event.xdata:.4f} s  |  "
-                    f"RMS: {rms:.4f} ({rms_db:.1f} dB)"
-                )
+                    f"Time: {time:.4f} s  |  RMS: {rms:.4f} ({rms_db:.1f} dB)")
         elif self._crosshair_visible:
             self._hide_crosshair()
 
-        # --- Formant editing (only while drawing) ---
+        # Formant editing
         if not self.is_drawing or not self.edit_mode:
             return
-        if event.inaxes != self.ax or event.xdata is None:
+        if name != 'spec' or time is None:
             return
-        self._apply_edit(event.xdata, event.ydata)
+        self._apply_edit(time, y)
 
     def _update_crosshair(self, xdata, ydata, on_spectrogram=True):
-        """Move crosshair lines to cursor position via blitting.
-
-        on_spectrogram: True if hovering spectrogram (show horiz freq line),
-                        False if hovering waveform (vertical only).
-        """
-        if self._crosshair_v is None or self._crosshair_bg is None:
+        """Move crosshair lines to cursor position."""
+        if self._crosshair_v is None:
             return
-        self._crosshair_v.set_xdata([xdata])
+        self._crosshair_v.setValue(xdata)
         if on_spectrogram and ydata is not None:
-            self._crosshair_h.set_ydata([ydata])
+            self._crosshair_h.setValue(ydata)
 
         if not self._crosshair_visible:
-            self._crosshair_v.set_visible(True)
-            self._crosshair_h.set_visible(on_spectrogram)
+            self._crosshair_v.setVisible(True)
+            self._crosshair_h.setVisible(on_spectrogram)
             if self._crosshair_wave_v is not None:
-                self._crosshair_wave_v.set_visible(True)
+                self._crosshair_wave_v.setVisible(True)
             self._crosshair_visible = True
         else:
-            # Toggle horizontal line visibility based on which axes
-            self._crosshair_h.set_visible(on_spectrogram)
+            self._crosshair_h.setVisible(on_spectrogram)
 
         if self._crosshair_wave_v is not None:
-            self._crosshair_wave_v.set_xdata([xdata])
-
-        self.fig.canvas.restore_region(self._crosshair_bg)
-        self.ax.draw_artist(self._crosshair_v)
-        if on_spectrogram:
-            self.ax.draw_artist(self._crosshair_h)
-        if self._crosshair_wave_v is not None:
-            self.wave_ax.draw_artist(self._crosshair_wave_v)
-        self.fig.canvas.blit(self.fig.bbox)
+            self._crosshair_wave_v.setValue(xdata)
 
     def _get_rms_at_time(self, time_s, window=0.01):
         """Compute RMS amplitude in a short window centered on time_s."""
@@ -1988,17 +2052,14 @@ class SpectrogramCanvas(FigureCanvas):
         return float(np.sqrt(np.mean(chunk ** 2)))
 
     def _hide_crosshair(self):
-        """Hide crosshair when cursor leaves spectrogram/waveform."""
+        """Hide crosshair when cursor leaves."""
         if self._crosshair_h is None:
             return
-        self._crosshair_h.set_visible(False)
-        self._crosshair_v.set_visible(False)
+        self._crosshair_h.setVisible(False)
+        self._crosshair_v.setVisible(False)
         if self._crosshair_wave_v is not None:
-            self._crosshair_wave_v.set_visible(False)
+            self._crosshair_wave_v.setVisible(False)
         self._crosshair_visible = False
-        if self._crosshair_bg is not None:
-            self.fig.canvas.restore_region(self._crosshair_bg)
-            self.fig.canvas.blit(self.fig.bbox)
 
     # -------------------------------------------------------------------
     # Audio playback
@@ -2008,54 +2069,32 @@ class SpectrogramCanvas(FigureCanvas):
         """Play audio from start_time to end_time with animated cursor."""
         if self.sound is None:
             return
-
-        # Stop any current playback
         if self._playback_playing:
             self.stop_playback()
 
-        # Extract samples for the requested range
         sr = int(self.sound.sampling_frequency)
-        samples = self.sound.values[0]  # mono float64
+        samples = self.sound.values[0]
         start_sample = max(0, int(start_time * sr))
         end_sample = min(len(samples), int(end_time * sr))
         if end_sample <= start_sample:
             return
 
         audio_chunk = samples[start_sample:end_sample].copy()
-
         self._playback_start_time = start_time
         self._playback_end_time = end_time
         self._playback_playing = True
 
-        # Start audio
         sd.play(audio_chunk, sr)
         self._playback_start_wall = _time.monotonic()
 
-        # Create green cursor line
-        self._playback_cursor = self.ax.axvline(
-            x=start_time, color="#00ff44", linewidth=1.5,
-            alpha=0.9, zorder=15,
-        )
-        # Waveform cursor
-        self._playback_wave_cursor = None
-        if self.wave_ax is not None:
-            self._playback_wave_cursor = self.wave_ax.axvline(
-                x=start_time, color="#00ff44", linewidth=1.5,
-                alpha=0.9, zorder=15,
-            )
-        # Also add cursor lines to tier axes
-        self._playback_tier_cursors = []
-        for tier_ax in self.tier_axes:
-            tc = tier_ax.axvline(
-                x=start_time, color="#00ff44", linewidth=1.5,
-                alpha=0.9, zorder=15,
-            )
-            self._playback_tier_cursors.append(tc)
+        # Create green cursor lines on all plots
+        green_pen = pg.mkPen('#00ff44', width=1.5)
+        self._playback_cursors = []
+        for _, plot in self._iter_plots():
+            line = pg.InfiniteLine(pos=start_time, angle=90, pen=green_pen, movable=False)
+            plot.addItem(line)
+            self._playback_cursors.append((plot, line))
 
-        self.fig.canvas.draw()
-        self._playback_cursor_bg = self.fig.canvas.copy_from_bbox(self.fig.bbox)
-
-        # Start timer for cursor animation (30ms interval)
         self._playback_timer = QTimer()
         self._playback_timer.timeout.connect(self._update_playback_cursor)
         self._playback_timer.start(30)
@@ -2064,76 +2103,46 @@ class SpectrogramCanvas(FigureCanvas):
         """Stop audio playback and clean up cursor."""
         if not self._playback_playing:
             return
-
         sd.stop()
         self._playback_playing = False
-
         if self._playback_timer is not None:
             self._playback_timer.stop()
             self._playback_timer = None
-
-        # Remove cursor artists
-        if self._playback_cursor is not None:
-            self._playback_cursor.remove()
-            self._playback_cursor = None
-        wc = getattr(self, '_playback_wave_cursor', None)
-        if wc is not None:
-            wc.remove()
-            self._playback_wave_cursor = None
-        for tc in getattr(self, '_playback_tier_cursors', []):
-            tc.remove()
-        self._playback_tier_cursors = []
-        self._playback_cursor_bg = None
-
+        for p, line in self._playback_cursors:
+            try:
+                p.removeItem(line)
+            except Exception:
+                pass
+        self._playback_cursors = []
         self.render()
 
     def _update_playback_cursor(self):
-        """Timer callback: update playback cursor position via blitting."""
+        """Timer callback: update playback cursor position."""
         if not self._playback_playing:
             return
-
         elapsed = _time.monotonic() - self._playback_start_wall
         current_time = self._playback_start_time + elapsed
-
         if current_time >= self._playback_end_time:
             self.stop_playback()
             return
+        for _, line in self._playback_cursors:
+            line.setValue(current_time)
 
-        # Update cursor position
-        self._playback_cursor.set_xdata([current_time])
-        wc = getattr(self, '_playback_wave_cursor', None)
-        if wc is not None:
-            wc.set_xdata([current_time])
-        for tc in self._playback_tier_cursors:
-            tc.set_xdata([current_time])
-
-        # Blit
-        if self._playback_cursor_bg is not None:
-            self.fig.canvas.restore_region(self._playback_cursor_bg)
-            self.ax.draw_artist(self._playback_cursor)
-            if wc is not None:
-                self.wave_ax.draw_artist(wc)
-            for tc, tier_ax in zip(self._playback_tier_cursors, self.tier_axes):
-                tier_ax.draw_artist(tc)
-            self.fig.canvas.blit(self.fig.bbox)
+    # -------------------------------------------------------------------
+    # Formant editing
+    # -------------------------------------------------------------------
 
     def _apply_edit(self, time_s, freq_hz):
         """Apply an edit at the given time/frequency position."""
         if self.formant_data is None:
             return
-
         fd = self.formant_data
         f_idx = self.active_formant
-        # Find nearest frame
         frame_idx = np.argmin(np.abs(fd.times - time_s))
-
-        # Avoid re-editing the exact same frame in one drag
         if frame_idx == self._last_frame_idx:
             return
 
         if self._is_erasing:
-            # --- Eraser: revert to original values ---
-            # Interpolate skipped frames (each gets its own original)
             if (self._last_frame_idx >= 0
                     and abs(frame_idx - self._last_frame_idx) > 1):
                 prev_fi = self._last_frame_idx
@@ -2162,8 +2171,7 @@ class SpectrogramCanvas(FigureCanvas):
             self._quick_draw_edit_point(frame_idx, new_val)
             return
 
-        # --- Normal drawing ---
-        # Interpolate skipped frames
+        # Normal drawing
         if (self._last_frame_idx >= 0
                 and abs(frame_idx - self._last_frame_idx) > 1
                 and self._last_frame_freq is not None):
@@ -2175,7 +2183,6 @@ class SpectrogramCanvas(FigureCanvas):
                 mid_fi = prev_fi + k * step
                 t = k / n_steps
                 mid_freq = prev_freq + t * (freq_hz - prev_freq)
-                # Capture old value for undo
                 old_val = float(fd.values[f_idx, mid_fi])
                 old_mask = bool(fd.edited_mask[f_idx, mid_fi])
                 fd.set_value(f_idx, mid_fi, mid_freq)
@@ -2183,44 +2190,31 @@ class SpectrogramCanvas(FigureCanvas):
                     (f_idx, mid_fi, old_val, old_mask, mid_freq, True))
                 self._quick_draw_edit_point(mid_fi, mid_freq)
 
-        # Capture old value for undo
         old_val = float(fd.values[f_idx, frame_idx])
         old_mask = bool(fd.edited_mask[f_idx, frame_idx])
-
         fd.set_value(f_idx, frame_idx, freq_hz)
         self._stroke_changes.append(
             (f_idx, frame_idx, old_val, old_mask, freq_hz, True))
-
         self._last_frame_idx = frame_idx
         self._last_frame_freq = freq_hz
-
-        # Quick incremental draw via blitting
         self._quick_draw_edit_point(frame_idx, freq_hz)
 
     def _quick_draw_edit_point(self, frame_idx, freq_hz):
-        """Draw edited points using blitting for responsiveness."""
-        if self._bg_cache is None or self._stroke_scatter is None:
+        """Draw edited point using scatter update."""
+        if self._stroke_scatter is None:
             return
-
         t = self.formant_data.times[frame_idx]
         self._stroke_times.append(t)
         self._stroke_freqs.append(freq_hz)
-
-        # Update the scatter artist with all stroke points
-        offsets = np.column_stack([self._stroke_times, self._stroke_freqs])
-        self._stroke_scatter.set_offsets(offsets)
-
-        # Blit: restore background, draw artist, update canvas
-        self.fig.canvas.restore_region(self._bg_cache)
-        self.ax.draw_artist(self._stroke_scatter)
-        self.fig.canvas.blit(self.ax.bbox)
+        self._stroke_scatter.setData(
+            x=self._stroke_times, y=self._stroke_freqs)
 
     # -------------------------------------------------------------------
     # Undo / Redo
     # -------------------------------------------------------------------
 
     def undo(self):
-        """Undo the last formant edit. Returns True if an action was undone."""
+        """Undo the last formant edit."""
         if not self._undo_stack or self.formant_data is None:
             return False
         entry = self._undo_stack.pop()
@@ -2233,7 +2227,7 @@ class SpectrogramCanvas(FigureCanvas):
         return True
 
     def redo(self):
-        """Redo the last undone formant edit. Returns True if an action was redone."""
+        """Redo the last undone formant edit."""
         if not self._redo_stack or self.formant_data is None:
             return False
         entry = self._redo_stack.pop()
@@ -2246,21 +2240,11 @@ class SpectrogramCanvas(FigureCanvas):
         return True
 
     def interpolate_formant(self, formant_idx, start_time=None, end_time=None):
-        """Linearly interpolate between consecutive edited points.
-
-        For the given formant, finds pairs of edited points and fills
-        intermediate frames with linear interpolation. Respects
-        start_time/end_time range if provided.
-
-        Returns the number of frames interpolated.
-        """
+        """Linearly interpolate between consecutive edited points."""
         if self.formant_data is None:
             return 0
-
         fd = self.formant_data
         f_idx = formant_idx
-
-        # Determine frame range
         if start_time is not None and end_time is not None:
             fi_start = np.argmin(np.abs(fd.times - start_time))
             fi_end = np.argmin(np.abs(fd.times - end_time))
@@ -2270,24 +2254,20 @@ class SpectrogramCanvas(FigureCanvas):
             fi_start = 0
             fi_end = fd.n_frames - 1
 
-        # Find edited points in range
         edited_frames = []
         for fi in range(fi_start, fi_end + 1):
             if fd.edited_mask[f_idx, fi] and not np.isnan(fd.values[f_idx, fi]):
                 edited_frames.append(fi)
-
         if len(edited_frames) < 2:
             return 0
 
         changes = []
         count = 0
-
-        # Interpolate between each consecutive pair
         for i in range(len(edited_frames) - 1):
             a = edited_frames[i]
             b = edited_frames[i + 1]
             if b - a <= 1:
-                continue  # adjacent, nothing to interpolate
+                continue
             val_a = fd.values[f_idx, a]
             val_b = fd.values[f_idx, b]
             for fi in range(a + 1, b):
@@ -2310,7 +2290,7 @@ class SpectrogramCanvas(FigureCanvas):
         return count
 
 
-# ---------------------------------------------------------------------------
+
 # Control Panel (sliders, settings)
 # ---------------------------------------------------------------------------
 
