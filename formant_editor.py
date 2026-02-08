@@ -612,8 +612,9 @@ class SpectrogramCanvas(FigureCanvas):
         self._overlay_artists = []    # current overlay artists (for cleanup)
 
         # Crosshair state
-        self._crosshair_h = None  # horizontal line artist
-        self._crosshair_v = None  # vertical line artist
+        self._crosshair_h = None  # horizontal line artist (spectrogram)
+        self._crosshair_v = None  # vertical line artist (spectrogram)
+        self._crosshair_wave_v = None  # vertical line artist (waveform)
         self._crosshair_visible = False
         self._status_callback = None  # set by MainWindow
         self._on_formant_edited = None  # callback when formant edit stroke ends
@@ -803,6 +804,12 @@ class SpectrogramCanvas(FigureCanvas):
             x=0, color="#00ffcc", linewidth=0.7, alpha=0.8,
             linestyle="-", visible=False, zorder=10,
         )
+        self._crosshair_wave_v = None
+        if self.wave_ax is not None:
+            self._crosshair_wave_v = self.wave_ax.axvline(
+                x=0, color="#00ffcc", linewidth=0.7, alpha=0.8,
+                linestyle="-", visible=False, zorder=10,
+            )
         self._crosshair_visible = False
 
         self.draw()
@@ -908,8 +915,8 @@ class SpectrogramCanvas(FigureCanvas):
 
         self.fig.canvas.blit(self.fig.bbox)
 
-        # Recapture crosshair bg to include overlays
-        self._crosshair_bg = self.fig.canvas.copy_from_bbox(self.ax.bbox)
+        # Recapture crosshair bg to include overlays (full figure for wave+spec)
+        self._crosshair_bg = self.fig.canvas.copy_from_bbox(self.fig.bbox)
 
     def _draw_formants(self):
         """Draw formant overlay on the spectrogram."""
@@ -1759,7 +1766,7 @@ class SpectrogramCanvas(FigureCanvas):
             return
         if event.inaxes == self.ax and event.xdata is not None:
             self._hover_time = event.xdata
-            self._update_crosshair(event.xdata, event.ydata)
+            self._update_crosshair(event.xdata, event.ydata, on_spectrogram=True)
             if self._status_callback and not self.is_drawing:
                 self._status_callback(
                     f"Time: {event.xdata:.4f} s  |  "
@@ -1768,10 +1775,14 @@ class SpectrogramCanvas(FigureCanvas):
         elif (self.wave_ax is not None and event.inaxes == self.wave_ax
               and event.xdata is not None):
             self._hover_time = event.xdata
-            if self._crosshair_visible:
-                self._hide_crosshair()
+            self._update_crosshair(event.xdata, event.ydata, on_spectrogram=False)
             if self._status_callback and not self.is_drawing:
-                self._status_callback(f"Time: {event.xdata:.4f} s")
+                rms = self._get_rms_at_time(event.xdata)
+                rms_db = 20 * np.log10(rms + 1e-20)
+                self._status_callback(
+                    f"Time: {event.xdata:.4f} s  |  "
+                    f"RMS: {rms:.4f} ({rms_db:.1f} dB)"
+                )
         elif self._crosshair_visible:
             self._hide_crosshair()
 
@@ -1782,31 +1793,66 @@ class SpectrogramCanvas(FigureCanvas):
             return
         self._apply_edit(event.xdata, event.ydata)
 
-    def _update_crosshair(self, xdata, ydata):
-        """Move crosshair lines to cursor position via blitting."""
-        if self._crosshair_h is None or self._crosshair_bg is None:
+    def _update_crosshair(self, xdata, ydata, on_spectrogram=True):
+        """Move crosshair lines to cursor position via blitting.
+
+        on_spectrogram: True if hovering spectrogram (show horiz freq line),
+                        False if hovering waveform (vertical only).
+        """
+        if self._crosshair_v is None or self._crosshair_bg is None:
             return
-        self._crosshair_h.set_ydata([ydata])
         self._crosshair_v.set_xdata([xdata])
+        if on_spectrogram and ydata is not None:
+            self._crosshair_h.set_ydata([ydata])
+
         if not self._crosshair_visible:
-            self._crosshair_h.set_visible(True)
             self._crosshair_v.set_visible(True)
+            self._crosshair_h.set_visible(on_spectrogram)
+            if self._crosshair_wave_v is not None:
+                self._crosshair_wave_v.set_visible(True)
             self._crosshair_visible = True
+        else:
+            # Toggle horizontal line visibility based on which axes
+            self._crosshair_h.set_visible(on_spectrogram)
+
+        if self._crosshair_wave_v is not None:
+            self._crosshair_wave_v.set_xdata([xdata])
+
         self.fig.canvas.restore_region(self._crosshair_bg)
-        self.ax.draw_artist(self._crosshair_h)
         self.ax.draw_artist(self._crosshair_v)
-        self.fig.canvas.blit(self.ax.bbox)
+        if on_spectrogram:
+            self.ax.draw_artist(self._crosshair_h)
+        if self._crosshair_wave_v is not None:
+            self.wave_ax.draw_artist(self._crosshair_wave_v)
+        self.fig.canvas.blit(self.fig.bbox)
+
+    def _get_rms_at_time(self, time_s, window=0.01):
+        """Compute RMS amplitude in a short window centered on time_s."""
+        if self.sound is None:
+            return 0.0
+        sr = self.sound.sampling_frequency
+        samples = self.sound.values[0]
+        half_win = int(window * 0.5 * sr)
+        center = int(time_s * sr)
+        i0 = max(0, center - half_win)
+        i1 = min(len(samples), center + half_win)
+        if i1 <= i0:
+            return 0.0
+        chunk = samples[i0:i1]
+        return float(np.sqrt(np.mean(chunk ** 2)))
 
     def _hide_crosshair(self):
-        """Hide crosshair when cursor leaves the spectrogram."""
+        """Hide crosshair when cursor leaves spectrogram/waveform."""
         if self._crosshair_h is None:
             return
         self._crosshair_h.set_visible(False)
         self._crosshair_v.set_visible(False)
+        if self._crosshair_wave_v is not None:
+            self._crosshair_wave_v.set_visible(False)
         self._crosshair_visible = False
         if self._crosshair_bg is not None:
             self.fig.canvas.restore_region(self._crosshair_bg)
-            self.fig.canvas.blit(self.ax.bbox)
+            self.fig.canvas.blit(self.fig.bbox)
 
     # -------------------------------------------------------------------
     # Audio playback
