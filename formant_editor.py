@@ -758,7 +758,7 @@ class SpectrogramCanvas(QWidget):
             self._wave_plot.getAxis('bottom').setStyle(showValues=False)
             self._wave_plot.getAxis('bottom').setHeight(0)
             self._wave_plot.setLabel('left', 'Amp', **{'font-size': '8pt', 'color': '#eeeeee'})
-            self._glw.ci.layout.setRowStretchFactor(row, 15)
+            self._glw.ci.layout.setRowStretchFactor(row, 25)
             self.wave_ax = self._wave_plot  # API compat
             row += 1
 
@@ -766,9 +766,9 @@ class SpectrogramCanvas(QWidget):
         has_visible_tiers = (has_tiers and
                              any(i not in self.hidden_tiers for i in range(len(tg.tiers))))
         if has_visible_tiers:
-            spec_stretch = 50
+            spec_stretch = 45
         else:
-            spec_stretch = 85 if has_wave else 100
+            spec_stretch = 75 if has_wave else 100
         self._spec_plot = self._glw.addPlot(row=row, col=0)
         self._configure_plot(self._spec_plot, '#1a1a2e')
         self._spec_plot.setLabel('left', 'Frequency (Hz)', **{'font-size': '9pt', 'color': '#eeeeee'})
@@ -785,7 +785,17 @@ class SpectrogramCanvas(QWidget):
                                if i not in self.hidden_tiers]
             n_visible = len(visible_indices)
             if n_visible > 0:
-                tier_share = max(3, 35 // n_visible)
+                # Compute left axis width from longest visible tier name
+                from PyQt6.QtGui import QFontMetrics
+                measure_font = QFont("Segoe UI", 10)
+                fm = QFontMetrics(measure_font)
+                max_name_w = max(
+                    fm.horizontalAdvance(tg.tiers[i].name)
+                    for i in visible_indices
+                )
+                axis_width = max(60, max_name_w + 20)  # padding for offset
+
+                tier_share = max(3, 30 // n_visible)
                 for vi, tier_i in enumerate(visible_indices):
                     tp = self._glw.addPlot(row=row + vi, col=0)
                     self._configure_plot(tp, '#ffffff')
@@ -793,7 +803,7 @@ class SpectrogramCanvas(QWidget):
                     tp.setYRange(0, 1, padding=0)
                     # Left axis: tier name shown as a centered tick label
                     left_ax = tp.getAxis('left')
-                    left_ax.setWidth(90)
+                    left_ax.setWidth(axis_width)
                     left_ax.setStyle(tickTextOffset=8)
                     # Only show x-axis on bottom visible tier
                     if vi < n_visible - 1:
