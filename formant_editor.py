@@ -791,11 +791,10 @@ class SpectrogramCanvas(QWidget):
                     self._configure_plot(tp, '#ffffff')
                     tp.setXLink(self._spec_plot)
                     tp.setYRange(0, 1, padding=0)
-                    # Show tier name as left axis label (horizontal, no tick marks)
+                    # Left axis: tier name shown as a centered tick label
                     left_ax = tp.getAxis('left')
                     left_ax.setWidth(90)
-                    left_ax.setTicks([])  # no tick marks
-                    left_ax.setStyle(showValues=False)
+                    left_ax.setStyle(tickTextOffset=8)
                     # Only show x-axis on bottom visible tier
                     if vi < n_visible - 1:
                         tp.getAxis('bottom').setStyle(showValues=False)
@@ -1218,15 +1217,15 @@ class SpectrogramCanvas(QWidget):
             tier_plot.getViewBox().setBackgroundColor('#fff8c4' if is_active else '#ffffff')
             tier_plot.setYRange(0, 1, padding=0)
 
-            # Tier name as left axis label (horizontal)
+            # Tier name as centered tick label on left axis
+            left_ax = tier_plot.getAxis('left')
+            left_ax.setTicks([[(0.5, tier.name)]])
             label_color = '#cc2200' if is_active else '#5577aa'
-            label_weight = 'bold' if is_active else 'normal'
-            tier_plot.setLabel('left', tier.name, **{
-                'color': label_color,
-                'font-size': '10pt',
-                'font-weight': label_weight,
-            })
-            tier_plot.getAxis('left').label.setRotation(0)
+            font = QFont("Segoe UI", 10)
+            if is_active:
+                font.setBold(True)
+            left_ax.setTickFont(font)
+            left_ax.setTextPen(pg.mkPen(label_color))
 
             if tier.tier_class == "IntervalTier":
                 vis = [iv for iv in tier.intervals
@@ -2719,7 +2718,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("FormantStudio — Manual Formant Editor")
         self.setMinimumSize(1200, 900)
-        self.resize(1800, 1425)
+        self.resize(2100, 1425)
 
         # Dark theme
         self.setStyleSheet("""
