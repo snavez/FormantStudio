@@ -8,12 +8,38 @@ Praat's automatic formant tracking is excellent but not infallible — particula
 
 ## Features
 
-- **Praat-powered analysis**: Formant extraction uses Praat's Burg algorithm (identical results to Praat itself)
-- **Spectrogram display** with adjustable dynamic range, brightness, and pre-emphasis
+### Display & Navigation
+- **Greyscale spectrogram** with adjustable dynamic range, brightness, window length, and max frequency
+- **Waveform display** above the spectrogram
+- **TextGrid overlay** — IntervalTier and TextTier display below the spectrogram
+- **Zoom** via mouse scroll wheel (cursor-centred) or Ctrl+I / Ctrl+O
+- **Scroll/pan** via scrollbar with ◀/▶ arrow buttons (2/3 window overlap)
+- **Crosshair cursor** with time/frequency readout in status bar
+- **Drag time selection** on spectrogram (click-drag in non-edit mode)
+- **Audio playback** (Tab to play selection/view, Esc to stop)
+
+### Formant Editing
+- **Praat-powered analysis**: Formant extraction uses Praat's Burg algorithm (identical results to Praat)
 - **Color-coded formant overlay**: F1 (blue), F2 (yellow), F3 (red), F4 (green), F5 (magenta)
-- **Click-and-drag formant editing**: Enter edit mode, select a formant (F1–F5 keys), draw corrections
+- **Click-and-drag drawing**: Enter edit mode, select a formant (F1–F5 keys), draw corrections
+- **Frame interpolation**: Fast mouse movement fills skipped frames automatically
+- **Eraser tool**: Right-click drag reverts points to original Praat values
+- **Undo/redo**: Ctrl+Z / Ctrl+Y (100-step history)
+- **Interpolate between points**: Fills gaps between edited points with linear ramp
+- **Reset**: Per-formant or all-formant reset (undoable)
+
+### TextGrid Editing
+- **Load/save TextGrid files** (Praat normal + short format)
+- **Add boundaries** (Enter key at cursor/hover position)
+- **Delete boundaries** (Del key on selected boundary)
+- **Drag boundaries** to adjust timing (blit-based visual feedback)
+- **Shift+drag** for aligned multi-tier boundary movement
+- **Inline label editing** with live update
+- **Create new TextGrid** or add tiers to existing
+
+### File Management
 - **Save/load** edited formant data as `.formants` files alongside your TextGrids
-- **Cross-platform**: Windows, macOS, Linux
+- **Auto-detect** existing `.formants` and `.TextGrid` files when opening a WAV
 
 ## Installation
 
@@ -25,14 +51,29 @@ pip install -r requirements.txt
 python formant_editor.py
 ```
 
-## Quick Start
+## Keyboard Shortcuts
 
-1. **Open a WAV file** (Ctrl+O)
-2. Adjust spectrogram display using the sliders (Dynamic Range, Brightness)
-3. Click **EDIT MODE** (or press the Edit button)
-4. Press **F1**, **F2**, or **F3** to select which formant to draw
-5. **Click and drag** on the spectrogram to correct formant values
-6. **Ctrl+S** to save (creates a `.formants` file next to your WAV)
+| Shortcut | Action |
+|----------|--------|
+| Ctrl+Shift+O | Open WAV file |
+| Ctrl+S | Save formants |
+| Ctrl+Shift+S | Save TextGrid |
+| Ctrl+L | Load formants |
+| Ctrl+T | Load TextGrid |
+| Ctrl+E | Toggle edit mode |
+| F1–F5 | Select formant (in edit mode) |
+| Ctrl+Z | Undo |
+| Ctrl+Y | Redo |
+| Ctrl+I | Zoom in |
+| Ctrl+O | Zoom out |
+| Ctrl+N | Zoom to selection |
+| Ctrl+A | Zoom all |
+| Tab | Play selection/view |
+| Esc | Stop playback / clear selection |
+| Enter | Add boundary at cursor |
+| Del | Delete selected boundary |
+| F | Toggle formant visibility |
+| Scroll wheel | Zoom in/out (centred on cursor) |
 
 ## .formants File Format
 
@@ -68,13 +109,15 @@ If you use FormantStudio in research, the formant analysis itself should be cite
 
 > Boersma, Paul & Weenink, David (2024). Praat: doing phonetics by computer [Computer program]. Retrieved from http://www.praat.org/
 
+> Jadoul, Y., Thompson, B., & de Boer, B. (2018). Introducing Parselmouth: A Python interface to Praat. *Journal of Phonetics*, 71, 1–15.
+
 ## Roadmap
 
-- [ ] TextGrid display overlay
-- [ ] Zoom and scroll (time selection)
-- [ ] Interpolation tools for edited regions
 - [ ] Export to Praat Formant object format
+- [ ] Export formant values as CSV
+- [ ] Drag-to-adjust existing formant points (needs modifier key approach)
 - [ ] Adjustable formant time resolution
+- [ ] Batch processing (directory of files)
 - [ ] PyInstaller packaging for non-Python users
 
 ## License

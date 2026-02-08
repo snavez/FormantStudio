@@ -4,7 +4,7 @@
 
 | Field | Value |
 |-------|-------|
-| Version | 0.1.0 (Milestone 1 Prototype) |
+| Version | 0.3.0 (Milestone 3) |
 | Date | February 2026 |
 | Status | In Development |
 | Platform | Windows / macOS / Linux |
@@ -59,7 +59,7 @@ FormantStudio is a standalone desktop application that uses Praat's actual analy
 
 ### 2.1 Spectrogram Display
 
-The main area of the application displays a wideband spectrogram computed by Praat's spectrogram algorithm. The spectrogram is rendered using Matplotlib's pcolormesh with the "inferno" colourmap and Gouraud shading for smooth visual appearance.
+The main area of the application displays a wideband spectrogram computed by Praat's spectrogram algorithm. The spectrogram is rendered using Matplotlib's `imshow` with bilinear interpolation and the `gray_r` colourmap (greyscale, dark = high intensity), limited to ≤10 seconds of visible audio for performance. A waveform display sits above the spectrogram showing the audio amplitude.
 
 #### 2.1.1 Display Controls
 
@@ -107,7 +107,19 @@ The user activates edit mode by clicking the "EDIT MODE" button in the control p
 
 #### 2.3.2 Drawing Formants
 
-While edit mode is active, the user holds the left mouse button and drags across the spectrogram. The cursor position is mapped to the nearest analysis frame (by time) and the frequency axis (by vertical position). The formant value at each frame under the cursor is overwritten with the cursor's frequency. A visual marker is drawn immediately for responsiveness (using draw_idle), with a full re-render on mouse release.
+While edit mode is active, the user holds the left mouse button and drags across the spectrogram. The cursor position is mapped to the nearest analysis frame (by time) and the frequency axis (by vertical position). The formant value at each frame under the cursor is overwritten with the cursor's frequency. Fast mouse movement fills skipped frames with linear interpolation between consecutive edit positions. A visual marker is drawn immediately for responsiveness (using blitting), with a full re-render on mouse release.
+
+#### 2.3.2a Eraser Tool (Right-Click Drag)
+
+While edit mode is active, right-click dragging across the spectrogram reverts formant points to their original Praat-calculated values and clears the edited mask. Grey scatter dots provide visual feedback during erasing. Skipped frames during fast mouse movement are also reverted. Eraser strokes are undoable.
+
+#### 2.3.2b Undo/Redo (Ctrl+Z / Ctrl+Y)
+
+All formant editing operations (draw strokes, erase strokes, resets, interpolation) are undoable. The undo stack holds up to 100 entries. Each entry stores per-frame diffs (old/new value and mask). Ctrl+Z undoes, Ctrl+Y redoes.
+
+#### 2.3.2c Interpolate Between Edited Points
+
+The "Interpolate Between Points" button in the control panel finds consecutive pairs of edited points for the active formant and fills intermediate frames with linear interpolation. If a time selection is active, only points within the selection are considered. The operation is undoable.
 
 #### 2.3.3 Formant Selection
 
@@ -151,59 +163,67 @@ Ctrl+S saves the .formants file. On opening a WAV file, FormantStudio checks for
 
 ## 3. Implementation Status
 
-### 3.1 Milestone 1 — Core Prototype (Current)
-
-Milestone 1 delivers the minimum viable tool: open audio, view spectrogram with formants, edit formants, and save/load.
+### 3.1 Milestone 1 — Core Prototype ✅ COMPLETE
 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Open WAV files | ✅ COMPLETE | Also supports AIFF, MP3 |
-| Spectrogram display (Praat engine) | ✅ COMPLETE | Inferno colourmap, Gouraud shading |
+| Spectrogram display (Praat engine) | ✅ COMPLETE | Greyscale (`gray_r`), bilinear interpolation, ≤10s view limit |
+| Waveform display | ✅ COMPLETE | Amplitude waveform above spectrogram |
 | Dynamic range / brightness sliders | ✅ COMPLETE | Real-time update |
 | Pre-emphasis control | ✅ COMPLETE | Affects formant re-analysis |
 | Max frequency control | ✅ COMPLETE | Recomputes spectrogram |
+| Spectrogram window length slider | ✅ COMPLETE | Adjustable analysis window |
 | Formant analysis (Praat Burg method) | ✅ COMPLETE | Configurable parameters |
 | Colour-coded formant overlay | ✅ COMPLETE | F1–F5, edited points highlighted |
-| Click-drag formant editing | ✅ COMPLETE | Per-frame overwrite |
+| Click-drag formant editing | ✅ COMPLETE | Per-frame overwrite with interpolation |
 | F1–F5 key selection | ✅ COMPLETE | Active only in edit mode |
 | Save .formants file (Ctrl+S) | ✅ COMPLETE | JSON format, alongside WAV |
 | Load .formants file (Ctrl+L / auto) | ✅ COMPLETE | Auto-detect on WAV open |
-| Reset edits (per-formant / all) | ✅ COMPLETE | Restores original values |
+| Reset edits (per-formant / all) | ✅ COMPLETE | Restores original values, undoable |
 | Re-analyse with changed parameters | ✅ COMPLETE | Button in control panel |
 | Dark theme UI | ✅ COMPLETE | Fusion style + custom palette |
 
-### 3.2 Known Issues (Milestone 1)
+### 3.2 Milestone 2 — TextGrid Integration & Navigation ✅ COMPLETE
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Display TextGrid tiers below spectrogram | ✅ COMPLETE | IntervalTier + TextTier, batch rendering |
+| Load/save TextGrid files | ✅ COMPLETE | Normal and short format parsing, normal format save |
+| TextGrid boundary editing | ✅ COMPLETE | Add (Enter), delete (Del), drag boundaries |
+| Shift+drag aligned boundaries | ✅ COMPLETE | Multi-tier aligned boundary movement |
+| Interval/point label editing | ✅ COMPLETE | Inline label editor, live update |
+| Create new TextGrid | ✅ COMPLETE | Dialog for creating from scratch |
+| Add tier to existing TextGrid | ✅ COMPLETE | IntervalTier or TextTier |
+| Zoom in/out (time axis) | ✅ COMPLETE | Mouse scroll wheel + Ctrl+I/O |
+| Scroll / pan through audio | ✅ COMPLETE | Scrollbar with ◀/▶ arrow buttons (2/3 window step) |
+| Click-to-play audio selection | ✅ COMPLETE | Tab to play, selection/click/view range |
+| Drag time selection on spectrogram | ✅ COMPLETE | Click-drag in non-edit mode |
+| Crosshair cursor | ✅ COMPLETE | Time/frequency readout in status bar |
+| Boundary lines on spectrogram + waveform | ✅ COMPLETE | Interval (thick) and point (thin) dashed lines |
+
+### 3.3 Milestone 3 — Editing Refinements (Current)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Undo/redo (Ctrl+Z / Ctrl+Y) | ✅ COMPLETE | Command-based, per-frame diffs, 100-entry stack |
+| Frame interpolation during drawing | ✅ COMPLETE | Fills skipped frames with linear interpolation |
+| Eraser tool (right-click drag) | ✅ COMPLETE | Reverts to original Praat values, grey feedback |
+| Interpolate between edited points | ✅ COMPLETE | Button in control panel, respects selection range |
+| Drag-to-adjust existing formant points | 🔲 DEFERRED | Removed due to conflict with freehand draw; needs modifier key |
+| Adjustable formant time resolution | 🔵 FUTURE | Low priority |
+
+### 3.4 Known Issues
 
 - Parselmouth's Spectrogram object does not expose `get_frequency_from_frequency_bin_number`; resolved by using the `.xs()` and `.ys()` methods instead.
 - The pre-emphasis slider minimum must be 1 Hz (not 0), as Praat's Burg method requires a positive value.
-- No zoom or scroll — the entire audio file is displayed at once. Long files will have compressed temporal resolution.
-- Drawing interpolation between frames is not yet implemented; fast mouse movement can skip frames.
+- Drag-to-adjust existing formant points was implemented but removed — left-click detection near existing points conflicted with freehand drawing. Needs a modifier key (e.g. Ctrl+click) approach.
 
 ---
 
 ## 4. Roadmap
 
-### 4.1 Milestone 2 — TextGrid Integration & Navigation
-
-| Feature | Status | Priority |
-|---------|--------|----------|
-| Display TextGrid tiers below spectrogram | 🔲 PLANNED | High |
-| Zoom in/out (time axis) | 🔲 PLANNED | High |
-| Scroll / pan through audio | 🔲 PLANNED | High |
-| Click-to-play audio selection | 🔲 PLANNED | Medium |
-| Frame interpolation during drawing | 🔲 PLANNED | Medium |
-
-### 4.2 Milestone 3 — Editing Refinements
-
-| Feature | Status | Priority |
-|---------|--------|----------|
-| Drag-to-adjust existing formant points | 🔲 PLANNED | High |
-| Interpolate between edited points | 🔲 PLANNED | High |
-| Undo/redo (Ctrl+Z / Ctrl+Y) | 🔲 PLANNED | High |
-| Delete formant points (eraser tool) | 🔲 PLANNED | Medium |
-| Adjustable formant time resolution | 🔵 FUTURE | Low |
-
-### 4.3 Milestone 4 — Export & Distribution
+### 4.1 Milestone 4 — Export & Distribution
 
 | Feature | Status | Priority |
 |---------|--------|----------|
@@ -219,30 +239,33 @@ Milestone 1 delivers the minimum viable tool: open audio, view spectrogram with 
 
 ### 5.1 Application Structure
 
-The application is a single Python file (`formant_editor.py`) organised into four main classes:
+The application is a single Python file (`formant_editor.py`) organised into the following classes:
 
 | Class | Responsibility |
 |-------|---------------|
 | FormantData | Data container for formant values (original + edited), with save/load to JSON .formants format, edit tracking via edited_mask, and per-formant reset. |
-| SpectrogramCanvas | Matplotlib FigureCanvas embedded in Qt. Handles spectrogram rendering, formant overlay drawing, and mouse interaction for editing. |
-| ControlPanel | Qt widget containing all sliders, spin boxes, buttons, and the edit mode controls. Emits signals connected to MainWindow. |
-| MainWindow | QMainWindow subclass. Orchestrates file operations, formant analysis, keyboard events (F1–F5), and signal routing between canvas and controls. |
+| Interval, Point, Tier, TextGrid | TextGrid data model — parsing (normal + short format), serialisation, and in-memory representation. |
+| LabelEdit | Inline QLineEdit for editing interval/point labels with Tab-play and Escape support. |
+| SpectrogramCanvas | Matplotlib FigureCanvas embedded in Qt. Handles spectrogram/waveform/TextGrid rendering, formant overlay, mouse interaction (editing, boundary drag, selection), audio playback with animated cursor, zoom/scroll, crosshair, undo/redo. |
+| ControlPanel | Qt widget containing all sliders, spin boxes, buttons, and the edit mode controls. |
+| MainWindow | QMainWindow subclass. Orchestrates file operations, formant analysis, keyboard events, menu bar, signal routing, and scrollbar management. |
 
 ### 5.2 Data Flow
 
 1. User opens a WAV file → Parselmouth loads it as a Sound object.
 2. Sound → `to_spectrogram()` → spectrogram data (power values, frequency bins, time bins) for display.
 3. Sound → `to_formant_burg()` → Formant object → extracted into FormantData (NumPy arrays of times and values).
-4. SpectrogramCanvas renders spectrogram via pcolormesh, then overlays formant scatter points.
-5. Mouse editing writes directly to `FormantData.values` and sets `edited_mask`.
+4. SpectrogramCanvas renders spectrogram via `imshow`, waveform, formant scatter points, and TextGrid tiers using a GridSpec layout with shared x-axis.
+5. Mouse editing writes directly to `FormantData.values` and sets `edited_mask`. Changes are recorded in the undo stack as per-frame diffs.
 6. Save serialises FormantData to JSON; load deserialises and replaces the current FormantData.
+7. TextGrid files are parsed into the Tier/Interval/Point data model, displayed as synchronised axes, and saved back in Praat normal text format.
 
 ### 5.3 Key Design Decisions
 
 - **JSON file format:** Chosen over binary formats for human readability, version control compatibility, and ease of integration with analysis scripts (Python, R). The slight file size increase is negligible for formant data.
 - **5 formant slots always stored:** Even when only F1–F3 are calculated, the data structure holds 5 rows (with NaN for unused formants). This prevents schema changes if the user later increases the analysis to F1–F5.
 - **Separate original_values:** The original Praat-calculated values are stored alongside edited values, enabling per-point reset without re-running the analysis.
-- **Matplotlib for rendering:** While a custom OpenGL canvas could be faster for large files, matplotlib provides well-tested spectrogram rendering (pcolormesh), scientific colour maps, and a familiar API. Performance is adequate for typical phonetics files (up to several minutes of audio).
+- **Matplotlib for rendering:** While a custom OpenGL canvas could be faster for large files, matplotlib provides well-tested spectrogram rendering, scientific colour maps, and a familiar API. Performance is adequate for typical phonetics files (up to several minutes of audio). `imshow` with bilinear interpolation is used instead of `pcolormesh` (Gouraud shading was too slow for large spectrograms). Blitting is used for responsive mouse interactions (drawing, boundary drag, selection, crosshair).
 
 ---
 
