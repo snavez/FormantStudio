@@ -989,6 +989,10 @@ class SpectrogramCanvas(FigureCanvas):
         vis_samples = samples[i_start:i_end]
         n_vis = len(vis_samples)
 
+        # Compute actual sample times from indices (not view bounds)
+        t_start = i_start / sr
+        t_end = i_end / sr
+
         # Determine target chunk count (~2x pixel width)
         try:
             ax_width_px = self.wave_ax.get_window_extent().width
@@ -998,7 +1002,7 @@ class SpectrogramCanvas(FigureCanvas):
 
         if n_vis <= target_chunks * 2:
             # Few enough samples to plot directly
-            times = np.linspace(self.view_start, self.view_end, n_vis)
+            times = np.linspace(t_start, t_end, n_vis)
             self.wave_ax.plot(times, vis_samples, color="#66ccff",
                               linewidth=0.5, alpha=0.9)
         else:
@@ -1008,7 +1012,7 @@ class SpectrogramCanvas(FigureCanvas):
             reshaped = vis_samples[:n_usable].reshape(target_chunks, chunk_size)
             env_min = reshaped.min(axis=1)
             env_max = reshaped.max(axis=1)
-            chunk_times = np.linspace(self.view_start, self.view_end, target_chunks)
+            chunk_times = np.linspace(t_start, t_end, target_chunks)
             self.wave_ax.fill_between(chunk_times, env_min, env_max,
                                        color="#66ccff", alpha=0.7)
 
@@ -2602,8 +2606,10 @@ class MainWindow(QMainWindow):
                 event.accept()
                 return
             if key == Qt.Key.Key_A:
-                # Zoom all — guard against Select All in label editor
-                if not self.label_edit.hasFocus():
+                # Zoom all — but let Select All work in active label editor
+                if self.label_edit.hasFocus() and self.label_edit.isEnabled():
+                    pass  # let Qt handle Select All
+                else:
                     c = self.canvas
                     c.set_view(0, c.total_duration)
                     c.render()
