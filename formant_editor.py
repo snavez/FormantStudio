@@ -558,7 +558,8 @@ class SpectrogramCanvas(QWidget):
         # Plot items (created in _setup_axes)
         self._spec_plot = None   # PlotItem for spectrogram
         self._wave_plot = None   # PlotItem for waveform
-        self._tier_plots = []    # list of PlotItem for TextGrid tiers
+        self._tier_plots = []    # list of PlotItem for visible TextGrid tiers
+        self._tier_plot_indices = []  # maps _tier_plots[i] → tg.tiers index
 
         # pyqtgraph items (persistent, updated in-place)
         self._spec_image = None       # pg.ImageItem for spectrogram
@@ -598,6 +599,7 @@ class SpectrogramCanvas(QWidget):
         self.spec_freqs = None
         self.formant_data = None
         self.textgrid_data = None   # TextGrid object or None
+        self.hidden_tiers = set()   # indices of tiers to hide
         self.tier_axes = []         # kept for API compat (list, same length as _tier_plots)
         self.wave_ax = None         # kept for API compat
 
@@ -709,6 +711,7 @@ class SpectrogramCanvas(QWidget):
         self._spec_plot.setYRange(0, 1)
         self._wave_plot = None
         self._tier_plots = []
+        self._tier_plot_indices = []
         self.tier_axes = []
         self.wave_ax = None
 
@@ -716,6 +719,7 @@ class SpectrogramCanvas(QWidget):
         """Recreate plot layout based on loaded data."""
         self._glw.clear()
         self._tier_plots = []
+        self._tier_plot_indices = []
         self.tier_axes = []
         self._wave_plot = None
         self.wave_ax = None
@@ -759,7 +763,9 @@ class SpectrogramCanvas(QWidget):
             row += 1
 
         # Spectrogram
-        if has_tiers:
+        has_visible_tiers = (has_tiers and
+                             any(i not in self.hidden_tiers for i in range(len(tg.tiers))))
+        if has_visible_tiers:
             spec_stretch = 50
         else:
             spec_stretch = 85 if has_wave else 100
@@ -773,31 +779,38 @@ class SpectrogramCanvas(QWidget):
         if self._wave_plot is not None:
             self._wave_plot.setXLink(self._spec_plot)
 
-        # Tier plots
+        # Tier plots (skip hidden tiers)
         if has_tiers:
-            n_tiers = len(tg.tiers)
-            tier_share = max(3, 35 // n_tiers)
-            for i in range(n_tiers):
-                tp = self._glw.addPlot(row=row + i, col=0)
-                self._configure_plot(tp, '#ffffff')
-                tp.setXLink(self._spec_plot)
-                tp.setYRange(0, 1, padding=0)
-                # Show tier name as left axis label (no tick marks)
-                left_ax = tp.getAxis('left')
-                left_ax.setWidth(60)
-                left_ax.setTicks([])  # no tick marks
-                left_ax.setStyle(showValues=False)
-                # Only show x-axis on bottom tier
-                if i < n_tiers - 1:
-                    tp.getAxis('bottom').setStyle(showValues=False)
-                    tp.getAxis('bottom').setHeight(0)
-                else:
-                    tp.setLabel('bottom', 'Time (s)', **{'font-size': '9pt', 'color': '#eeeeee'})
-                self._glw.ci.layout.setRowStretchFactor(row + i, tier_share)
-                self._tier_plots.append(tp)
-            # Hide x-axis on spectrogram when tiers present
-            self._spec_plot.getAxis('bottom').setStyle(showValues=False)
-            self._spec_plot.getAxis('bottom').setHeight(0)
+            visible_indices = [i for i in range(len(tg.tiers))
+                               if i not in self.hidden_tiers]
+            n_visible = len(visible_indices)
+            if n_visible > 0:
+                tier_share = max(3, 35 // n_visible)
+                for vi, tier_i in enumerate(visible_indices):
+                    tp = self._glw.addPlot(row=row + vi, col=0)
+                    self._configure_plot(tp, '#ffffff')
+                    tp.setXLink(self._spec_plot)
+                    tp.setYRange(0, 1, padding=0)
+                    # Show tier name as left axis label (horizontal, no tick marks)
+                    left_ax = tp.getAxis('left')
+                    left_ax.setWidth(90)
+                    left_ax.setTicks([])  # no tick marks
+                    left_ax.setStyle(showValues=False)
+                    # Only show x-axis on bottom visible tier
+                    if vi < n_visible - 1:
+                        tp.getAxis('bottom').setStyle(showValues=False)
+                        tp.getAxis('bottom').setHeight(0)
+                    else:
+                        tp.setLabel('bottom', 'Time (s)', **{'font-size': '9pt', 'color': '#eeeeee'})
+                    self._glw.ci.layout.setRowStretchFactor(row + vi, tier_share)
+                    self._tier_plots.append(tp)
+                    self._tier_plot_indices.append(tier_i)
+                # Hide x-axis on spectrogram when visible tiers present
+                self._spec_plot.getAxis('bottom').setStyle(showValues=False)
+                self._spec_plot.getAxis('bottom').setHeight(0)
+            else:
+                # All tiers hidden — spec shows its own x-axis
+                self._spec_plot.setLabel('bottom', 'Time (s)', **{'font-size': '9pt', 'color': '#eeeeee'})
         else:
             # No tiers — spec shows its own x-axis
             self._spec_plot.setLabel('bottom', 'Time (s)', **{'font-size': '9pt', 'color': '#eeeeee'})
@@ -1198,12 +1211,14 @@ class SpectrogramCanvas(QWidget):
         spec_interval_boundaries = set()
         spec_point_times = []
 
-        for tier_idx, (tier, tier_plot) in enumerate(zip(tg.tiers, self._tier_plots)):
+        for plot_i, tier_plot in enumerate(self._tier_plots):
+            tier_idx = self._tier_plot_indices[plot_i]
+            tier = tg.tiers[tier_idx]
             is_active = (tier_idx == self._active_tier)
             tier_plot.getViewBox().setBackgroundColor('#fff8c4' if is_active else '#ffffff')
             tier_plot.setYRange(0, 1, padding=0)
 
-            # Tier name as left axis label
+            # Tier name as left axis label (horizontal)
             label_color = '#cc2200' if is_active else '#5577aa'
             label_weight = 'bold' if is_active else 'normal'
             tier_plot.setLabel('left', tier.name, **{
@@ -1211,6 +1226,7 @@ class SpectrogramCanvas(QWidget):
                 'font-size': '10pt',
                 'font-weight': label_weight,
             })
+            tier_plot.getAxis('left').label.setRotation(0)
 
             if tier.tier_class == "IntervalTier":
                 vis = [iv for iv in tier.intervals
@@ -1242,7 +1258,7 @@ class SpectrogramCanvas(QWidget):
                             mid_t = (iv.xmin + iv.xmax) / 2.0
                             if view_start <= mid_t <= view_end:
                                 t = pg.TextItem(iv.text, color='#000000', anchor=(0.5, 0.5))
-                                t.setFont(QFont("Segoe UI", 10))
+                                t.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
                                 t.setPos(mid_t, 0.5)
                                 self._add_transient(t, tier_plot)
 
@@ -1360,14 +1376,15 @@ class SpectrogramCanvas(QWidget):
                 if (tier.tier_class == "IntervalTier"
                         and sel_i < len(tier.intervals)):
                     iv = tier.intervals[sel_i]
-                    if sel_tier_idx < len(self._tier_plots):
+                    sel_plot = self._plot_for_tier(sel_tier_idx)
+                    if sel_plot is not None:
                         region = pg.LinearRegionItem(
                             values=[iv.xmin, iv.xmax],
                             movable=False,
                             brush=pg.mkBrush(51, 102, 204, 65),
                             pen=pg.mkPen(None),
                         )
-                        self._add_overlay(region, self._tier_plots[sel_tier_idx])
+                        self._add_overlay(region, sel_plot)
 
         # Selected boundary highlight + shadows
         if self._selected_boundary is not None:
@@ -1382,13 +1399,14 @@ class SpectrogramCanvas(QWidget):
                     line2 = pg.InfiniteLine(pos=sel_time, angle=90, pen=red_pen)
                     self._add_overlay(line2, self._wave_plot)
                 # On selected tier
-                if 0 <= sel_tier < len(self._tier_plots):
+                sel_tier_plot = self._plot_for_tier(sel_tier)
+                if sel_tier_plot is not None:
                     line3 = pg.InfiniteLine(pos=sel_time, angle=90, pen=red_pen)
-                    self._add_overlay(line3, self._tier_plots[sel_tier])
+                    self._add_overlay(line3, sel_tier_plot)
 
                 # Shadow boundaries on OTHER tiers
                 for other_idx, other_plot in enumerate(self._tier_plots):
-                    if other_idx == sel_tier:
+                    if self._tier_plot_indices[other_idx] == sel_tier:
                         continue
                     dash_pen = pg.mkPen('#888888', width=1.0, style=Qt.PenStyle.DashLine)
                     line = pg.InfiniteLine(pos=sel_time, angle=90, pen=dash_pen)
@@ -1406,11 +1424,19 @@ class SpectrogramCanvas(QWidget):
     # -------------------------------------------------------------------
 
     def _tier_index_for_plot(self, plot):
-        """Return the tier index for a given PlotItem, or None."""
+        """Return the actual tier index for a given PlotItem, or None."""
         for i, tp in enumerate(self._tier_plots):
             if tp is plot:
-                return i
+                return self._tier_plot_indices[i]
         return None
+
+    def _plot_for_tier(self, tier_idx):
+        """Return the PlotItem for a given tier index, or None if hidden."""
+        try:
+            pi = self._tier_plot_indices.index(tier_idx)
+            return self._tier_plots[pi]
+        except ValueError:
+            return None
 
     # Keep the old name for backward compat with any internal usage
     def _tier_index_for_axes(self, axes):
@@ -1849,15 +1875,17 @@ class SpectrogramCanvas(QWidget):
                 line = pg.InfiniteLine(pos=bt, angle=90, pen=red_pen, movable=False)
                 p.addItem(line)
                 self._drag_lines.append((p, line))
-        if tier_idx < len(self._tier_plots):
+        drag_tier_plot = self._plot_for_tier(tier_idx)
+        if drag_tier_plot is not None:
             line = pg.InfiniteLine(pos=bt, angle=90, pen=red_pen, movable=False)
-            self._tier_plots[tier_idx].addItem(line)
-            self._drag_lines.append((self._tier_plots[tier_idx], line))
+            drag_tier_plot.addItem(line)
+            self._drag_lines.append((drag_tier_plot, line))
         for a_tier_idx, _ in self._drag_aligned:
-            if a_tier_idx < len(self._tier_plots):
+            a_plot = self._plot_for_tier(a_tier_idx)
+            if a_plot is not None:
                 line = pg.InfiniteLine(pos=bt, angle=90, pen=red_pen, movable=False)
-                self._tier_plots[a_tier_idx].addItem(line)
-                self._drag_lines.append((self._tier_plots[a_tier_idx], line))
+                a_plot.addItem(line)
+                self._drag_lines.append((a_plot, line))
 
     # -------------------------------------------------------------------
     # Mouse release
@@ -2450,6 +2478,13 @@ class ControlPanel(QWidget):
 
         layout.addWidget(edit_group)
 
+        # --- TextGrid Tiers ---
+        self._tier_group = QGroupBox("TextGrid Tiers")
+        self._tier_group_layout = QVBoxLayout(self._tier_group)
+        self._tier_checkboxes = []  # list of QCheckBox
+        self._tier_group.setVisible(False)  # hidden until TextGrid loaded
+        layout.addWidget(self._tier_group)
+
         layout.addStretch()
 
     def _make_slider(self, label_text, min_val, max_val, default, parent_layout):
@@ -2461,6 +2496,25 @@ class ControlPanel(QWidget):
         slider.valueChanged.connect(lambda v, l=lbl, t=label_text: l.setText(f"{t}: {v}"))
         parent_layout.addWidget(slider)
         return slider
+
+    def populate_tier_checkboxes(self, tier_names, hidden_set):
+        """Populate tier visibility checkboxes from tier names."""
+        # Clear old checkboxes
+        for cb in self._tier_checkboxes:
+            self._tier_group_layout.removeWidget(cb)
+            cb.deleteLater()
+        self._tier_checkboxes = []
+
+        if not tier_names:
+            self._tier_group.setVisible(False)
+            return
+
+        for i, name in enumerate(tier_names):
+            cb = QCheckBox(name)
+            cb.setChecked(i not in hidden_set)
+            self._tier_checkboxes.append(cb)
+            self._tier_group_layout.addWidget(cb)
+        self._tier_group.setVisible(True)
 
     def update_active_formant_display(self, formant_idx):
         """Update the active formant label (0-indexed input)."""
@@ -2664,8 +2718,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("FormantStudio — Manual Formant Editor")
-        self.setMinimumSize(1200, 700)
-        self.resize(1800, 950)
+        self.setMinimumSize(1200, 900)
+        self.resize(1800, 1425)
 
         # Dark theme
         self.setStyleSheet("""
@@ -3204,6 +3258,7 @@ class MainWindow(QMainWindow):
                 tg = self._create_textgrid_from_dialog()
                 if tg is not None:
                     self.canvas.textgrid_data = tg
+                    self._setup_tier_checkboxes()
                     self.canvas._setup_axes()
                     self.canvas.render()
                     tier_desc = ", ".join(t.name for t in tg.tiers)
@@ -3258,6 +3313,7 @@ class MainWindow(QMainWindow):
             tg = TextGrid.from_file(filepath)
             self._textgrid_path = filepath
             self.canvas.textgrid_data = tg
+            self._setup_tier_checkboxes()
             self.canvas._setup_axes()
             self.canvas.render()
             tier_desc = ", ".join(t.name for t in tg.tiers)
@@ -3293,6 +3349,28 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save TextGrid:\n{e}")
 
+    def _setup_tier_checkboxes(self):
+        """Populate tier visibility checkboxes for the current TextGrid."""
+        tg = self.canvas.textgrid_data
+        if tg is None:
+            self.controls.populate_tier_checkboxes([], set())
+            return
+        names = [t.name for t in tg.tiers]
+        self.canvas.hidden_tiers = set()  # reset when loading new TextGrid
+        self.controls.populate_tier_checkboxes(names, self.canvas.hidden_tiers)
+        # Connect signals
+        for i, cb in enumerate(self.controls._tier_checkboxes):
+            cb.toggled.connect(lambda checked, idx=i: self._on_tier_visibility_toggled(idx, checked))
+
+    def _on_tier_visibility_toggled(self, tier_idx, checked):
+        """Toggle tier visibility and rebuild axes."""
+        if checked:
+            self.canvas.hidden_tiers.discard(tier_idx)
+        else:
+            self.canvas.hidden_tiers.add(tier_idx)
+        self.canvas._setup_axes()
+        self.canvas.render()
+
     def _create_textgrid_from_dialog(self):
         """Show CreateTextGridDialog and return a TextGrid or None."""
         if self.canvas.sound is None:
@@ -3314,10 +3392,16 @@ class MainWindow(QMainWindow):
             new_tier = dlg.get_tier()
             pos = dlg.get_position()
             tg.tiers.insert(pos, new_tier)
-            # Adjust active tier if it shifted
+            # Adjust active tier and hidden tiers if they shifted
             if (self.canvas._active_tier is not None
                     and pos <= self.canvas._active_tier):
                 self.canvas._active_tier += 1
+            # Shift hidden tier indices
+            new_hidden = set()
+            for h in self.canvas.hidden_tiers:
+                new_hidden.add(h + 1 if h >= pos else h)
+            self.canvas.hidden_tiers = new_hidden
+            self._setup_tier_checkboxes()
             self.canvas._setup_axes()
             self.canvas.render()
             self.status.showMessage(f"Added tier \"{new_tier.name}\"")

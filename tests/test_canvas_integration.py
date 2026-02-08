@@ -203,6 +203,40 @@ class TestTextGridRendering:
         c._active_tier = 1
         c.render()
 
+    def test_hide_tier(self, canvas_with_sound, simple_textgrid):
+        """Hiding a tier should exclude it from rendering."""
+        c = canvas_with_sound
+        c.textgrid_data = simple_textgrid
+        c._setup_axes()
+        assert len(c._tier_plots) == 2
+        # Hide tier 0
+        c.hidden_tiers = {0}
+        c._setup_axes()
+        c.render()
+        assert len(c._tier_plots) == 1
+        assert c._tier_plot_indices == [1]
+
+    def test_hide_all_tiers(self, canvas_with_sound, simple_textgrid):
+        """Hiding all tiers should show spectrogram x-axis."""
+        c = canvas_with_sound
+        c.textgrid_data = simple_textgrid
+        c.hidden_tiers = {0, 1}
+        c._setup_axes()
+        c.render()
+        assert len(c._tier_plots) == 0
+
+    def test_tier_index_mapping(self, canvas_with_sound, simple_textgrid):
+        """_tier_index_for_plot should return actual tier index, not plot index."""
+        c = canvas_with_sound
+        c.textgrid_data = simple_textgrid
+        c.hidden_tiers = {0}  # hide first tier
+        c._setup_axes()
+        c.render()
+        # The one visible plot should map to tier index 1
+        assert c._tier_index_for_plot(c._tier_plots[0]) == 1
+        assert c._plot_for_tier(1) is c._tier_plots[0]
+        assert c._plot_for_tier(0) is None  # hidden
+
 
 # ---------------------------------------------------------------------------
 # Zoom and view
