@@ -566,13 +566,6 @@ class SpectrogramCanvas(FigureCanvas):
         # Eraser state (right-click drag in edit mode)
         self._is_erasing = False
 
-        # Point drag state (click near existing formant point to adjust)
-        self._point_drag_mode = False
-        self._point_drag_frame_idx = None
-        self._point_drag_formant_idx = None
-        self._point_drag_original_value = None
-        self._point_drag_scatter = None
-
         # Undo/redo stacks
         self._undo_stack = []
         self._redo_stack = []
@@ -1690,33 +1683,6 @@ class SpectrogramCanvas(FigureCanvas):
         # --- Edit mode: formant drawing / erasing (only on spectrogram axes) ---
         if event.inaxes != self.ax:
             return
-
-        # Left-click near existing point: start point drag adjustment
-        if event.button == 1 and event.ydata is not None:
-            f_idx, frame_idx, dist = self._find_nearest_formant_point(
-                event.xdata, event.ydata)
-            if f_idx is not None:
-                fd = self.formant_data
-                self._point_drag_mode = True
-                self._point_drag_frame_idx = frame_idx
-                self._point_drag_formant_idx = f_idx
-                self._point_drag_original_value = float(fd.values[f_idx, frame_idx])
-                # Cache background and create drag scatter
-                self.fig.canvas.draw()
-                self._bg_cache = self.fig.canvas.copy_from_bbox(self.ax.bbox)
-                fn = f_idx + 1
-                color = FORMANT_COLORS.get(fn, "#ffffff")
-                t = fd.times[frame_idx]
-                self._point_drag_scatter = self.ax.scatter(
-                    [t], [fd.values[f_idx, frame_idx]],
-                    c=color, s=30, edgecolors="white",
-                    linewidths=0.8, zorder=6, marker='o',
-                )
-                self.ax.draw_artist(self._point_drag_scatter)
-                self.fig.canvas.blit(self.ax.bbox)
-                return
-
-        # Freehand draw / erase
         self.is_drawing = True
         self._is_erasing = (event.button == 3)
         self._last_frame_idx = -1
@@ -1774,37 +1740,6 @@ class SpectrogramCanvas(FigureCanvas):
             self._dragging_boundary = False
             self._drag_tier_index = None
             self._drag_original_time = None
-            self.render()
-            return
-
-        # --- End point drag (formant point adjust) ---
-        if self._point_drag_mode:
-            self._point_drag_mode = False
-            fd = self.formant_data
-            f_idx = self._point_drag_formant_idx
-            fi = self._point_drag_frame_idx
-            old_val = self._point_drag_original_value
-            old_mask = bool(fd.edited_mask[f_idx, fi])
-            # Determine final frequency from mouse position
-            new_val = event.ydata if event.ydata is not None else old_val
-            fd.set_value(f_idx, fi, new_val)
-            # Push undo entry
-            entry = UndoEntry("Adjust point", [
-                (f_idx, fi, old_val, old_mask, new_val, True)])
-            self._undo_stack.append(entry)
-            self._redo_stack.clear()
-            if len(self._undo_stack) > MAX_UNDO_STEPS:
-                self._undo_stack.pop(0)
-            # Clean up
-            if self._point_drag_scatter is not None:
-                self._point_drag_scatter.remove()
-                self._point_drag_scatter = None
-            self._bg_cache = None
-            self._point_drag_frame_idx = None
-            self._point_drag_formant_idx = None
-            self._point_drag_original_value = None
-            if self._on_formant_edited is not None:
-                self._on_formant_edited()
             self.render()
             return
 
@@ -1941,17 +1876,6 @@ class SpectrogramCanvas(FigureCanvas):
             if self._spec_sel_wave_artist is not None:
                 self.wave_ax.draw_artist(self._spec_sel_wave_artist)
             self.fig.canvas.blit(self.fig.bbox)
-            return
-
-        # --- Point drag (vertical adjust of existing formant point) ---
-        if self._point_drag_mode:
-            if event.ydata is not None and self._bg_cache is not None:
-                fd = self.formant_data
-                t = fd.times[self._point_drag_frame_idx]
-                self._point_drag_scatter.set_offsets([[t, event.ydata]])
-                self.fig.canvas.restore_region(self._bg_cache)
-                self.ax.draw_artist(self._point_drag_scatter)
-                self.fig.canvas.blit(self.ax.bbox)
             return
 
         # --- Crosshair + readout (always active over spectrogram/waveform, not during playback) ---
@@ -2163,59 +2087,6 @@ class SpectrogramCanvas(FigureCanvas):
             for tc, tier_ax in zip(self._playback_tier_cursors, self.tier_axes):
                 tier_ax.draw_artist(tc)
             self.fig.canvas.blit(self.fig.bbox)
-
-    def _find_nearest_formant_point(self, time_s, freq_hz, pixel_threshold=8):
-        """Find nearest existing formant point within pixel_threshold pixels.
-
-        Returns (formant_idx, frame_idx, distance_px) or (None, None, float('inf')).
-        Only checks the active formant.
-        """
-        if self.formant_data is None:
-            return None, None, float('inf')
-
-        fd = self.formant_data
-        f_idx = self.active_formant
-
-        # Convert pixel threshold to data coordinates
-        try:
-            # Get display-to-data transform
-            inv = self.ax.transData.inverted()
-            # Measure pixel threshold in both dimensions
-            p0 = self.ax.transData.transform((time_s, freq_hz))
-            p_dx = inv.transform((p0[0] + pixel_threshold, p0[1]))
-            p_dy = inv.transform((p0[0], p0[1] + pixel_threshold))
-            time_thresh = abs(p_dx[0] - time_s)
-            freq_thresh = abs(p_dy[1] - freq_hz)
-        except Exception:
-            return None, None, float('inf')
-
-        if time_thresh == 0 or freq_thresh == 0:
-            return None, None, float('inf')
-
-        # Find frames within time threshold
-        time_diffs = np.abs(fd.times - time_s)
-        candidate_mask = time_diffs <= time_thresh
-        if not np.any(candidate_mask):
-            return None, None, float('inf')
-
-        best_dist = float('inf')
-        best_frame = None
-        candidates = np.where(candidate_mask)[0]
-        for fi in candidates:
-            val = fd.values[f_idx, fi]
-            if np.isnan(val):
-                continue
-            # Compute distance in normalized pixel space
-            dx = (fd.times[fi] - time_s) / time_thresh
-            dy = (val - freq_hz) / freq_thresh
-            dist = np.sqrt(dx * dx + dy * dy)
-            if dist < best_dist:
-                best_dist = dist
-                best_frame = fi
-
-        if best_frame is not None and best_dist <= 1.0:
-            return f_idx, best_frame, best_dist * pixel_threshold
-        return None, None, float('inf')
 
     def _apply_edit(self, time_s, freq_hz):
         """Apply an edit at the given time/frequency position."""
