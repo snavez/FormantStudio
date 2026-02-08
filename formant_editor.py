@@ -1407,8 +1407,16 @@ class SpectrogramCanvas(FigureCanvas):
     # -------------------------------------------------------------------
 
     def _on_scroll(self, event):
-        """Mouse wheel — disabled (use Ctrl+I/O for zoom)."""
-        return
+        """Mouse wheel zoom — centered on cursor position."""
+        if self.sound is None or event.xdata is None:
+            return
+        if event.step > 0:
+            self.zoom(1.0 / ZOOM_FACTOR, center_time=event.xdata)
+        else:
+            self.zoom(ZOOM_FACTOR, center_time=event.xdata)
+        self.render()
+        if self._on_view_changed_callback:
+            self._on_view_changed_callback()
 
     # -------------------------------------------------------------------
     # Mouse interaction for formant editing
@@ -2714,14 +2722,42 @@ class MainWindow(QMainWindow):
         self.scrollbar = QScrollBar(Qt.Orientation.Horizontal)
         self.scrollbar.setStyleSheet("""
             QScrollBar:horizontal {
-                background: #1a1a2e; height: 14px;
+                background: #3a3a4e; height: 18px;
                 border: none;
             }
             QScrollBar::handle:horizontal {
-                background: #556677; border-radius: 4px;
+                background: #667788; border-radius: 4px;
                 min-width: 30px;
             }
-            QScrollBar::add-line, QScrollBar::sub-line { width: 0; }
+            QScrollBar::add-line:horizontal {
+                background: #3a3a4e; width: 18px;
+                subcontrol-position: right;
+                subcontrol-origin: margin;
+                border: 1px solid #556677; border-radius: 3px;
+            }
+            QScrollBar::sub-line:horizontal {
+                background: #3a3a4e; width: 18px;
+                subcontrol-position: left;
+                subcontrol-origin: margin;
+                border: 1px solid #556677; border-radius: 3px;
+            }
+            QScrollBar::left-arrow:horizontal {
+                width: 10px; height: 10px;
+                image: none;
+                border-left: 2px solid #aabbcc;
+                border-bottom: 2px solid #aabbcc;
+                margin: 3px;
+            }
+            QScrollBar::right-arrow:horizontal {
+                width: 10px; height: 10px;
+                image: none;
+                border-right: 2px solid #aabbcc;
+                border-top: 2px solid #aabbcc;
+                margin: 3px;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: #3a3a4e;
+            }
         """)
 
         canvas_layout.addWidget(self.canvas, 1)
@@ -3333,6 +3369,7 @@ class MainWindow(QMainWindow):
 
         self.scrollbar.setRange(0, max(0, total_ms - view_ms))
         self.scrollbar.setPageStep(view_ms)
+        self.scrollbar.setSingleStep(max(1, int(view_ms * 2 / 3)))
         self.scrollbar.setValue(pos_ms)
 
         self._scrollbar_updating = False
