@@ -3,9 +3,16 @@ __pycache__/
 *.pyc
 *.wav
 *.formants
+*.TextGrid
+*.textgrid
 
 # PyInstaller
 build/
 dist/
 *.spec
 FormantStudio.exe
+
+# Misc
+nul
+.claude/
+formant_editor_SpectroCanvas.py
