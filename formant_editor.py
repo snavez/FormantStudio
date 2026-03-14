@@ -2475,6 +2475,10 @@ class ControlPanel(QWidget):
 
         edit_layout.addWidget(QLabel("Press F1–F5 to select formant"))
 
+        # Undo button
+        self.undo_btn = QPushButton("Undo Last Edit  (Ctrl+Z)")
+        edit_layout.addWidget(self.undo_btn)
+
         # Reset buttons
         self.reset_current_btn = QPushButton("Reset Current Formant")
         self.reset_all_btn = QPushButton("Reset All Edits")
@@ -3004,6 +3008,7 @@ class MainWindow(QMainWindow):
 
         # Edit mode
         ctrl.edit_btn.toggled.connect(self._on_edit_toggled)
+        ctrl.undo_btn.clicked.connect(self._undo_last_edit)
         ctrl.reset_current_btn.clicked.connect(self._reset_current_formant)
         ctrl.reset_all_btn.clicked.connect(self._reset_all_formants)
         ctrl.interpolate_btn.clicked.connect(self._interpolate_formant)
@@ -3216,7 +3221,39 @@ class MainWindow(QMainWindow):
     # File operations
     # -------------------------------------------------------------------
 
+    def _check_unsaved_changes(self):
+        """Check for unsaved formant/TextGrid edits. Returns True if OK to proceed."""
+        unsaved = []
+        if self._formants_dirty:
+            unsaved.append("formants")
+        if self._textgrid_dirty:
+            unsaved.append("TextGrid")
+        if not unsaved:
+            return True
+        reply = QMessageBox.question(
+            self,
+            "Unsaved Changes",
+            f"You have unsaved {' and '.join(unsaved)} changes.\n\n"
+            "Do you want to save before opening a new file?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+        )
+        if reply == QMessageBox.StandardButton.Save:
+            if self._formants_dirty:
+                self.save_formants()
+            if self._textgrid_dirty:
+                self.save_textgrid()
+            return True
+        elif reply == QMessageBox.StandardButton.Discard:
+            return True
+        else:  # Cancel
+            return False
+
     def open_file(self):
+        if not self._check_unsaved_changes():
+            return
+
         filepath, _ = QFileDialog.getOpenFileName(
             self, "Open Audio File", "",
             "Audio Files (*.wav *.WAV *.aiff *.AIFF *.mp3);;All Files (*)"
@@ -3628,6 +3665,14 @@ class MainWindow(QMainWindow):
         else:
             self.status.showMessage(
                 "Need at least 2 edited points to interpolate")
+
+    def _undo_last_edit(self):
+        """Undo last formant edit via button click."""
+        if self.canvas.undo():
+            self.status.showMessage("Undo")
+            self._formants_dirty = True
+        else:
+            self.status.showMessage("Nothing to undo")
 
     def _reset_current_formant(self):
         if self.canvas.formant_data is None:
