@@ -3264,17 +3264,7 @@ class MainWindow(QMainWindow):
                     tg_found = True
                     break
             if not tg_found:
-                tg = self._create_textgrid_from_dialog()
-                if tg is not None:
-                    self.canvas.textgrid_data = tg
-                    self._setup_tier_checkboxes()
-                    self.canvas._setup_axes()
-                    self.canvas.render()
-                    tier_desc = ", ".join(t.name for t in tg.tiers)
-                    self.status.showMessage(
-                        f"Created TextGrid "
-                        f"({len(tg.tiers)} tier{'s' if len(tg.tiers) != 1 else ''}: {tier_desc})"
-                    )
+                self._prompt_textgrid_choice()
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load file:\n{e}")
@@ -3379,6 +3369,35 @@ class MainWindow(QMainWindow):
             self.canvas.hidden_tiers.add(tier_idx)
         self.canvas._setup_axes()
         self.canvas.render()
+
+    def _prompt_textgrid_choice(self):
+        """When no matching TextGrid is found, let the user create or load one."""
+        msg = QMessageBox(self)
+        msg.setWindowTitle("No TextGrid Found")
+        msg.setText(
+            "No TextGrid was found for this audio file.\n\n"
+            "Would you like to create a new TextGrid or load an existing one?"
+        )
+        btn_create = msg.addButton("Create New", QMessageBox.ButtonRole.AcceptRole)
+        btn_load = msg.addButton("Load Existing…", QMessageBox.ButtonRole.ActionRole)
+        msg.addButton("Skip", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+
+        clicked = msg.clickedButton()
+        if clicked is btn_create:
+            tg = self._create_textgrid_from_dialog()
+            if tg is not None:
+                self.canvas.textgrid_data = tg
+                self._setup_tier_checkboxes()
+                self.canvas._setup_axes()
+                self.canvas.render()
+                tier_desc = ", ".join(t.name for t in tg.tiers)
+                self.status.showMessage(
+                    f"Created TextGrid "
+                    f"({len(tg.tiers)} tier{'s' if len(tg.tiers) != 1 else ''}: {tier_desc})"
+                )
+        elif clicked is btn_load:
+            self.load_textgrid()
 
     def _create_textgrid_from_dialog(self):
         """Show CreateTextGridDialog and return a TextGrid or None."""
