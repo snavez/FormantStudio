@@ -2740,6 +2740,7 @@ class MainWindow(QMainWindow):
 
         self._filepath = None
         self._textgrid_path = None
+        self._formants_path = None
         self._scrollbar_updating = False
         self._formants_dirty = False
         self._textgrid_dirty = False
@@ -3225,6 +3226,8 @@ class MainWindow(QMainWindow):
 
         self._filepath = filepath
         self.canvas._filepath = filepath
+        self._textgrid_path = None
+        self._formants_path = None
         self.status.showMessage(f"Loading {os.path.basename(filepath)}...")
         QApplication.processEvents()
 
@@ -3249,6 +3252,7 @@ class MainWindow(QMainWindow):
                 )
                 if reply == QMessageBox.StandardButton.Yes:
                     self.canvas.formant_data = FormantData.load(fmt_path)
+                    self._formants_path = fmt_path
                     self.canvas.render()
                     self.status.showMessage(
                         f"Loaded formants from {os.path.basename(fmt_path)}"
@@ -3271,27 +3275,44 @@ class MainWindow(QMainWindow):
             self.status.showMessage("Error loading file")
 
     def save_formants(self):
-        if self.canvas.formant_data is None or self._filepath is None:
+        if self.canvas.formant_data is None:
             self.status.showMessage("Nothing to save")
             return
 
-        fmt_path = os.path.splitext(self._filepath)[0] + ".formants"
+        if self._formants_path:
+            fmt_path = self._formants_path
+        else:
+            # Default to audio directory if available, otherwise prompt
+            if self._filepath:
+                default = os.path.splitext(self._filepath)[0] + ".formants"
+            else:
+                default = ""
+            fmt_path, _ = QFileDialog.getSaveFileName(
+                self, "Save Formants", default,
+                "Formant Files (*.formants);;All Files (*)"
+            )
+            if not fmt_path:
+                return
+
         try:
             self.canvas.formant_data.save(fmt_path)
+            self._formants_path = fmt_path
             self._formants_dirty = False
             self.status.showMessage(f"Saved: {os.path.basename(fmt_path)}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
 
     def load_formants(self):
+        start_dir = os.path.dirname(self._formants_path or self._filepath or "")
         filepath, _ = QFileDialog.getOpenFileName(
-            self, "Load Formant Data", "",
+            self, "Load Formant Data", start_dir,
             "Formant Files (*.formants);;All Files (*)"
         )
         if not filepath:
             return
         try:
             self.canvas.formant_data = FormantData.load(filepath)
+            self._formants_path = filepath
             self.canvas.render()
             self.status.showMessage(f"Loaded: {os.path.basename(filepath)}")
         except Exception as e:
@@ -3332,9 +3353,13 @@ class MainWindow(QMainWindow):
         if self._textgrid_path:
             save_path = self._textgrid_path
         else:
-            start_dir = os.path.dirname(self._filepath) if self._filepath else ""
+            # Suggest audio directory with matching basename, but let user choose
+            if self._filepath:
+                default = os.path.splitext(self._filepath)[0] + ".TextGrid"
+            else:
+                default = ""
             save_path, _ = QFileDialog.getSaveFileName(
-                self, "Save TextGrid", start_dir,
+                self, "Save TextGrid", default,
                 "TextGrid Files (*.TextGrid);;All Files (*)"
             )
             if not save_path:
