@@ -3688,8 +3688,24 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 def main():
+    # Set Windows taskbar icon identity (must be before QApplication)
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "FormantStudio.FormantStudio.1"
+        )
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    # Application icon (title bar + taskbar)
+    from PyQt6.QtGui import QIcon
+    icon_path = os.path.join(
+        getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
+        "formant_studio.ico",
+    )
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
 
     # Dark palette
     from PyQt6.QtGui import QPalette
