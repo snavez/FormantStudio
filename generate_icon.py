@@ -1,6 +1,6 @@
 """Generate a FormantStudio app icon (.ico) with multiple sizes."""
 import math
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 SIZES = [256, 128, 64, 48, 32, 16]
 
@@ -28,10 +28,10 @@ def draw_icon(size: int) -> Image.Image:
     )
 
     # --- Spectrogram bars (vertical bars with varying heights) ---
-    inner_l = pad + max(2, size // 10)
-    inner_r = size - pad - max(2, size // 10)
-    inner_t = pad + max(2, size // 6)
-    inner_b = size - pad - max(2, size // 4)
+    inner_l = pad + max(2, size // 12)
+    inner_r = size - pad - max(2, size // 12)
+    inner_t = pad + max(2, size // 8)
+    inner_b = size - pad - max(2, size // 8)
     bar_region_w = inner_r - inner_l
     bar_region_h = inner_b - inner_t
 
@@ -72,28 +72,8 @@ def draw_icon(size: int) -> Image.Image:
             y = inner_t + int(bar_region_h * y_frac)
             pts.append((px, y))
         if len(pts) > 1:
-            lw = max(1, size // 64)
+            lw = max(2, size // 48)
             draw.line(pts, fill=color, width=lw)
-
-    # --- "FS" text at bottom ---
-    text_size = max(6, size // 5)
-    try:
-        font = ImageFont.truetype("segoeuib.ttf", text_size)
-    except (OSError, IOError):
-        try:
-            font = ImageFont.truetype("arialbd.ttf", text_size)
-        except (OSError, IOError):
-            font = ImageFont.load_default()
-
-    text = "FS"
-    text_y = size - pad - max(2, size // 5) - max(1, size // 32)
-    bbox = draw.textbbox((0, 0), text, font=font)
-    tw = bbox[2] - bbox[0]
-    text_x = (size - tw) // 2
-    # Shadow
-    draw.text((text_x + 1, text_y + 1), text, fill=(0, 0, 0, 140), font=font)
-    # Main text
-    draw.text((text_x, text_y), text, fill=(220, 230, 255, 240), font=font)
 
     return img
 
