@@ -3265,6 +3265,8 @@ class MainWindow(QMainWindow):
         self.canvas._filepath = filepath
         self._textgrid_path = None
         self._formants_path = None
+        self._formants_dirty = False
+        self._textgrid_dirty = False
         self.status.showMessage(f"Loading {os.path.basename(filepath)}...")
         QApplication.processEvents()
 
@@ -3370,6 +3372,7 @@ class MainWindow(QMainWindow):
             tg = TextGrid.from_file(filepath)
             self._textgrid_path = filepath
             self.canvas.textgrid_data = tg
+            self._textgrid_dirty = False
             self._setup_tier_checkboxes()
             self.canvas._setup_axes()
             self.canvas.render()
