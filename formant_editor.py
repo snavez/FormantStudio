@@ -2730,7 +2730,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FormantStudio — Manual Formant Editor")
+        self._app_title = "FormantStudio — Manual Formant Editor"
+        self.setWindowTitle(self._app_title)
         self.setMinimumSize(1200, 900)
         self.resize(2100, 1425)
 
@@ -3275,6 +3276,9 @@ class MainWindow(QMainWindow):
             self._run_formant_analysis()
             self._update_scrollbar()
             self.canvas.render()
+            self.setWindowTitle(
+                f"{self._app_title}  —  {os.path.basename(filepath)}"
+            )
             self.status.showMessage(
                 f"Loaded: {os.path.basename(filepath)} "
                 f"({self.canvas.sound.duration:.2f}s, "
