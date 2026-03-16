@@ -91,7 +91,6 @@ _DIACRITIC_SUFFIXES = [
     ("_~", "nasalized"),
     ("_d", "breathy"),
     ("_c", "creaky"),
-    ("_b", "backed"),
     ("_:", "long"),
     (":", "long"),
 ]
@@ -114,7 +113,6 @@ _IPA_COMBINING_DIACRITICS = [
 _ALL_DIACRITIC_FEATURES = [
     "aspirated", "voiceless_diac", "dental_diac", "velarized",
     "labialized", "palatalized", "nasalized", "breathy", "creaky",
-    "backed",
 ]
 
 
