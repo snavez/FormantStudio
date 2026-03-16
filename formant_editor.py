@@ -2892,6 +2892,39 @@ _DIALOG_FIELD_STYLE = """
         background-color: #ffffff; color: #000000;
         selection-background-color: #d0d0d0; selection-color: #000000;
     }
+    QCheckBox, QRadioButton {
+        color: #cccccc;
+        spacing: 6px;
+    }
+    QCheckBox::indicator, QRadioButton::indicator {
+        width: 16px; height: 16px;
+        border: 2px solid #8899aa;
+        background-color: #2a2a3a;
+    }
+    QCheckBox::indicator { border-radius: 3px; }
+    QRadioButton::indicator { border-radius: 9px; }
+    QCheckBox::indicator:checked, QRadioButton::indicator:checked {
+        background-color: #6699cc;
+        border-color: #88bbee;
+    }
+    QListWidget {
+        background-color: #252535; color: #cccccc;
+        border: 1px solid #556677;
+    }
+    QListWidget::item { padding: 4px; }
+    QListWidget::item:selected {
+        background-color: #3a4a5a;
+    }
+    QListWidget::indicator {
+        width: 16px; height: 16px;
+        border: 2px solid #8899aa;
+        border-radius: 3px;
+        background-color: #2a2a3a;
+    }
+    QListWidget::indicator:checked {
+        background-color: #6699cc;
+        border-color: #88bbee;
+    }
 """
 
 
@@ -3475,6 +3508,8 @@ class BuildCSVWizard(QWizard):
         self.addPage(_PathsPage())
         self.addPage(_TierSelectionPage())
         self.addPage(_DataOptionsPage())
+
+        self.setStyleSheet(_DIALOG_FIELD_STYLE)
 
 
 class MainWindow(QMainWindow):
