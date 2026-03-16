@@ -3885,8 +3885,99 @@ class _DiphthongReviewDialog(QDialog):
         return result
 
 
+class _MultiSelectDropdown(QWidget):
+    """A button that opens a checkable dropdown list. Shows selected count."""
+
+    def __init__(self, label, items, parent=None):
+        """*items* is a list of (key, display_text) tuples."""
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._label = QLabel(label)
+        self._label.setMinimumWidth(130)
+        layout.addWidget(self._label)
+
+        self._button = QPushButton("All selected")
+        self._button.setMinimumWidth(250)
+        self._button.setStyleSheet(
+            "QPushButton { text-align: left; padding: 4px 8px; }"
+        )
+        self._button.clicked.connect(self._toggle_popup)
+        layout.addWidget(self._button, 1)
+
+        # Popup list widget
+        self._popup = QListWidget()
+        self._popup.setWindowFlags(
+            Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self._popup.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._popup.setStyleSheet("""
+            QListWidget {
+                background-color: #2a2a3a; color: #cccccc;
+                border: 1px solid #555; font-size: 13px;
+                padding: 4px;
+            }
+            QListWidget::item { padding: 3px 6px; }
+            QListWidget::item:hover { background-color: #3a3a4a; }
+        """)
+
+        self._items_data = []
+        for key, display in items:
+            item = QListWidgetItem(display)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            self._popup.addItem(item)
+            self._items_data.append((key, item))
+
+        self._popup.itemChanged.connect(self._update_button_text)
+        self._update_button_text()
+
+    def _toggle_popup(self):
+        if self._popup.isVisible():
+            self._popup.hide()
+            return
+        # Position below the button
+        pos = self._button.mapToGlobal(self._button.rect().bottomLeft())
+        self._popup.setMinimumWidth(self._button.width())
+        h = min(self._popup.sizeHintForRow(0) * len(self._items_data) + 10,
+                300)
+        self._popup.setFixedHeight(h)
+        self._popup.move(pos)
+        self._popup.show()
+
+    def _update_button_text(self):
+        checked = self.selected_keys()
+        total = len(self._items_data)
+        if len(checked) == total:
+            self._button.setText(f"All selected ({total})")
+        elif len(checked) == 0:
+            self._button.setText("None selected")
+        else:
+            self._button.setText(f"{len(checked)} of {total} selected")
+
+    def selected_keys(self):
+        return [key for key, item in self._items_data
+                if item.checkState() == Qt.CheckState.Checked]
+
+
 class _CategorisationPage(QWizardPage):
     """Page 4: Phonetic categorisation options for CSV export."""
+
+    _VOWEL_ITEMS = [
+        ("height",   "Height  —  e.g. high, mid-high, mid-low, low"),
+        ("fronting",  "Fronting  —  e.g. front, centre, back"),
+        ("rounding",  "Rounding  —  e.g. rounded, unrounded"),
+        ("length",    "Length  —  e.g. short, long"),
+        ("voicing",   "Voicing  —  e.g. voiced"),
+        ("subtype",   "Vowel type  —  e.g. monophthong, diphthong"),
+    ]
+
+    _CONSONANT_ITEMS = [
+        ("place",   "Place  —  e.g. bilabial, alveolar, velar, glottal"),
+        ("manner",  "Manner  —  e.g. plosive, fricative, nasal, trill"),
+        ("voicing", "Voicing  —  e.g. voiced, voiceless"),
+    ]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3895,75 +3986,71 @@ class _CategorisationPage(QWizardPage):
             "Optionally add phonetic classification columns to the CSV.")
 
         layout = QVBoxLayout(self)
+        layout.setSpacing(12)
 
         # Master enable checkbox
         self._enable_cb = QCheckBox("Add phonetic categorisation columns")
+        self._enable_cb.setStyleSheet("font-size: 14px; padding: 4px;")
         layout.addWidget(self._enable_cb)
 
-        # Options group (toggled by master checkbox)
-        self._group = QGroupBox("Categorisation Options")
-        grp_layout = QVBoxLayout(self._group)
+        # Container widget for all options — hidden until master checkbox is on
+        self._options_widget = QWidget()
+        opts_layout = QVBoxLayout(self._options_widget)
+        opts_layout.setContentsMargins(10, 8, 0, 0)
+        opts_layout.setSpacing(10)
 
         # Notation selector
         notation_row = QHBoxLayout()
-        notation_row.addWidget(QLabel("Notation system:"))
+        lbl = QLabel("Notation system:")
+        lbl.setMinimumWidth(130)
+        notation_row.addWidget(lbl)
         self._notation_combo = QComboBox()
         self._notation_combo.addItems(["IPA", "SAMPA", "X-SAMPA"])
+        self._notation_combo.setMinimumWidth(150)
         notation_row.addWidget(self._notation_combo)
         notation_row.addStretch()
-        grp_layout.addLayout(notation_row)
+        opts_layout.addLayout(notation_row)
 
         # Tier selection
-        grp_layout.addWidget(QLabel("Tiers to categorise:"))
-        self._tier_list = QVBoxLayout()
+        opts_layout.addWidget(QLabel("Tiers to categorise:"))
+        self._tier_container = QVBoxLayout()
+        self._tier_container.setContentsMargins(10, 0, 0, 0)
         self._tier_cbs = []
-        grp_layout.addLayout(self._tier_list)
+        opts_layout.addLayout(self._tier_container)
 
-        # Vowel properties
-        v_group = QGroupBox("Vowel columns")
-        v_layout = QVBoxLayout(v_group)
-        self._vowel_cbs = {}
-        for prop in ["height", "fronting", "rounding", "length",
-                      "voicing", "subtype"]:
-            cb = QCheckBox(prop.capitalize())
-            cb.setChecked(True)
-            self._vowel_cbs[prop] = cb
-            v_layout.addWidget(cb)
-        grp_layout.addWidget(v_group)
+        # Vowel columns multi-select dropdown
+        self._vowel_dropdown = _MultiSelectDropdown(
+            "Vowel columns:", self._VOWEL_ITEMS)
+        opts_layout.addWidget(self._vowel_dropdown)
 
-        # Consonant properties
-        c_group = QGroupBox("Consonant columns")
-        c_layout = QVBoxLayout(c_group)
-        self._consonant_cbs = {}
-        for prop in ["place", "manner", "voicing"]:
-            cb = QCheckBox(prop.capitalize())
-            cb.setChecked(True)
-            self._consonant_cbs[prop] = cb
-            c_layout.addWidget(cb)
-        grp_layout.addWidget(c_group)
+        # Consonant columns multi-select dropdown
+        self._consonant_dropdown = _MultiSelectDropdown(
+            "Consonant columns:", self._CONSONANT_ITEMS)
+        opts_layout.addWidget(self._consonant_dropdown)
 
-        layout.addWidget(self._group)
+        opts_layout.addStretch()
+        layout.addWidget(self._options_widget)
         layout.addStretch()
 
-        # Toggle group visibility
-        self._group.setEnabled(False)
-        self._enable_cb.toggled.connect(self._group.setEnabled)
+        # Start hidden; show when checkbox is toggled
+        self._options_widget.setVisible(False)
+        self._enable_cb.toggled.connect(self._options_widget.setVisible)
 
     def initializePage(self):
         """Populate tier checkboxes from wizard state."""
         # Clear old tier checkboxes
         for cb in self._tier_cbs:
-            self._tier_list.removeWidget(cb)
+            self._tier_container.removeWidget(cb)
             cb.deleteLater()
         self._tier_cbs = []
 
         wiz = self.wizard()
         for name, tier_class in wiz.selected_tier_info:
-            cb = QCheckBox(f"{name} ({tier_class})")
+            cb = QCheckBox(f"{name}  ({tier_class})")
             cb.setChecked(tier_class == "IntervalTier")
             cb.setProperty("tier_name", name)
             self._tier_cbs.append(cb)
-            self._tier_list.addWidget(cb)
+            self._tier_container.addWidget(cb)
 
     def validatePage(self):
         wiz = self.wizard()
@@ -3982,8 +4069,8 @@ class _CategorisationPage(QWizardPage):
             return False
 
         # Collect selected properties
-        v_props = [k for k, cb in self._vowel_cbs.items() if cb.isChecked()]
-        c_props = [k for k, cb in self._consonant_cbs.items() if cb.isChecked()]
+        v_props = self._vowel_dropdown.selected_keys()
+        c_props = self._consonant_dropdown.selected_keys()
         if not v_props and not c_props:
             QMessageBox.warning(
                 self, "Error",
