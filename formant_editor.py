@@ -550,12 +550,17 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     selected_tiers, extract_formants, formant_mode,
                     point_tier_name, segment_tier_name,
                     percentage_markers, extract_durations,
-                    duration_tier_names, progress_callback=None):
+                    duration_tier_names, point_tier_parents=None,
+                    progress_callback=None):
     """Build CSV header and rows for batch formant/duration export.
 
     *formant_mode* can be ``"at_points"``, ``"for_segments"``, or ``"both"``.
+    *point_tier_parents* maps point tier names to their parent interval tier
+    name (determined by hierarchy order — the nearest interval tier above).
     Returns (headers: list[str], rows: list[list[str|float]]).
     """
+    if point_tier_parents is None:
+        point_tier_parents = {}
     do_at_points = formant_mode in ("at_points", "both") if extract_formants else False
     do_for_segments = formant_mode in ("for_segments", "both") if extract_formants else False
 
@@ -670,25 +675,37 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         # Helper: build the common prefix columns for a lowest-tier interval
         def _label_cols(iv):
             cols = []
-            # Interval tier labels
+            # Interval tier labels — also cache for point tier parent lookups
+            interval_cache = {}  # tier_name -> containing Interval
             for t_name in interval_tier_names:
                 t = tier_map.get(t_name)
                 if t is None:
                     cols.append("")
                 elif t.name == lowest_tier.name:
                     cols.append(iv.text)
+                    interval_cache[t_name] = iv
                 else:
                     civ = _find_containing_interval(t, iv.xmin, iv.xmax)
                     cols.append(civ.text if civ else "")
-            # Point tier labels — find point(s) within this interval
+                    if civ:
+                        interval_cache[t_name] = civ
+            # Point tier labels — look up within the PARENT interval tier
             for pt_name in point_tier_names:
                 pt_tier = tier_map.get(pt_name)
                 if pt_tier is None or pt_tier.tier_class != "TextTier":
                     cols.append("")
                     continue
+                # Determine the search bounds from parent interval tier
+                parent_name = point_tier_parents.get(pt_name)
+                parent_iv = interval_cache.get(parent_name) if parent_name else None
+                if parent_iv is not None:
+                    search_xmin, search_xmax = parent_iv.xmin, parent_iv.xmax
+                else:
+                    # Fallback: use the lowest-tier interval bounds
+                    search_xmin, search_xmax = iv.xmin, iv.xmax
                 eps = 1e-6
                 marks = [p.mark for p in pt_tier.points
-                         if iv.xmin - eps <= p.time <= iv.xmax + eps]
+                         if search_xmin - eps <= p.time <= search_xmax + eps]
                 cols.append("; ".join(marks) if marks else "")
             return cols
 
@@ -750,8 +767,19 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                         else:
                             civ = _find_containing_interval(t, iv.xmin, iv.xmax)
                             row.append(civ.text if civ else "")
-                    # Point tier labels — for the formant-extraction point tier,
-                    # use this specific point's mark; for others, collect all
+                    # Point tier labels — use parent interval tier bounds
+                    # Build interval cache for parent lookups
+                    _iv_cache = {}
+                    for t_name in interval_tier_names:
+                        t = tier_map.get(t_name)
+                        if t is None:
+                            continue
+                        if t.name == lowest_tier.name:
+                            _iv_cache[t_name] = iv
+                        else:
+                            civ = _find_containing_interval(t, iv.xmin, iv.xmax)
+                            if civ:
+                                _iv_cache[t_name] = civ
                     for pt_name in point_tier_names:
                         if pt_name == point_tier_name:
                             row.append(pt.mark)
@@ -760,12 +788,14 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                             if pt_tier is None or pt_tier.tier_class != "TextTier":
                                 row.append("")
                                 continue
+                            parent_name = point_tier_parents.get(pt_name)
+                            parent_iv = _iv_cache.get(parent_name) if parent_name else None
+                            if parent_iv is not None:
+                                smin, smax = parent_iv.xmin, parent_iv.xmax
+                            else:
+                                smin, smax = iv.xmin, iv.xmax
                             marks = [p.mark for p in pt_tier.points
-                                     if iv.xmin - eps <= p.time <= iv.xmax + eps
-                                     and abs(p.time - pt.time) < eps]
-                            if not marks:
-                                marks = [p.mark for p in pt_tier.points
-                                         if iv.xmin - eps <= p.time <= iv.xmax + eps]
+                                     if smin - eps <= p.time <= smax + eps]
                             row.append("; ".join(marks) if marks else "")
 
                     # At-point formant values
@@ -2929,9 +2959,15 @@ _DIALOG_FIELD_STYLE = """
     QLineEdit, QComboBox {
         background-color: #ffffff; color: #000000;
     }
+    QLineEdit:disabled, QComboBox:disabled {
+        background-color: #3a3a4a; color: #666666;
+    }
     QComboBox QAbstractItemView {
         background-color: #ffffff; color: #000000;
         selection-background-color: #d0d0d0; selection-color: #000000;
+    }
+    QLabel:disabled {
+        color: #555555;
     }
     QCheckBox, QRadioButton {
         color: #cccccc;
@@ -3346,6 +3382,17 @@ class _TierSelectionPage(QWizardPage):
             return False
         wiz = self.wizard()
         wiz.selected_tier_info = selected  # list of (name, tier_class)
+
+        # Compute point-tier-to-parent-interval-tier mapping based on order.
+        # Each point tier belongs to the nearest interval tier above it.
+        wiz.point_tier_parents = {}  # point_tier_name -> interval_tier_name
+        last_interval = None
+        for name, tc in selected:
+            if tc == "IntervalTier":
+                last_interval = name
+            elif tc == "TextTier" and last_interval is not None:
+                wiz.point_tier_parents[name] = last_interval
+
         return True
 
     def _get_selected_tiers(self):
@@ -3564,6 +3611,7 @@ class BuildCSVWizard(QWizard):
         self.formants_dir = ""
         self.example_textgrid = None
         self.selected_tier_info = []  # [(name, tier_class), ...]
+        self.point_tier_parents = {}  # point_name -> parent_interval_name
         self.extract_formants = False
         self.formant_mode = None
         self.point_tier_name = None
@@ -4339,6 +4387,7 @@ class MainWindow(QMainWindow):
                 percentage_markers=wizard.percentage_markers,
                 extract_durations=wizard.extract_durations,
                 duration_tier_names=wizard.duration_tier_names,
+                point_tier_parents=wizard.point_tier_parents,
                 progress_callback=on_progress,
             )
         except Exception as e:
