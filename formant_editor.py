@@ -16,6 +16,7 @@ import sys
 import os
 import re
 import json
+import csv
 import time as _time
 import numpy as np
 import parselmouth
@@ -27,7 +28,9 @@ from PyQt6.QtWidgets import (
     QToolBar, QFileDialog, QLabel, QSlider, QGroupBox, QStatusBar,
     QPushButton, QSplitter, QComboBox, QDoubleSpinBox, QCheckBox,
     QMessageBox, QSizePolicy, QScrollBar, QLineEdit, QDialog,
-    QDialogButtonBox, QFormLayout, QGridLayout
+    QDialogButtonBox, QFormLayout, QGridLayout,
+    QWizard, QWizardPage, QProgressDialog, QListWidget, QListWidgetItem,
+    QRadioButton, QButtonGroup
 )
 from PyQt6.QtCore import Qt, QTimer, QEvent, QObject, pyqtSignal
 from PyQt6.QtGui import QAction, QKeySequence, QColor, QFont, QTransform
@@ -450,6 +453,321 @@ def extract_formants_from_praat(sound, n_formants=5, max_formant=5500.0,
         n_formants=5,
         time_step=actual_time_step,
     )
+
+
+# ---------------------------------------------------------------------------
+# CSV Export Helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_formant_at_time(fd, time_s):
+    """Return (F1, F2, F3) at *time_s*, interpolating between nearest frames.
+
+    If the exact time matches a frame (within half a time step), return that
+    frame's values directly.  Otherwise linearly interpolate between the two
+    bracketing frames.  Returns NaN for any formant that is NaN in both
+    bracketing frames.
+    """
+    if fd is None or fd.n_frames == 0:
+        return (np.nan, np.nan, np.nan)
+
+    times = fd.times
+    half_step = (fd.time_step or 0.005) / 2.0
+
+    # Find nearest frame
+    idx = int(np.argmin(np.abs(times - time_s)))
+
+    # Close enough to an exact frame?
+    if abs(times[idx] - time_s) <= half_step:
+        return tuple(float(fd.values[f, idx]) for f in range(3))
+
+    # Determine bracketing frames
+    if time_s < times[idx]:
+        lo, hi = max(0, idx - 1), idx
+    else:
+        lo, hi = idx, min(fd.n_frames - 1, idx + 1)
+
+    if lo == hi:
+        return tuple(float(fd.values[f, lo]) for f in range(3))
+
+    # Linear interpolation factor
+    t_lo, t_hi = times[lo], times[hi]
+    frac = (time_s - t_lo) / (t_hi - t_lo) if t_hi != t_lo else 0.0
+
+    result = []
+    for f in range(3):
+        v_lo = fd.values[f, lo]
+        v_hi = fd.values[f, hi]
+        if np.isnan(v_lo) and np.isnan(v_hi):
+            result.append(np.nan)
+        elif np.isnan(v_lo):
+            result.append(float(v_hi))
+        elif np.isnan(v_hi):
+            result.append(float(v_lo))
+        else:
+            result.append(float(v_lo + frac * (v_hi - v_lo)))
+    return tuple(result)
+
+
+def _detect_tier_hierarchy(tiers):
+    """Sort interval tiers by non-empty segment count (fewest = highest).
+
+    *tiers* is a list of Tier objects.  Returns a new list sorted so that
+    tiers with fewer non-empty intervals come first (e.g. words before
+    phones).  Point tiers are appended at the end.
+    """
+    interval_tiers = []
+    point_tiers = []
+    for t in tiers:
+        if t.tier_class == "IntervalTier":
+            n = sum(1 for iv in t.intervals if iv.text.strip())
+            interval_tiers.append((n, t))
+        else:
+            point_tiers.append(t)
+    interval_tiers.sort(key=lambda x: x[0])
+    return [t for _, t in interval_tiers] + point_tiers
+
+
+def _find_containing_interval(tier, xmin, xmax):
+    """Return the Interval in *tier* that contains [xmin, xmax], or None."""
+    eps = 1e-6
+    for iv in tier.intervals:
+        if iv.xmin <= xmin + eps and iv.xmax >= xmax - eps:
+            return iv
+    return None
+
+
+def _find_containing_interval_for_point(tier, time_s):
+    """Return the Interval in *tier* that contains *time_s*, or None."""
+    eps = 1e-6
+    for iv in tier.intervals:
+        if iv.xmin - eps <= time_s <= iv.xmax + eps:
+            return iv
+    return None
+
+
+def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
+                    selected_tiers, extract_formants, formant_mode,
+                    point_tier_name, segment_tier_name,
+                    percentage_markers, extract_durations,
+                    duration_tier_names, progress_callback=None):
+    """Build CSV header and rows for batch formant/duration export.
+
+    Returns (headers: list[str], rows: list[list[str|float]]).
+    """
+    # Discover audio files
+    audio_exts = {".wav", ".aiff", ".mp3"}
+    audio_files = sorted(
+        f for f in os.listdir(audio_dir)
+        if os.path.splitext(f)[1].lower() in audio_exts
+    )
+
+    # --- Build header ---
+    headers = ["filename"]
+    # Tier label columns (interval tiers only, in hierarchy order)
+    interval_tier_names = [t.name for t in selected_tiers
+                           if t.tier_class == "IntervalTier"]
+    headers.extend(interval_tier_names)
+
+    # Point tier column (if formant at-points mode)
+    if extract_formants and formant_mode == "at_points" and point_tier_name:
+        headers.append(point_tier_name)
+
+    # Formant columns
+    if extract_formants:
+        if formant_mode == "at_points":
+            headers.extend(["F1", "F2", "F3"])
+        else:  # for_segments
+            for pct in percentage_markers:
+                pct_s = f"{pct:g}"
+                headers.extend([f"F1_{pct_s}%", f"F2_{pct_s}%", f"F3_{pct_s}%"])
+
+    # Duration columns
+    if extract_durations:
+        for tn in duration_tier_names:
+            headers.append(f"dur_{tn}")
+
+    rows = []
+
+    for file_idx, audio_file in enumerate(audio_files):
+        if progress_callback:
+            progress_callback(file_idx, len(audio_files), audio_file)
+
+        basename = os.path.splitext(audio_file)[0]
+
+        # Find matching TextGrid
+        tg_path = None
+        for ext in (".TextGrid", ".textgrid"):
+            candidate = os.path.join(textgrid_dir, basename + ext)
+            if os.path.exists(candidate):
+                tg_path = candidate
+                break
+
+        if tg_path is None:
+            # No TextGrid — write filename-only row
+            row = [audio_file] + [""] * (len(headers) - 1)
+            rows.append(row)
+            continue
+
+        try:
+            tg = TextGrid.from_file(tg_path)
+        except Exception:
+            row = [audio_file] + [""] * (len(headers) - 1)
+            rows.append(row)
+            continue
+
+        # Map selected tier names to actual tiers in this TextGrid
+        tier_map = {}  # name -> Tier
+        for tier in tg.tiers:
+            tier_map[tier.name] = tier
+
+        # Load formant data if needed
+        fd = None
+        if extract_formants:
+            fmt_path = None
+            if formants_dir:
+                for fext in (".formants",):
+                    candidate = os.path.join(formants_dir, basename + fext)
+                    if os.path.exists(candidate):
+                        fmt_path = candidate
+                        break
+            if fmt_path:
+                try:
+                    fd = FormantData.load(fmt_path)
+                except Exception:
+                    fd = None
+            if fd is None:
+                # Extract from audio via Praat
+                audio_path = os.path.join(audio_dir, audio_file)
+                try:
+                    snd = parselmouth.Sound(audio_path)
+                    fd = extract_formants_from_praat(snd)
+                except Exception:
+                    fd = None
+
+        # Determine the lowest-level interval tier to drive rows
+        lowest_tier = None
+        for t_name in reversed(interval_tier_names):
+            if t_name in tier_map:
+                lowest_tier = tier_map[t_name]
+                break
+
+        if lowest_tier is None:
+            # No matching interval tiers in this file
+            row = [audio_file] + [""] * (len(headers) - 1)
+            rows.append(row)
+            continue
+
+        # Build rows driven by lowest tier
+        if extract_formants and formant_mode == "at_points" and point_tier_name:
+            # Row per point within each lowest-tier segment
+            point_tier = tier_map.get(point_tier_name)
+            if point_tier is None or point_tier.tier_class != "TextTier":
+                point_tier = None
+
+            for iv in lowest_tier.intervals:
+                if not iv.text.strip():
+                    continue
+
+                # Collect points within this interval
+                points_in_iv = []
+                if point_tier:
+                    eps = 1e-6
+                    for pt in point_tier.points:
+                        if iv.xmin - eps <= pt.time <= iv.xmax + eps:
+                            points_in_iv.append(pt)
+
+                if not points_in_iv:
+                    continue  # skip segments with no target points
+
+                for pt in points_in_iv:
+                    row = [audio_file]
+                    # Tier label columns
+                    for t_name in interval_tier_names:
+                        t = tier_map.get(t_name)
+                        if t is None:
+                            row.append("")
+                        elif t.name == lowest_tier.name:
+                            row.append(iv.text)
+                        else:
+                            civ = _find_containing_interval(t, iv.xmin, iv.xmax)
+                            row.append(civ.text if civ else "")
+
+                    # Point label
+                    row.append(pt.mark)
+
+                    # Formant values at point time
+                    f1, f2, f3 = _get_formant_at_time(fd, pt.time)
+                    for v in (f1, f2, f3):
+                        row.append(f"{v:.1f}" if not np.isnan(v) else "")
+
+                    # Durations
+                    if extract_durations:
+                        for tn in duration_tier_names:
+                            t = tier_map.get(tn)
+                            if t is None or t.tier_class != "IntervalTier":
+                                row.append("")
+                            else:
+                                civ = _find_containing_interval(t, iv.xmin, iv.xmax)
+                                if civ is None:
+                                    civ = _find_containing_interval_for_point(
+                                        t, (iv.xmin + iv.xmax) / 2)
+                                if civ:
+                                    row.append(f"{civ.xmax - civ.xmin:.4f}")
+                                else:
+                                    row.append("")
+
+                    rows.append(row)
+
+        else:
+            # Row per lowest-tier segment
+            for iv in lowest_tier.intervals:
+                if not iv.text.strip():
+                    continue
+
+                row = [audio_file]
+                # Tier label columns
+                for t_name in interval_tier_names:
+                    t = tier_map.get(t_name)
+                    if t is None:
+                        row.append("")
+                    elif t.name == lowest_tier.name:
+                        row.append(iv.text)
+                    else:
+                        civ = _find_containing_interval(t, iv.xmin, iv.xmax)
+                        row.append(civ.text if civ else "")
+
+                # Formant values for segment
+                if extract_formants and formant_mode == "for_segments":
+                    dur = iv.xmax - iv.xmin
+                    for pct in percentage_markers:
+                        t = iv.xmin + dur * pct / 100.0
+                        f1, f2, f3 = _get_formant_at_time(fd, t)
+                        for v in (f1, f2, f3):
+                            row.append(f"{v:.1f}" if not np.isnan(v) else "")
+
+                # Durations
+                if extract_durations:
+                    for tn in duration_tier_names:
+                        t = tier_map.get(tn)
+                        if t is None or t.tier_class != "IntervalTier":
+                            row.append("")
+                        else:
+                            if tn == lowest_tier.name:
+                                row.append(f"{iv.xmax - iv.xmin:.4f}")
+                            else:
+                                civ = _find_containing_interval(t, iv.xmin, iv.xmax)
+                                if civ is None:
+                                    civ = _find_containing_interval_for_point(
+                                        t, (iv.xmin + iv.xmax) / 2)
+                                if civ:
+                                    row.append(f"{civ.xmax - civ.xmin:.4f}")
+                                else:
+                                    row.append("")
+
+                rows.append(row)
+
+    return headers, rows
 
 
 # ---------------------------------------------------------------------------
@@ -2725,6 +3043,440 @@ class AddTierDialog(QDialog):
         return self.position_combo.currentData()
 
 
+# ---------------------------------------------------------------------------
+# Build CSV Wizard
+# ---------------------------------------------------------------------------
+
+
+class _PathsPage(QWizardPage):
+    """Page 1: Select audio, TextGrid, and formants directories."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTitle("Select Directories")
+        self.setSubTitle(
+            "Choose the directories containing your audio files, "
+            "TextGrids, and (optionally) formant files."
+        )
+
+        layout = QFormLayout(self)
+        layout.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        # Audio directory
+        audio_row = QHBoxLayout()
+        self._audio_edit = QLineEdit()
+        self._audio_edit.setPlaceholderText("Path to audio files...")
+        self._audio_edit.setReadOnly(True)
+        audio_btn = QPushButton("Browse...")
+        audio_btn.clicked.connect(self._browse_audio)
+        audio_row.addWidget(self._audio_edit, 1)
+        audio_row.addWidget(audio_btn)
+        layout.addRow("Audio directory:", audio_row)
+
+        # TextGrid separate?
+        self._tg_separate_cb = QCheckBox("TextGrids in a different directory")
+        layout.addRow("", self._tg_separate_cb)
+
+        tg_row = QHBoxLayout()
+        self._tg_edit = QLineEdit()
+        self._tg_edit.setPlaceholderText("Path to TextGrid files...")
+        self._tg_edit.setReadOnly(True)
+        self._tg_btn = QPushButton("Browse...")
+        self._tg_btn.clicked.connect(self._browse_tg)
+        tg_row.addWidget(self._tg_edit, 1)
+        tg_row.addWidget(self._tg_btn)
+        self._tg_edit.setVisible(False)
+        self._tg_btn.setVisible(False)
+        layout.addRow("TextGrid directory:", tg_row)
+        self._tg_label = layout.labelForField(tg_row)
+        self._tg_label.setVisible(False)
+
+        self._tg_separate_cb.toggled.connect(self._toggle_tg)
+
+        # Formants separate?
+        self._fmt_separate_cb = QCheckBox("Formants in a different directory")
+        layout.addRow("", self._fmt_separate_cb)
+
+        fmt_row = QHBoxLayout()
+        self._fmt_edit = QLineEdit()
+        self._fmt_edit.setPlaceholderText("Path to .formants files...")
+        self._fmt_edit.setReadOnly(True)
+        self._fmt_btn = QPushButton("Browse...")
+        self._fmt_btn.clicked.connect(self._browse_fmt)
+        fmt_row.addWidget(self._fmt_edit, 1)
+        fmt_row.addWidget(self._fmt_btn)
+        self._fmt_edit.setVisible(False)
+        self._fmt_btn.setVisible(False)
+        layout.addRow("Formants directory:", fmt_row)
+        self._fmt_label = layout.labelForField(fmt_row)
+        self._fmt_label.setVisible(False)
+
+        self._fmt_separate_cb.toggled.connect(self._toggle_fmt)
+
+        self.setStyleSheet(_DIALOG_FIELD_STYLE)
+
+    # --- Browsing ---
+    def _browse_audio(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Audio Directory")
+        if d:
+            self._audio_edit.setText(d)
+            self.completeChanged.emit()
+
+    def _browse_tg(self):
+        d = QFileDialog.getExistingDirectory(self, "Select TextGrid Directory")
+        if d:
+            self._tg_edit.setText(d)
+
+    def _browse_fmt(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Formants Directory")
+        if d:
+            self._fmt_edit.setText(d)
+
+    def _toggle_tg(self, checked):
+        self._tg_edit.setVisible(checked)
+        self._tg_btn.setVisible(checked)
+        self._tg_label.setVisible(checked)
+
+    def _toggle_fmt(self, checked):
+        self._fmt_edit.setVisible(checked)
+        self._fmt_btn.setVisible(checked)
+        self._fmt_label.setVisible(checked)
+
+    def isComplete(self):
+        return bool(self._audio_edit.text().strip())
+
+    def validatePage(self):
+        audio_dir = self._audio_edit.text().strip()
+        if not os.path.isdir(audio_dir):
+            QMessageBox.warning(self, "Error", "Audio directory does not exist.")
+            return False
+
+        tg_dir = (self._tg_edit.text().strip()
+                  if self._tg_separate_cb.isChecked() else audio_dir)
+        if not os.path.isdir(tg_dir):
+            QMessageBox.warning(self, "Error", "TextGrid directory does not exist.")
+            return False
+
+        # Check for at least one TextGrid
+        has_tg = any(f.lower().endswith(".textgrid")
+                     for f in os.listdir(tg_dir))
+        if not has_tg:
+            QMessageBox.warning(
+                self, "Error",
+                f"No .TextGrid files found in:\n{tg_dir}")
+            return False
+
+        fmt_dir = (self._fmt_edit.text().strip()
+                   if self._fmt_separate_cb.isChecked() else audio_dir)
+
+        # Store on wizard
+        wiz = self.wizard()
+        wiz.audio_dir = audio_dir
+        wiz.textgrid_dir = tg_dir
+        wiz.formants_dir = fmt_dir
+        return True
+
+
+class _TierSelectionPage(QWizardPage):
+    """Page 2: Select and order TextGrid tiers."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTitle("Select & Order Tiers")
+        self.setSubTitle(
+            "Tiers are auto-sorted by hierarchy (widest segments first). "
+            "Use Up/Down to adjust. Uncheck tiers you don't need."
+        )
+        layout = QVBoxLayout(self)
+
+        self._list = QListWidget()
+        layout.addWidget(self._list)
+
+        btn_row = QHBoxLayout()
+        up_btn = QPushButton("Move Up")
+        down_btn = QPushButton("Move Down")
+        up_btn.clicked.connect(self._move_up)
+        down_btn.clicked.connect(self._move_down)
+        btn_row.addWidget(up_btn)
+        btn_row.addWidget(down_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self._example_label = QLabel()
+        self._example_label.setWordWrap(True)
+        layout.addWidget(self._example_label)
+
+    def initializePage(self):
+        self._list.clear()
+        wiz = self.wizard()
+        tg_dir = wiz.textgrid_dir
+
+        # Find first TextGrid
+        tg_file = None
+        for f in sorted(os.listdir(tg_dir)):
+            if f.lower().endswith(".textgrid"):
+                tg_file = os.path.join(tg_dir, f)
+                break
+
+        if tg_file is None:
+            return
+
+        try:
+            tg = TextGrid.from_file(tg_file)
+        except Exception as e:
+            self._example_label.setText(f"Error reading TextGrid: {e}")
+            return
+
+        wiz.example_textgrid = tg
+        self._example_label.setText(
+            f"Example TextGrid: {os.path.basename(tg_file)} "
+            f"({len(tg.tiers)} tiers)")
+
+        # Auto-detect hierarchy
+        ordered = _detect_tier_hierarchy(tg.tiers)
+
+        for tier in ordered:
+            kind = "Interval" if tier.tier_class == "IntervalTier" else "Point"
+            n = (len([iv for iv in tier.intervals if iv.text.strip()])
+                 if tier.tier_class == "IntervalTier"
+                 else len(tier.points))
+            label = f"{tier.name}  [{kind}, {n} items]"
+            item = QListWidgetItem(label)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            item.setData(Qt.ItemDataRole.UserRole, tier.name)
+            item.setData(Qt.ItemDataRole.UserRole + 1, tier.tier_class)
+            self._list.addItem(item)
+
+    def _move_up(self):
+        row = self._list.currentRow()
+        if row <= 0:
+            return
+        item = self._list.takeItem(row)
+        self._list.insertItem(row - 1, item)
+        self._list.setCurrentRow(row - 1)
+
+    def _move_down(self):
+        row = self._list.currentRow()
+        if row < 0 or row >= self._list.count() - 1:
+            return
+        item = self._list.takeItem(row)
+        self._list.insertItem(row + 1, item)
+        self._list.setCurrentRow(row + 1)
+
+    def validatePage(self):
+        selected = self._get_selected_tiers()
+        if not selected:
+            QMessageBox.warning(self, "Error", "Select at least one tier.")
+            return False
+        wiz = self.wizard()
+        wiz.selected_tier_info = selected  # list of (name, tier_class)
+        return True
+
+    def _get_selected_tiers(self):
+        result = []
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                name = item.data(Qt.ItemDataRole.UserRole)
+                tc = item.data(Qt.ItemDataRole.UserRole + 1)
+                result.append((name, tc))
+        return result
+
+
+class _DataOptionsPage(QWizardPage):
+    """Page 3: Choose data extraction options."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTitle("Data Extraction Options")
+        self.setSubTitle("Choose what data to extract for each segment.")
+        layout = QVBoxLayout(self)
+
+        # --- Formants ---
+        self._fmt_cb = QCheckBox("Extract formant values (F1–F3)")
+        layout.addWidget(self._fmt_cb)
+
+        self._fmt_group = QGroupBox()
+        fmt_layout = QVBoxLayout(self._fmt_group)
+
+        self._fmt_btn_group = QButtonGroup(self)
+        self._at_points_rb = QRadioButton("At points (from a point tier)")
+        self._for_segments_rb = QRadioButton("For segments (at percentage markers)")
+        self._for_segments_rb.setChecked(True)
+        self._fmt_btn_group.addButton(self._at_points_rb)
+        self._fmt_btn_group.addButton(self._for_segments_rb)
+        fmt_layout.addWidget(self._at_points_rb)
+        fmt_layout.addWidget(self._for_segments_rb)
+
+        # Point tier combo
+        pt_row = QHBoxLayout()
+        pt_row.addWidget(QLabel("Point tier:"))
+        self._point_tier_combo = QComboBox()
+        pt_row.addWidget(self._point_tier_combo, 1)
+        fmt_layout.addLayout(pt_row)
+
+        # Segment tier combo + percentages
+        seg_row = QHBoxLayout()
+        seg_row.addWidget(QLabel("Segment tier:"))
+        self._seg_tier_combo = QComboBox()
+        seg_row.addWidget(self._seg_tier_combo, 1)
+        fmt_layout.addLayout(seg_row)
+
+        pct_row = QHBoxLayout()
+        pct_row.addWidget(QLabel("Percentage markers:"))
+        self._pct_edit = QLineEdit("10, 20, 30, 50, 70, 80, 90")
+        pct_row.addWidget(self._pct_edit, 1)
+        fmt_layout.addLayout(pct_row)
+
+        layout.addWidget(self._fmt_group)
+        self._fmt_group.setVisible(False)
+        self._fmt_cb.toggled.connect(self._fmt_group.setVisible)
+        self._fmt_btn_group.buttonToggled.connect(self._update_fmt_ui)
+
+        # --- Durations ---
+        self._dur_cb = QCheckBox("Extract durations")
+        layout.addWidget(self._dur_cb)
+
+        self._dur_group = QGroupBox("Duration tiers")
+        self._dur_layout = QVBoxLayout(self._dur_group)
+        self._dur_checks = []  # list of (QCheckBox, tier_name)
+        layout.addWidget(self._dur_group)
+        self._dur_group.setVisible(False)
+        self._dur_cb.toggled.connect(self._dur_group.setVisible)
+
+        layout.addStretch()
+        self.setStyleSheet(_DIALOG_FIELD_STYLE)
+
+    def initializePage(self):
+        wiz = self.wizard()
+        selected = wiz.selected_tier_info  # list of (name, tier_class)
+
+        # Populate combos
+        self._point_tier_combo.clear()
+        self._seg_tier_combo.clear()
+        # Clear duration checkboxes
+        for cb, _ in self._dur_checks:
+            self._dur_layout.removeWidget(cb)
+            cb.deleteLater()
+        self._dur_checks = []
+
+        for name, tc in selected:
+            if tc == "TextTier":
+                self._point_tier_combo.addItem(name)
+            else:
+                self._seg_tier_combo.addItem(name)
+                cb = QCheckBox(name)
+                cb.setChecked(True)
+                self._dur_layout.addWidget(cb)
+                self._dur_checks.append((cb, name))
+
+        self._update_fmt_ui()
+
+    def _update_fmt_ui(self):
+        at_pts = self._at_points_rb.isChecked()
+        self._point_tier_combo.setEnabled(at_pts)
+        self._seg_tier_combo.setEnabled(not at_pts)
+        self._pct_edit.setEnabled(not at_pts)
+
+    def validatePage(self):
+        wiz = self.wizard()
+
+        wiz.extract_formants = self._fmt_cb.isChecked()
+        wiz.extract_durations = self._dur_cb.isChecked()
+
+        if not wiz.extract_formants and not wiz.extract_durations:
+            QMessageBox.warning(
+                self, "Error",
+                "Select at least one extraction type "
+                "(formant values or durations).")
+            return False
+
+        if wiz.extract_formants:
+            if self._at_points_rb.isChecked():
+                wiz.formant_mode = "at_points"
+                wiz.point_tier_name = self._point_tier_combo.currentText()
+                if not wiz.point_tier_name:
+                    QMessageBox.warning(
+                        self, "Error", "No point tier available.")
+                    return False
+                wiz.segment_tier_name = None
+                wiz.percentage_markers = []
+            else:
+                wiz.formant_mode = "for_segments"
+                wiz.segment_tier_name = self._seg_tier_combo.currentText()
+                wiz.point_tier_name = None
+                if not wiz.segment_tier_name:
+                    QMessageBox.warning(
+                        self, "Error", "No segment tier available.")
+                    return False
+                # Parse percentages
+                try:
+                    pcts = [float(x.strip())
+                            for x in self._pct_edit.text().split(",")
+                            if x.strip()]
+                    if not pcts:
+                        raise ValueError("empty")
+                    for p in pcts:
+                        if p < 0 or p > 100:
+                            raise ValueError(f"{p} out of range")
+                    wiz.percentage_markers = pcts
+                except ValueError as e:
+                    QMessageBox.warning(
+                        self, "Error",
+                        f"Invalid percentage markers: {e}\n"
+                        "Enter comma-separated numbers 0–100.")
+                    return False
+        else:
+            wiz.formant_mode = None
+            wiz.point_tier_name = None
+            wiz.segment_tier_name = None
+            wiz.percentage_markers = []
+
+        if wiz.extract_durations:
+            dur_names = [name for cb, name in self._dur_checks
+                         if cb.isChecked()]
+            if not dur_names:
+                QMessageBox.warning(
+                    self, "Error",
+                    "Select at least one tier for duration extraction.")
+                return False
+            wiz.duration_tier_names = dur_names
+        else:
+            wiz.duration_tier_names = []
+
+        return True
+
+
+class BuildCSVWizard(QWizard):
+    """Three-page wizard for batch CSV export."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Build CSV — Batch Export")
+        self.setMinimumSize(580, 480)
+        self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
+
+        # Wizard-level state (populated by pages)
+        self.audio_dir = ""
+        self.textgrid_dir = ""
+        self.formants_dir = ""
+        self.example_textgrid = None
+        self.selected_tier_info = []  # [(name, tier_class), ...]
+        self.extract_formants = False
+        self.formant_mode = None
+        self.point_tier_name = None
+        self.segment_tier_name = None
+        self.percentage_markers = []
+        self.extract_durations = False
+        self.duration_tier_names = []
+
+        self.addPage(_PathsPage())
+        self.addPage(_TierSelectionPage())
+        self.addPage(_DataOptionsPage())
+
+
 class MainWindow(QMainWindow):
     """FormantStudio main application window."""
 
@@ -2968,6 +3720,12 @@ class MainWindow(QMainWindow):
         ref_shift = QAction("Drag aligned boundaries\tShift+Drag", self)
         ref_shift.setEnabled(False)
         view_menu.addAction(ref_shift)
+
+        # Tools menu
+        tools_menu = menubar.addMenu("&Tools")
+        build_csv_action = QAction("&Build CSV...", self)
+        build_csv_action.triggered.connect(self._build_csv)
+        tools_menu.addAction(build_csv_action)
 
     def _menu_action(self, fn):
         """Run fn then re-render + update scrollbar (for View menu actions)."""
@@ -3416,6 +4174,100 @@ class MainWindow(QMainWindow):
             self.status.showMessage(f"Saved TextGrid: {os.path.basename(save_path)}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save TextGrid:\n{e}")
+
+    def _build_csv(self):
+        """Launch the Build CSV wizard and run batch export."""
+        wizard = BuildCSVWizard(self)
+        if wizard.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        # Resolve selected tiers to Tier objects from the example TextGrid
+        # (used only for hierarchy info; each file's tiers are looked up fresh)
+        tg = wizard.example_textgrid
+        selected_tiers = []
+        for name, tc in wizard.selected_tier_info:
+            for t in tg.tiers:
+                if t.name == name and t.tier_class == tc:
+                    selected_tiers.append(t)
+                    break
+
+        if not selected_tiers:
+            QMessageBox.warning(self, "Error", "No valid tiers selected.")
+            return
+
+        # Count audio files
+        audio_exts = {".wav", ".aiff", ".mp3"}
+        audio_files = [
+            f for f in os.listdir(wizard.audio_dir)
+            if os.path.splitext(f)[1].lower() in audio_exts
+        ]
+        if not audio_files:
+            QMessageBox.warning(
+                self, "Error",
+                f"No audio files found in:\n{wizard.audio_dir}")
+            return
+
+        # Progress dialog
+        progress = QProgressDialog(
+            "Building CSV...", "Cancel", 0, len(audio_files), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+
+        cancelled = False
+
+        def on_progress(current, total, filename):
+            nonlocal cancelled
+            progress.setValue(current)
+            progress.setLabelText(
+                f"Processing {current + 1}/{total}: {filename}")
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                cancelled = True
+
+        try:
+            headers, rows = _build_csv_data(
+                audio_dir=wizard.audio_dir,
+                textgrid_dir=wizard.textgrid_dir,
+                formants_dir=wizard.formants_dir,
+                selected_tiers=selected_tiers,
+                extract_formants=wizard.extract_formants,
+                formant_mode=wizard.formant_mode,
+                point_tier_name=wizard.point_tier_name,
+                segment_tier_name=wizard.segment_tier_name,
+                percentage_markers=wizard.percentage_markers,
+                extract_durations=wizard.extract_durations,
+                duration_tier_names=wizard.duration_tier_names,
+                progress_callback=on_progress,
+            )
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(self, "Error", f"CSV build failed:\n{e}")
+            return
+
+        progress.close()
+
+        if cancelled:
+            self.status.showMessage("CSV export cancelled")
+            return
+
+        # Save dialog
+        default_name = os.path.join(wizard.audio_dir, "formant_data.csv")
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Save CSV", default_name,
+            "CSV Files (*.csv);;All Files (*)")
+        if not save_path:
+            return
+
+        try:
+            with open(save_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                writer.writerows(rows)
+            self.status.showMessage(
+                f"CSV exported: {len(rows)} rows → "
+                f"{os.path.basename(save_path)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to write CSV:\n{e}")
 
     def _setup_tier_checkboxes(self):
         """Populate tier visibility checkboxes for the current TextGrid."""
