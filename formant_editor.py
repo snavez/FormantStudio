@@ -683,6 +683,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     percentage_markers, extract_durations,
                     duration_tier_names, point_tier_parents=None,
                     progress_callback=None,
+                    include_point_times=False,
                     categorise=False, cat_chart=None,
                     cat_notation="ipa", cat_tier_names=None,
                     cat_vowel_props=None, cat_consonant_props=None,
@@ -729,9 +730,12 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                         if t.tier_class == "TextTier"]
     headers.extend(point_tier_names)
 
-    # Formant columns — at-points (F1, F2, F3)
+    # Formant columns — at-points (F1, F2, F3 named after point tier)
     if do_at_points:
-        headers.extend(["F1_pt", "F2_pt", "F3_pt"])
+        pt_suffix = point_tier_name or "pt"
+        if include_point_times:
+            headers.append(f"{pt_suffix}_time")
+        headers.extend([f"F1_{pt_suffix}", f"F2_{pt_suffix}", f"F3_{pt_suffix}"])
 
     # Formant columns — for-segments (F1_P%, F2_P%, F3_P% per percentage)
     if do_for_segments:
@@ -953,10 +957,9 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     else:
                         cols.append("")
 
-                # Track auto-diphthong candidates
+                # Track all diphthong labels for review
                 if (auto_diphthong_candidates is not None
-                        and props.get("subtype") == "diphthong"
-                        and lbl not in cat_chart[cat_notation]):
+                        and props.get("subtype") == "diphthong"):
                     auto_diphthong_candidates[lbl] = (
                         auto_diphthong_candidates.get(lbl, 0) + 1)
 
@@ -980,6 +983,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     if do_for_segments:
                         lc_np = _label_cols(iv)
                         row = [audio_file] + lc_np
+                        if include_point_times:
+                            row.append("")  # empty time
                         row.extend(["", "", ""])  # empty at-point F1/F2/F3
                         dur = iv.xmax - iv.xmin
                         for pct in percentage_markers:
@@ -1036,7 +1041,9 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                                      if smin - eps <= p.time <= smax + eps]
                             row.append("; ".join(marks) if marks else "")
 
-                    # At-point formant values
+                    # At-point time and formant values
+                    if include_point_times:
+                        row.append(f"{pt.time:.4f}")
                     f1, f2, f3 = _get_formant_at_time(fd, pt.time)
                     for v in (f1, f2, f3):
                         row.append(f"{v:.1f}" if not np.isnan(v) else "")
@@ -3678,6 +3685,9 @@ class _DataOptionsPage(QWizardPage):
         pt_row.addWidget(self._point_tier_combo, 1)
         fmt_layout.addLayout(pt_row)
 
+        self._pt_time_cb = QCheckBox("Include point times in output")
+        fmt_layout.addWidget(self._pt_time_cb)
+
         # For segments (checkbox, not radio)
         self._for_segments_cb = QCheckBox("For segments (at percentage markers)")
         self._for_segments_cb.setChecked(True)
@@ -3747,7 +3757,8 @@ class _DataOptionsPage(QWizardPage):
         for_seg = self._for_segments_cb.isChecked()
 
         # Enable/disable + visual feedback for dark theme
-        for widget in (self._point_tier_combo, self._pt_label):
+        for widget in (self._point_tier_combo, self._pt_label,
+                       self._pt_time_cb):
             widget.setEnabled(at_pts)
             widget.setStyleSheet("" if at_pts else "color: #555555;")
         for widget in (self._seg_tier_combo, self._seg_label,
@@ -3794,8 +3805,10 @@ class _DataOptionsPage(QWizardPage):
                     QMessageBox.warning(
                         self, "Error", "No point tier available.")
                     return False
+                wiz.include_point_times = self._pt_time_cb.isChecked()
             else:
                 wiz.point_tier_name = None
+                wiz.include_point_times = False
 
             # Segment tier + percentages
             if for_seg:
@@ -3826,6 +3839,7 @@ class _DataOptionsPage(QWizardPage):
         else:
             wiz.formant_mode = None
             wiz.point_tier_name = None
+            wiz.include_point_times = False
             wiz.segment_tier_name = None
             wiz.percentage_markers = []
 
@@ -3845,19 +3859,19 @@ class _DataOptionsPage(QWizardPage):
 
 
 class _DiphthongReviewDialog(QDialog):
-    """Review auto-detected diphthong candidates for confirmation."""
+    """Review diphthong classifications for confirmation."""
 
     def __init__(self, candidates, parent=None):
         """*candidates* is a dict {label_str: count_int}."""
         super().__init__(parent)
-        self.setWindowTitle("Review Diphthong Candidates")
-        self.setMinimumSize(420, 340)
+        self.setWindowTitle("Review Diphthongs")
+        self.setMinimumSize(420, 380)
         self.setStyleSheet(_DIALOG_FIELD_STYLE)
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
-            "The following multi-vowel sequences were detected.\n"
-            "Check the ones that should be classified as diphthongs:"))
+            "The following labels were classified as diphthongs.\n"
+            "Uncheck any that should NOT be treated as diphthongs:"))
 
         self._list = QListWidget()
         for label in sorted(candidates, key=lambda x: -candidates[x]):
@@ -3886,7 +3900,11 @@ class _DiphthongReviewDialog(QDialog):
 
 
 class _MultiSelectDropdown(QWidget):
-    """A button that opens a checkable dropdown list. Shows selected count."""
+    """A button that opens a checkable dropdown list. Shows selected count.
+
+    Clicking the button toggles the popup open/closed.  The popup also
+    closes when the user clicks anywhere else in the application.
+    """
 
     def __init__(self, label, items, parent=None):
         """*items* is a list of (key, display_text) tuples."""
@@ -3898,7 +3916,7 @@ class _MultiSelectDropdown(QWidget):
         self._label.setMinimumWidth(130)
         layout.addWidget(self._label)
 
-        self._button = QPushButton("All selected")
+        self._button = QPushButton("All selected  \u25BC")
         self._button.setMinimumWidth(250)
         self._button.setStyleSheet(
             "QPushButton { text-align: left; padding: 4px 8px; }"
@@ -3906,18 +3924,16 @@ class _MultiSelectDropdown(QWidget):
         self._button.clicked.connect(self._toggle_popup)
         layout.addWidget(self._button, 1)
 
-        # Popup list widget
+        # Popup list widget — plain widget positioned manually
         self._popup = QListWidget()
-        self._popup.setWindowFlags(
-            Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
-        self._popup.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._popup.setWindowFlags(Qt.WindowType.Popup)
         self._popup.setStyleSheet("""
             QListWidget {
                 background-color: #2a2a3a; color: #cccccc;
                 border: 1px solid #555; font-size: 13px;
                 padding: 4px;
             }
-            QListWidget::item { padding: 3px 6px; }
+            QListWidget::item { padding: 4px 8px; }
             QListWidget::item:hover { background-color: #3a3a4a; }
         """)
 
@@ -3933,6 +3949,20 @@ class _MultiSelectDropdown(QWidget):
         self._popup.itemChanged.connect(self._update_button_text)
         self._update_button_text()
 
+        # Install app-wide event filter to catch clicks outside the popup
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        """Close popup when user clicks outside it."""
+        if (self._popup.isVisible()
+                and event.type() == QEvent.Type.MouseButtonPress
+                and obj is not self._popup
+                and not self._popup.isAncestorOf(obj)):
+            # Check the click isn't on our own toggle button
+            if obj is not self._button:
+                self._popup.hide()
+        return False
+
     def _toggle_popup(self):
         if self._popup.isVisible():
             self._popup.hide()
@@ -3940,21 +3970,22 @@ class _MultiSelectDropdown(QWidget):
         # Position below the button
         pos = self._button.mapToGlobal(self._button.rect().bottomLeft())
         self._popup.setMinimumWidth(self._button.width())
-        h = min(self._popup.sizeHintForRow(0) * len(self._items_data) + 10,
-                300)
+        row_h = max(self._popup.sizeHintForRow(0), 24)
+        h = min(row_h * len(self._items_data) + 12, 300)
         self._popup.setFixedHeight(h)
         self._popup.move(pos)
         self._popup.show()
+        self._popup.setFocus()
 
     def _update_button_text(self):
         checked = self.selected_keys()
         total = len(self._items_data)
         if len(checked) == total:
-            self._button.setText(f"All selected ({total})")
+            self._button.setText(f"All selected ({total})  \u25BC")
         elif len(checked) == 0:
-            self._button.setText("None selected")
+            self._button.setText("None selected  \u25BC")
         else:
-            self._button.setText(f"{len(checked)} of {total} selected")
+            self._button.setText(f"{len(checked)} of {total} selected  \u25BC")
 
     def selected_keys(self):
         return [key for key, item in self._items_data
@@ -4105,6 +4136,7 @@ class BuildCSVWizard(QWizard):
         self.extract_formants = False
         self.formant_mode = None
         self.point_tier_name = None
+        self.include_point_times = False
         self.segment_tier_name = None
         self.percentage_markers = []
         self.extract_durations = False
@@ -4901,6 +4933,7 @@ class MainWindow(QMainWindow):
                 duration_tier_names=wizard.duration_tier_names,
                 point_tier_parents=wizard.point_tier_parents,
                 progress_callback=on_progress,
+                include_point_times=wizard.include_point_times,
                 categorise=wizard.categorise,
                 cat_chart=cat_chart,
                 cat_notation=wizard.cat_notation,
