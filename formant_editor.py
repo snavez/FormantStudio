@@ -3500,12 +3500,15 @@ class _DataOptionsPage(QWizardPage):
     def _update_fmt_ui(self):
         at_pts = self._at_points_cb.isChecked()
         for_seg = self._for_segments_cb.isChecked()
-        self._point_tier_combo.setEnabled(at_pts)
-        self._pt_label.setEnabled(at_pts)
-        self._seg_tier_combo.setEnabled(for_seg)
-        self._seg_label.setEnabled(for_seg)
-        self._pct_edit.setEnabled(for_seg)
-        self._pct_label.setEnabled(for_seg)
+
+        # Enable/disable + visual feedback for dark theme
+        for widget in (self._point_tier_combo, self._pt_label):
+            widget.setEnabled(at_pts)
+            widget.setStyleSheet("" if at_pts else "color: #555555;")
+        for widget in (self._seg_tier_combo, self._seg_label,
+                       self._pct_edit, self._pct_label):
+            widget.setEnabled(for_seg)
+            widget.setStyleSheet("" if for_seg else "color: #555555;")
 
     def validatePage(self):
         wiz = self.wizard()
