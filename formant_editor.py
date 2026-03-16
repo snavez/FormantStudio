@@ -553,8 +553,12 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     duration_tier_names, progress_callback=None):
     """Build CSV header and rows for batch formant/duration export.
 
+    *formant_mode* can be ``"at_points"``, ``"for_segments"``, or ``"both"``.
     Returns (headers: list[str], rows: list[list[str|float]]).
     """
+    do_at_points = formant_mode in ("at_points", "both") if extract_formants else False
+    do_for_segments = formant_mode in ("for_segments", "both") if extract_formants else False
+
     # Discover audio files
     audio_exts = {".wav", ".aiff", ".mp3"}
     audio_files = sorted(
@@ -564,23 +568,26 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
 
     # --- Build header ---
     headers = ["filename"]
-    # Tier label columns (interval tiers only, in hierarchy order)
+
+    # Tier label columns — interval tiers in hierarchy order
     interval_tier_names = [t.name for t in selected_tiers
                            if t.tier_class == "IntervalTier"]
     headers.extend(interval_tier_names)
 
-    # Point tier column (if formant at-points mode)
-    if extract_formants and formant_mode == "at_points" and point_tier_name:
-        headers.append(point_tier_name)
+    # Point tier label columns — always included if the user selected them
+    point_tier_names = [t.name for t in selected_tiers
+                        if t.tier_class == "TextTier"]
+    headers.extend(point_tier_names)
 
-    # Formant columns
-    if extract_formants:
-        if formant_mode == "at_points":
-            headers.extend(["F1", "F2", "F3"])
-        else:  # for_segments
-            for pct in percentage_markers:
-                pct_s = f"{pct:g}"
-                headers.extend([f"F1_{pct_s}%", f"F2_{pct_s}%", f"F3_{pct_s}%"])
+    # Formant columns — at-points (F1, F2, F3)
+    if do_at_points:
+        headers.extend(["F1_pt", "F2_pt", "F3_pt"])
+
+    # Formant columns — for-segments (F1_P%, F2_P%, F3_P% per percentage)
+    if do_for_segments:
+        for pct in percentage_markers:
+            pct_s = f"{pct:g}"
+            headers.extend([f"F1_{pct_s}%", f"F2_{pct_s}%", f"F3_{pct_s}%"])
 
     # Duration columns
     if extract_durations:
@@ -604,7 +611,6 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 break
 
         if tg_path is None:
-            # No TextGrid — write filename-only row
             row = [audio_file] + [""] * (len(headers) - 1)
             rows.append(row)
             continue
@@ -616,28 +622,25 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             rows.append(row)
             continue
 
-        # Map selected tier names to actual tiers in this TextGrid
-        tier_map = {}  # name -> Tier
+        # Map tier names → Tier objects for this file
+        tier_map = {}
         for tier in tg.tiers:
             tier_map[tier.name] = tier
 
-        # Load formant data if needed
+        # Load or extract formant data
         fd = None
         if extract_formants:
             fmt_path = None
             if formants_dir:
-                for fext in (".formants",):
-                    candidate = os.path.join(formants_dir, basename + fext)
-                    if os.path.exists(candidate):
-                        fmt_path = candidate
-                        break
+                candidate = os.path.join(formants_dir, basename + ".formants")
+                if os.path.exists(candidate):
+                    fmt_path = candidate
             if fmt_path:
                 try:
                     fd = FormantData.load(fmt_path)
                 except Exception:
                     fd = None
             if fd is None:
-                # Extract from audio via Praat
                 audio_path = os.path.join(audio_dir, audio_file)
                 try:
                     snd = parselmouth.Sound(audio_path)
@@ -653,36 +656,91 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 break
 
         if lowest_tier is None:
-            # No matching interval tiers in this file
             row = [audio_file] + [""] * (len(headers) - 1)
             rows.append(row)
             continue
 
-        # Build rows driven by lowest tier
-        if extract_formants and formant_mode == "at_points" and point_tier_name:
-            # Row per point within each lowest-tier segment
-            point_tier = tier_map.get(point_tier_name)
-            if point_tier is None or point_tier.tier_class != "TextTier":
-                point_tier = None
+        # Resolve point tier for at-points formant extraction
+        at_pt_tier = None
+        if do_at_points and point_tier_name:
+            at_pt_tier = tier_map.get(point_tier_name)
+            if at_pt_tier and at_pt_tier.tier_class != "TextTier":
+                at_pt_tier = None
 
+        # Helper: build the common prefix columns for a lowest-tier interval
+        def _label_cols(iv):
+            cols = []
+            # Interval tier labels
+            for t_name in interval_tier_names:
+                t = tier_map.get(t_name)
+                if t is None:
+                    cols.append("")
+                elif t.name == lowest_tier.name:
+                    cols.append(iv.text)
+                else:
+                    civ = _find_containing_interval(t, iv.xmin, iv.xmax)
+                    cols.append(civ.text if civ else "")
+            # Point tier labels — find point(s) within this interval
+            for pt_name in point_tier_names:
+                pt_tier = tier_map.get(pt_name)
+                if pt_tier is None or pt_tier.tier_class != "TextTier":
+                    cols.append("")
+                    continue
+                eps = 1e-6
+                marks = [p.mark for p in pt_tier.points
+                         if iv.xmin - eps <= p.time <= iv.xmax + eps]
+                cols.append("; ".join(marks) if marks else "")
+            return cols
+
+        # Helper: duration columns for an interval
+        def _dur_cols(iv):
+            cols = []
+            for tn in duration_tier_names:
+                t = tier_map.get(tn)
+                if t is None or t.tier_class != "IntervalTier":
+                    cols.append("")
+                elif tn == lowest_tier.name:
+                    cols.append(f"{iv.xmax - iv.xmin:.4f}")
+                else:
+                    civ = _find_containing_interval(t, iv.xmin, iv.xmax)
+                    if civ is None:
+                        civ = _find_containing_interval_for_point(
+                            t, (iv.xmin + iv.xmax) / 2)
+                    cols.append(f"{civ.xmax - civ.xmin:.4f}" if civ else "")
+            return cols
+
+        # --- Row generation ---
+        if do_at_points and at_pt_tier:
+            # When extracting at points, one row per point in each segment
             for iv in lowest_tier.intervals:
                 if not iv.text.strip():
                     continue
 
-                # Collect points within this interval
-                points_in_iv = []
-                if point_tier:
-                    eps = 1e-6
-                    for pt in point_tier.points:
-                        if iv.xmin - eps <= pt.time <= iv.xmax + eps:
-                            points_in_iv.append(pt)
+                eps = 1e-6
+                points_in_iv = [
+                    p for p in at_pt_tier.points
+                    if iv.xmin - eps <= p.time <= iv.xmax + eps
+                ]
 
                 if not points_in_iv:
-                    continue  # skip segments with no target points
+                    # No target points — still emit a row if doing segments too
+                    if do_for_segments:
+                        row = [audio_file] + _label_cols(iv)
+                        row.extend(["", "", ""])  # empty at-point F1/F2/F3
+                        dur = iv.xmax - iv.xmin
+                        for pct in percentage_markers:
+                            t = iv.xmin + dur * pct / 100.0
+                            f1, f2, f3 = _get_formant_at_time(fd, t)
+                            for v in (f1, f2, f3):
+                                row.append(f"{v:.1f}" if not np.isnan(v) else "")
+                        if extract_durations:
+                            row.extend(_dur_cols(iv))
+                        rows.append(row)
+                    continue
 
                 for pt in points_in_iv:
                     row = [audio_file]
-                    # Tier label columns
+                    # Interval tier labels
                     for t_name in interval_tier_names:
                         t = tier_map.get(t_name)
                         if t is None:
@@ -692,53 +750,52 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                         else:
                             civ = _find_containing_interval(t, iv.xmin, iv.xmax)
                             row.append(civ.text if civ else "")
+                    # Point tier labels — for the formant-extraction point tier,
+                    # use this specific point's mark; for others, collect all
+                    for pt_name in point_tier_names:
+                        if pt_name == point_tier_name:
+                            row.append(pt.mark)
+                        else:
+                            pt_tier = tier_map.get(pt_name)
+                            if pt_tier is None or pt_tier.tier_class != "TextTier":
+                                row.append("")
+                                continue
+                            marks = [p.mark for p in pt_tier.points
+                                     if iv.xmin - eps <= p.time <= iv.xmax + eps
+                                     and abs(p.time - pt.time) < eps]
+                            if not marks:
+                                marks = [p.mark for p in pt_tier.points
+                                         if iv.xmin - eps <= p.time <= iv.xmax + eps]
+                            row.append("; ".join(marks) if marks else "")
 
-                    # Point label
-                    row.append(pt.mark)
-
-                    # Formant values at point time
+                    # At-point formant values
                     f1, f2, f3 = _get_formant_at_time(fd, pt.time)
                     for v in (f1, f2, f3):
                         row.append(f"{v:.1f}" if not np.isnan(v) else "")
 
-                    # Durations
+                    # Segment percentage formant values (if also requested)
+                    if do_for_segments:
+                        dur = iv.xmax - iv.xmin
+                        for pct in percentage_markers:
+                            t = iv.xmin + dur * pct / 100.0
+                            f1, f2, f3 = _get_formant_at_time(fd, t)
+                            for v in (f1, f2, f3):
+                                row.append(f"{v:.1f}" if not np.isnan(v) else "")
+
                     if extract_durations:
-                        for tn in duration_tier_names:
-                            t = tier_map.get(tn)
-                            if t is None or t.tier_class != "IntervalTier":
-                                row.append("")
-                            else:
-                                civ = _find_containing_interval(t, iv.xmin, iv.xmax)
-                                if civ is None:
-                                    civ = _find_containing_interval_for_point(
-                                        t, (iv.xmin + iv.xmax) / 2)
-                                if civ:
-                                    row.append(f"{civ.xmax - civ.xmin:.4f}")
-                                else:
-                                    row.append("")
+                        row.extend(_dur_cols(iv))
 
                     rows.append(row)
-
         else:
-            # Row per lowest-tier segment
+            # Row per lowest-tier segment (no at-points expansion)
             for iv in lowest_tier.intervals:
                 if not iv.text.strip():
                     continue
 
-                row = [audio_file]
-                # Tier label columns
-                for t_name in interval_tier_names:
-                    t = tier_map.get(t_name)
-                    if t is None:
-                        row.append("")
-                    elif t.name == lowest_tier.name:
-                        row.append(iv.text)
-                    else:
-                        civ = _find_containing_interval(t, iv.xmin, iv.xmax)
-                        row.append(civ.text if civ else "")
+                row = [audio_file] + _label_cols(iv)
 
-                # Formant values for segment
-                if extract_formants and formant_mode == "for_segments":
+                # Segment percentage formant values
+                if do_for_segments:
                     dur = iv.xmax - iv.xmin
                     for pct in percentage_markers:
                         t = iv.xmin + dur * pct / 100.0
@@ -746,24 +803,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                         for v in (f1, f2, f3):
                             row.append(f"{v:.1f}" if not np.isnan(v) else "")
 
-                # Durations
                 if extract_durations:
-                    for tn in duration_tier_names:
-                        t = tier_map.get(tn)
-                        if t is None or t.tier_class != "IntervalTier":
-                            row.append("")
-                        else:
-                            if tn == lowest_tier.name:
-                                row.append(f"{iv.xmax - iv.xmin:.4f}")
-                            else:
-                                civ = _find_containing_interval(t, iv.xmin, iv.xmax)
-                                if civ is None:
-                                    civ = _find_containing_interval_for_point(
-                                        t, (iv.xmin + iv.xmax) / 2)
-                                if civ:
-                                    row.append(f"{civ.xmax - civ.xmin:.4f}")
-                                else:
-                                    row.append("")
+                    row.extend(_dur_cols(iv))
 
                 rows.append(row)
 
@@ -3334,39 +3375,41 @@ class _DataOptionsPage(QWizardPage):
         self._fmt_group = QGroupBox()
         fmt_layout = QVBoxLayout(self._fmt_group)
 
-        self._fmt_btn_group = QButtonGroup(self)
-        self._at_points_rb = QRadioButton("At points (from a point tier)")
-        self._for_segments_rb = QRadioButton("For segments (at percentage markers)")
-        self._for_segments_rb.setChecked(True)
-        self._fmt_btn_group.addButton(self._at_points_rb)
-        self._fmt_btn_group.addButton(self._for_segments_rb)
-        fmt_layout.addWidget(self._at_points_rb)
-        fmt_layout.addWidget(self._for_segments_rb)
+        # At points (checkbox, not radio)
+        self._at_points_cb = QCheckBox("At points (from a point tier)")
+        fmt_layout.addWidget(self._at_points_cb)
 
-        # Point tier combo
         pt_row = QHBoxLayout()
-        pt_row.addWidget(QLabel("Point tier:"))
+        self._pt_label = QLabel("Point tier:")
+        pt_row.addWidget(self._pt_label)
         self._point_tier_combo = QComboBox()
         pt_row.addWidget(self._point_tier_combo, 1)
         fmt_layout.addLayout(pt_row)
 
-        # Segment tier combo + percentages
+        # For segments (checkbox, not radio)
+        self._for_segments_cb = QCheckBox("For segments (at percentage markers)")
+        self._for_segments_cb.setChecked(True)
+        fmt_layout.addWidget(self._for_segments_cb)
+
         seg_row = QHBoxLayout()
-        seg_row.addWidget(QLabel("Segment tier:"))
+        self._seg_label = QLabel("Segment tier:")
+        seg_row.addWidget(self._seg_label)
         self._seg_tier_combo = QComboBox()
         seg_row.addWidget(self._seg_tier_combo, 1)
         fmt_layout.addLayout(seg_row)
 
         pct_row = QHBoxLayout()
-        pct_row.addWidget(QLabel("Percentage markers:"))
-        self._pct_edit = QLineEdit("10, 20, 30, 50, 70, 80, 90")
+        self._pct_label = QLabel("Percentage markers:")
+        pct_row.addWidget(self._pct_label)
+        self._pct_edit = QLineEdit("0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100")
         pct_row.addWidget(self._pct_edit, 1)
         fmt_layout.addLayout(pct_row)
 
         layout.addWidget(self._fmt_group)
         self._fmt_group.setVisible(False)
         self._fmt_cb.toggled.connect(self._fmt_group.setVisible)
-        self._fmt_btn_group.buttonToggled.connect(self._update_fmt_ui)
+        self._at_points_cb.toggled.connect(self._update_fmt_ui)
+        self._for_segments_cb.toggled.connect(self._update_fmt_ui)
 
         # --- Durations ---
         self._dur_cb = QCheckBox("Extract durations")
@@ -3408,10 +3451,14 @@ class _DataOptionsPage(QWizardPage):
         self._update_fmt_ui()
 
     def _update_fmt_ui(self):
-        at_pts = self._at_points_rb.isChecked()
+        at_pts = self._at_points_cb.isChecked()
+        for_seg = self._for_segments_cb.isChecked()
         self._point_tier_combo.setEnabled(at_pts)
-        self._seg_tier_combo.setEnabled(not at_pts)
-        self._pct_edit.setEnabled(not at_pts)
+        self._pt_label.setEnabled(at_pts)
+        self._seg_tier_combo.setEnabled(for_seg)
+        self._seg_label.setEnabled(for_seg)
+        self._pct_edit.setEnabled(for_seg)
+        self._pct_label.setEnabled(for_seg)
 
     def validatePage(self):
         wiz = self.wizard()
@@ -3427,24 +3474,41 @@ class _DataOptionsPage(QWizardPage):
             return False
 
         if wiz.extract_formants:
-            if self._at_points_rb.isChecked():
+            at_pts = self._at_points_cb.isChecked()
+            for_seg = self._for_segments_cb.isChecked()
+
+            if not at_pts and not for_seg:
+                QMessageBox.warning(
+                    self, "Error",
+                    "Select at least one formant extraction mode "
+                    "(at points and/or for segments).")
+                return False
+
+            # Build formant_mode
+            if at_pts and for_seg:
+                wiz.formant_mode = "both"
+            elif at_pts:
                 wiz.formant_mode = "at_points"
+            else:
+                wiz.formant_mode = "for_segments"
+
+            # Point tier
+            if at_pts:
                 wiz.point_tier_name = self._point_tier_combo.currentText()
                 if not wiz.point_tier_name:
                     QMessageBox.warning(
                         self, "Error", "No point tier available.")
                     return False
-                wiz.segment_tier_name = None
-                wiz.percentage_markers = []
             else:
-                wiz.formant_mode = "for_segments"
-                wiz.segment_tier_name = self._seg_tier_combo.currentText()
                 wiz.point_tier_name = None
+
+            # Segment tier + percentages
+            if for_seg:
+                wiz.segment_tier_name = self._seg_tier_combo.currentText()
                 if not wiz.segment_tier_name:
                     QMessageBox.warning(
                         self, "Error", "No segment tier available.")
                     return False
-                # Parse percentages
                 try:
                     pcts = [float(x.strip())
                             for x in self._pct_edit.text().split(",")
@@ -3461,6 +3525,9 @@ class _DataOptionsPage(QWizardPage):
                         f"Invalid percentage markers: {e}\n"
                         "Enter comma-separated numbers 0–100.")
                     return False
+            else:
+                wiz.segment_tier_name = None
+                wiz.percentage_markers = []
         else:
             wiz.formant_mode = None
             wiz.point_tier_name = None
