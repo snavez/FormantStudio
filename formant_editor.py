@@ -15,6 +15,7 @@ Formant analysis uses Praat (Boersma & Weenink) via Parselmouth.
 import sys
 import os
 import re
+import io
 import json
 import csv
 import time as _time
@@ -72,6 +73,49 @@ from collections import namedtuple
 UndoEntry = namedtuple('UndoEntry', ['description', 'changes'])
 # changes = list of (formant_idx, frame_idx, old_value, old_mask, new_value, new_mask)
 MAX_UNDO_STEPS = 100
+
+# IPA symbol chart path (resolved for PyInstaller bundle)
+_IPA_CHART_PATH = os.path.join(
+    getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
+    "Docs", "ipa_symbol_chart.csv"
+)
+
+# Diacritic suffixes for SAMPA / X-SAMPA notation (longest first)
+_DIACRITIC_SUFFIXES = [
+    ("_h", "aspirated"),
+    ("_0", "voiceless"),
+    ("_t", "dental"),
+    ("_k", "velarized"),
+    ("_w", "labialized"),
+    ("_j", "palatalized"),
+    ("_~", "nasalized"),
+    ("_d", "breathy"),
+    ("_c", "creaky"),
+    ("_b", "backed"),
+    ("_:", "long"),
+    (":", "long"),
+]
+
+# IPA combining diacritics (Unicode)
+_IPA_COMBINING_DIACRITICS = [
+    ("\u02B0", "aspirated"),     # superscript h
+    ("\u0325", "voiceless"),     # combining ring below
+    ("\u032A", "dental"),        # combining bridge below
+    ("\u0334", "velarized"),     # combining tilde overlay
+    ("\u02B7", "labialized"),    # superscript w
+    ("\u02B2", "palatalized"),   # superscript j
+    ("\u0303", "nasalized"),     # combining tilde
+    ("\u0324", "breathy"),       # combining diaeresis below
+    ("\u0330", "creaky"),        # combining tilde below
+    ("\u02D0", "long"),          # length mark ː
+]
+
+# All known diacritic feature names (for column generation)
+_ALL_DIACRITIC_FEATURES = [
+    "aspirated", "voiceless_diac", "dental_diac", "velarized",
+    "labialized", "palatalized", "nasalized", "breathy", "creaky",
+    "backed",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -546,21 +590,124 @@ def _find_containing_interval_for_point(tier, time_s):
     return None
 
 
+# ---------------------------------------------------------------------------
+# IPA / SAMPA / X-SAMPA classification helpers
+# ---------------------------------------------------------------------------
+
+def _load_ipa_chart(csv_path):
+    """Parse the IPA symbol chart CSV into a dict keyed by notation system.
+
+    Returns ``{'ipa': {symbol: props}, 'sampa': {...}, 'xsampa': {...}}``
+    where *props* is a dict with keys: type, subtype, height, fronting,
+    rounding, length, voicing, place, manner.
+    """
+    with open(csv_path, "r", encoding="utf-8") as fh:
+        raw_lines = [ln for ln in fh if not ln.strip().startswith("#")]
+    reader = csv.DictReader(io.StringIO("".join(raw_lines)))
+    chart = {"ipa": {}, "sampa": {}, "xsampa": {}}
+    prop_keys = ["type", "subtype", "height", "fronting", "rounding",
+                 "length", "voicing", "place", "manner"]
+    for row in reader:
+        props = {k: row.get(k, "").strip() for k in prop_keys}
+        for notation in ("ipa", "sampa", "xsampa"):
+            sym = row.get(notation, "").strip()
+            if sym:
+                chart[notation][sym] = props
+    return chart
+
+
+def _build_known_vowels(chart_lookup):
+    """Return set of single-character vowel symbols from *chart_lookup*."""
+    return {sym for sym, props in chart_lookup.items()
+            if props.get("type") == "vowel" and len(sym) == 1}
+
+
+def _classify_label(label, chart_lookup, notation, known_vowels):
+    """Classify a single TextGrid label using the IPA chart.
+
+    Returns ``(properties_dict, modifiers_list, matched_bool)``.
+    """
+    label = label.strip()
+    if not label:
+        return {}, [], True
+
+    # Exact lookup
+    if label in chart_lookup:
+        return dict(chart_lookup[label]), [], True
+
+    # Diacritic stripping
+    if notation == "ipa":
+        diac_list = _IPA_COMBINING_DIACRITICS
+    else:
+        diac_list = _DIACRITIC_SUFFIXES
+
+    modifiers = []
+    base = label
+    changed = True
+    while changed:
+        changed = False
+        for suffix, feature in diac_list:
+            if base.endswith(suffix) and len(base) > len(suffix):
+                base = base[:-len(suffix)]
+                feat_name = feature
+                # Avoid duplicating "voiceless"/"long" if already a base property
+                if feat_name == "voiceless":
+                    feat_name = "voiceless_diac"
+                elif feat_name == "long":
+                    feat_name = "long_diac"
+                elif feat_name == "dental":
+                    feat_name = "dental_diac"
+                if feat_name not in modifiers:
+                    modifiers.append(feat_name)
+                changed = True
+                # Try lookup after each strip
+                if base in chart_lookup:
+                    return dict(chart_lookup[base]), modifiers, True
+                break  # restart loop for greedy matching
+
+    # After full stripping, try lookup once more
+    if base in chart_lookup:
+        return dict(chart_lookup[base]), modifiers, True
+
+    # Auto-detect diphthong: remaining is 2+ chars all in known vowels
+    if len(base) >= 2 and all(ch in known_vowels for ch in base):
+        props = {"type": "vowel", "subtype": "diphthong",
+                 "voicing": "voiced", "length": "short"}
+        return props, modifiers, True
+
+    # Unmatched
+    return {}, modifiers, False
+
+
 def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     selected_tiers, extract_formants, formant_mode,
                     point_tier_name, segment_tier_name,
                     percentage_markers, extract_durations,
                     duration_tier_names, point_tier_parents=None,
-                    progress_callback=None):
+                    progress_callback=None,
+                    categorise=False, cat_chart=None,
+                    cat_notation="ipa", cat_tier_names=None,
+                    cat_vowel_props=None, cat_consonant_props=None,
+                    auto_diphthong_candidates=None,
+                    unmatched_labels=None):
     """Build CSV header and rows for batch formant/duration export.
 
     *formant_mode* can be ``"at_points"``, ``"for_segments"``, or ``"both"``.
     *point_tier_parents* maps point tier names to their parent interval tier
     name (determined by hierarchy order — the nearest interval tier above).
+    When *categorise* is True, classification columns are appended.
+    *auto_diphthong_candidates* and *unmatched_labels* are mutable sets
+    that collect data for post-processing.
     Returns (headers: list[str], rows: list[list[str|float]]).
     """
     if point_tier_parents is None:
         point_tier_parents = {}
+    if cat_tier_names is None:
+        cat_tier_names = []
+    if cat_vowel_props is None:
+        cat_vowel_props = []
+    if cat_consonant_props is None:
+        cat_consonant_props = []
     do_at_points = formant_mode in ("at_points", "both") if extract_formants else False
     do_for_segments = formant_mode in ("for_segments", "both") if extract_formants else False
 
@@ -598,6 +745,27 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     if extract_durations:
         for tn in duration_tier_names:
             headers.append(f"dur_{tn}")
+
+    # Categorisation columns
+    cat_col_start = len(headers)
+    cat_col_info = []  # [(header_name, tier_name, col_type, prop_name), ...]
+    known_vowels_set = None
+    if categorise and cat_chart:
+        lookup = cat_chart[cat_notation]
+        known_vowels_set = _build_known_vowels(lookup)
+        for tn in cat_tier_names:
+            # Type column (always)
+            cat_col_info.append((f"{tn}_type", tn, "type", "type"))
+            # Vowel property columns
+            for vp in cat_vowel_props:
+                cat_col_info.append((f"{tn}_V_{vp}", tn, "vowel", vp))
+            # Consonant property columns
+            for cp in cat_consonant_props:
+                cat_col_info.append((f"{tn}_C_{cp}", tn, "consonant", cp))
+            # Diacritic modifier columns (all known — empty ones filtered later)
+            for feat in _ALL_DIACRITIC_FEATURES:
+                cat_col_info.append((f"{tn}_{feat}", tn, "modifier", feat))
+        headers.extend([ci[0] for ci in cat_col_info])
 
     rows = []
 
@@ -726,6 +894,76 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     cols.append(f"{civ.xmax - civ.xmin:.4f}" if civ else "")
             return cols
 
+        # Helper: categorisation columns for a row (given label_cols already built)
+        def _cat_cols(label_cols_list):
+            """Return list of categorisation cell values."""
+            if not categorise or not cat_col_info:
+                return []
+            cols = []
+            for _hdr, tn, col_type, prop in cat_col_info:
+                # Find the label for this tier from the already-built row
+                # Tier label is at index: interval_tier_names.index(tn) or
+                # point_tier_names offset
+                label_text = ""
+                if tn in interval_tier_names:
+                    idx = interval_tier_names.index(tn)
+                    if idx < len(label_cols_list):
+                        label_text = label_cols_list[idx]
+                elif tn in point_tier_names:
+                    idx = len(interval_tier_names) + point_tier_names.index(tn)
+                    if idx < len(label_cols_list):
+                        label_text = label_cols_list[idx]
+
+                if not label_text.strip():
+                    cols.append("")
+                    continue
+
+                # For point tiers that may have "; " joined labels, classify first
+                labels_to_classify = [l.strip() for l in label_text.split(";")
+                                      if l.strip()]
+                if not labels_to_classify:
+                    cols.append("")
+                    continue
+
+                # Classify the primary (first) label
+                lbl = labels_to_classify[0]
+                props, mods, matched = _classify_label(
+                    lbl, cat_chart[cat_notation], cat_notation,
+                    known_vowels_set)
+
+                if not matched:
+                    if unmatched_labels is not None:
+                        unmatched_labels.add((tn, lbl))
+                    cols.append("")
+                    continue
+
+                if col_type == "type":
+                    cols.append(props.get("type", ""))
+                elif col_type == "vowel":
+                    if props.get("type") == "vowel":
+                        cols.append(props.get(prop, ""))
+                    else:
+                        cols.append("")
+                elif col_type == "consonant":
+                    if props.get("type") == "consonant":
+                        cols.append(props.get(prop, ""))
+                    else:
+                        cols.append("")
+                elif col_type == "modifier":
+                    if prop in mods:
+                        cols.append(prop)
+                    else:
+                        cols.append("")
+
+                # Track auto-diphthong candidates
+                if (auto_diphthong_candidates is not None
+                        and props.get("subtype") == "diphthong"
+                        and lbl not in cat_chart[cat_notation]):
+                    auto_diphthong_candidates[lbl] = (
+                        auto_diphthong_candidates.get(lbl, 0) + 1)
+
+            return cols
+
         # --- Row generation ---
         if do_at_points and at_pt_tier:
             # When extracting at points, one row per point in each segment
@@ -742,7 +980,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 if not points_in_iv:
                     # No target points — still emit a row if doing segments too
                     if do_for_segments:
-                        row = [audio_file] + _label_cols(iv)
+                        lc_np = _label_cols(iv)
+                        row = [audio_file] + lc_np
                         row.extend(["", "", ""])  # empty at-point F1/F2/F3
                         dur = iv.xmax - iv.xmin
                         for pct in percentage_markers:
@@ -752,6 +991,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                                 row.append(f"{v:.1f}" if not np.isnan(v) else "")
                         if extract_durations:
                             row.extend(_dur_cols(iv))
+                        row.extend(_cat_cols(lc_np))
                         rows.append(row)
                     continue
 
@@ -815,6 +1055,10 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     if extract_durations:
                         row.extend(_dur_cols(iv))
 
+                    # Categorisation: label cols are row[1 : 1+n_labels]
+                    n_labels = len(interval_tier_names) + len(point_tier_names)
+                    row.extend(_cat_cols(row[1:1 + n_labels]))
+
                     rows.append(row)
         else:
             # Row per lowest-tier segment (no at-points expansion)
@@ -822,7 +1066,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 if not iv.text.strip():
                     continue
 
-                row = [audio_file] + _label_cols(iv)
+                lc = _label_cols(iv)
+                row = [audio_file] + lc
 
                 # Segment percentage formant values
                 if do_for_segments:
@@ -835,6 +1080,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
 
                 if extract_durations:
                     row.extend(_dur_cols(iv))
+
+                row.extend(_cat_cols(lc))
 
                 rows.append(row)
 
@@ -3599,8 +3846,163 @@ class _DataOptionsPage(QWizardPage):
         return True
 
 
+class _DiphthongReviewDialog(QDialog):
+    """Review auto-detected diphthong candidates for confirmation."""
+
+    def __init__(self, candidates, parent=None):
+        """*candidates* is a dict {label_str: count_int}."""
+        super().__init__(parent)
+        self.setWindowTitle("Review Diphthong Candidates")
+        self.setMinimumSize(420, 340)
+        self.setStyleSheet(_DIALOG_FIELD_STYLE)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "The following multi-vowel sequences were detected.\n"
+            "Check the ones that should be classified as diphthongs:"))
+
+        self._list = QListWidget()
+        for label in sorted(candidates, key=lambda x: -candidates[x]):
+            item = QListWidgetItem(f"{label}  ({candidates[label]}×)")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            item.setData(Qt.ItemDataRole.UserRole, label)
+            self._list.addItem(item)
+        layout.addWidget(self._list)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def confirmed(self):
+        """Return set of labels the user confirmed as diphthongs."""
+        result = set()
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                result.add(item.data(Qt.ItemDataRole.UserRole))
+        return result
+
+
+class _CategorisationPage(QWizardPage):
+    """Page 4: Phonetic categorisation options for CSV export."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTitle("Sound Categorisation")
+        self.setSubTitle(
+            "Optionally add phonetic classification columns to the CSV.")
+
+        layout = QVBoxLayout(self)
+
+        # Master enable checkbox
+        self._enable_cb = QCheckBox("Add phonetic categorisation columns")
+        layout.addWidget(self._enable_cb)
+
+        # Options group (toggled by master checkbox)
+        self._group = QGroupBox("Categorisation Options")
+        grp_layout = QVBoxLayout(self._group)
+
+        # Notation selector
+        notation_row = QHBoxLayout()
+        notation_row.addWidget(QLabel("Notation system:"))
+        self._notation_combo = QComboBox()
+        self._notation_combo.addItems(["IPA", "SAMPA", "X-SAMPA"])
+        notation_row.addWidget(self._notation_combo)
+        notation_row.addStretch()
+        grp_layout.addLayout(notation_row)
+
+        # Tier selection
+        grp_layout.addWidget(QLabel("Tiers to categorise:"))
+        self._tier_list = QVBoxLayout()
+        self._tier_cbs = []
+        grp_layout.addLayout(self._tier_list)
+
+        # Vowel properties
+        v_group = QGroupBox("Vowel columns")
+        v_layout = QVBoxLayout(v_group)
+        self._vowel_cbs = {}
+        for prop in ["height", "fronting", "rounding", "length",
+                      "voicing", "subtype"]:
+            cb = QCheckBox(prop.capitalize())
+            cb.setChecked(True)
+            self._vowel_cbs[prop] = cb
+            v_layout.addWidget(cb)
+        grp_layout.addWidget(v_group)
+
+        # Consonant properties
+        c_group = QGroupBox("Consonant columns")
+        c_layout = QVBoxLayout(c_group)
+        self._consonant_cbs = {}
+        for prop in ["place", "manner", "voicing"]:
+            cb = QCheckBox(prop.capitalize())
+            cb.setChecked(True)
+            self._consonant_cbs[prop] = cb
+            c_layout.addWidget(cb)
+        grp_layout.addWidget(c_group)
+
+        layout.addWidget(self._group)
+        layout.addStretch()
+
+        # Toggle group visibility
+        self._group.setEnabled(False)
+        self._enable_cb.toggled.connect(self._group.setEnabled)
+
+    def initializePage(self):
+        """Populate tier checkboxes from wizard state."""
+        # Clear old tier checkboxes
+        for cb in self._tier_cbs:
+            self._tier_list.removeWidget(cb)
+            cb.deleteLater()
+        self._tier_cbs = []
+
+        wiz = self.wizard()
+        for name, tier_class in wiz.selected_tier_info:
+            cb = QCheckBox(f"{name} ({tier_class})")
+            cb.setChecked(tier_class == "IntervalTier")
+            cb.setProperty("tier_name", name)
+            self._tier_cbs.append(cb)
+            self._tier_list.addWidget(cb)
+
+    def validatePage(self):
+        wiz = self.wizard()
+
+        if not self._enable_cb.isChecked():
+            wiz.categorise = False
+            return True
+
+        # Collect selected tiers
+        cat_tiers = [cb.property("tier_name")
+                     for cb in self._tier_cbs if cb.isChecked()]
+        if not cat_tiers:
+            QMessageBox.warning(
+                self, "Error",
+                "Select at least one tier to categorise.")
+            return False
+
+        # Collect selected properties
+        v_props = [k for k, cb in self._vowel_cbs.items() if cb.isChecked()]
+        c_props = [k for k, cb in self._consonant_cbs.items() if cb.isChecked()]
+        if not v_props and not c_props:
+            QMessageBox.warning(
+                self, "Error",
+                "Select at least one vowel or consonant property.")
+            return False
+
+        notation_map = {"IPA": "ipa", "SAMPA": "sampa", "X-SAMPA": "xsampa"}
+        wiz.categorise = True
+        wiz.cat_notation = notation_map[self._notation_combo.currentText()]
+        wiz.cat_tier_names = cat_tiers
+        wiz.cat_vowel_props = v_props
+        wiz.cat_consonant_props = c_props
+        return True
+
+
 class BuildCSVWizard(QWizard):
-    """Three-page wizard for batch CSV export."""
+    """Four-page wizard for batch CSV export."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3623,9 +4025,17 @@ class BuildCSVWizard(QWizard):
         self.extract_durations = False
         self.duration_tier_names = []
 
+        # Categorisation state (Page 4)
+        self.categorise = False
+        self.cat_notation = "ipa"
+        self.cat_tier_names = []
+        self.cat_vowel_props = []
+        self.cat_consonant_props = []
+
         self.addPage(_PathsPage())
         self.addPage(_TierSelectionPage())
         self.addPage(_DataOptionsPage())
+        self.addPage(_CategorisationPage())
 
         self.setStyleSheet(_DIALOG_FIELD_STYLE)
 
@@ -4377,6 +4787,20 @@ class MainWindow(QMainWindow):
             if progress.wasCanceled():
                 cancelled = True
 
+        # Load IPA chart if categorisation is enabled
+        cat_chart = None
+        if wizard.categorise:
+            try:
+                cat_chart = _load_ipa_chart(_IPA_CHART_PATH)
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "Error",
+                    f"Failed to load IPA chart:\n{e}")
+                return
+
+        auto_diphthong_candidates = {} if wizard.categorise else None
+        unmatched_labels = set() if wizard.categorise else None
+
         try:
             headers, rows = _build_csv_data(
                 audio_dir=wizard.audio_dir,
@@ -4392,6 +4816,14 @@ class MainWindow(QMainWindow):
                 duration_tier_names=wizard.duration_tier_names,
                 point_tier_parents=wizard.point_tier_parents,
                 progress_callback=on_progress,
+                categorise=wizard.categorise,
+                cat_chart=cat_chart,
+                cat_notation=wizard.cat_notation,
+                cat_tier_names=wizard.cat_tier_names,
+                cat_vowel_props=wizard.cat_vowel_props,
+                cat_consonant_props=wizard.cat_consonant_props,
+                auto_diphthong_candidates=auto_diphthong_candidates,
+                unmatched_labels=unmatched_labels,
             )
         except Exception as e:
             progress.close()
@@ -4403,6 +4835,76 @@ class MainWindow(QMainWindow):
         if cancelled:
             self.status.showMessage("CSV export cancelled")
             return
+
+        # Diphthong review dialog
+        if auto_diphthong_candidates:
+            dlg = _DiphthongReviewDialog(auto_diphthong_candidates, self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                confirmed = dlg.confirmed()
+                # Rejected diphthong labels → mark their cells as unmatched
+                rejected = set(auto_diphthong_candidates) - confirmed
+                if rejected:
+                    # Find cat column indices for type/subtype
+                    # Clear cells for rejected diphthongs
+                    n_labels = len([t for t in selected_tiers
+                                    if t.tier_class == "IntervalTier"])
+                    n_labels += len([t for t in selected_tiers
+                                     if t.tier_class == "TextTier"])
+                    for row in rows:
+                        for tn in wizard.cat_tier_names:
+                            # Find the label for this tier
+                            label_text = ""
+                            all_tnames = ([t.name for t in selected_tiers
+                                           if t.tier_class == "IntervalTier"] +
+                                          [t.name for t in selected_tiers
+                                           if t.tier_class == "TextTier"])
+                            if tn in all_tnames:
+                                li = 1 + all_tnames.index(tn)
+                                if li < len(row):
+                                    label_text = row[li]
+                            lbl = label_text.split(";")[0].strip() if label_text else ""
+                            if lbl in rejected:
+                                # Clear all cat columns for this tier
+                                for hi, h in enumerate(headers):
+                                    if h.startswith(f"{tn}_"):
+                                        if hi < len(row):
+                                            row[hi] = ""
+                                if unmatched_labels is not None:
+                                    unmatched_labels.add((tn, lbl))
+
+        # Filter empty columns (categorisation columns only)
+        if wizard.categorise and rows:
+            non_empty_cols = set()
+            # Always keep non-categorisation columns
+            cat_start = None
+            for i, h in enumerate(headers):
+                for tn in wizard.cat_tier_names:
+                    if h.startswith(f"{tn}_"):
+                        if cat_start is None:
+                            cat_start = i
+                        break
+                else:
+                    non_empty_cols.add(i)
+            # Check which cat columns have data
+            if cat_start is not None:
+                for row in rows:
+                    for i in range(cat_start, len(headers)):
+                        if i < len(row) and row[i]:
+                            non_empty_cols.add(i)
+                keep = sorted(non_empty_cols)
+                headers = [headers[i] for i in keep]
+                rows = [[row[i] if i < len(row) else "" for i in keep]
+                        for row in rows]
+
+        # Report unmatched labels
+        if unmatched_labels:
+            items = sorted(unmatched_labels)
+            msg = "The following labels could not be classified:\n\n"
+            for tn, lbl in items[:50]:  # cap at 50 to avoid huge dialog
+                msg += f"  [{tn}] {lbl}\n"
+            if len(items) > 50:
+                msg += f"\n  ... and {len(items) - 50} more."
+            QMessageBox.information(self, "Unmatched Labels", msg)
 
         # Save dialog
         default_name = os.path.join(wizard.audio_dir, "formant_data.csv")

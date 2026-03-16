@@ -1,0 +1,234 @@
+ipa,sampa,xsampa,type,subtype,height,fronting,rounding,length,voicing,place,manner
+# ============================================================
+# MONOPHTHONG VOWELS — short (default)
+# ============================================================
+# Front unrounded
+i,i,i,vowel,monophthong,high,front,unrounded,short,voiced,,
+ɪ,I,I,vowel,monophthong,mid-high,front,unrounded,short,voiced,,
+e,e,e,vowel,monophthong,mid-high,front,unrounded,short,voiced,,
+ɛ,E,E,vowel,monophthong,mid-low,front,unrounded,short,voiced,,
+æ,{,{,vowel,monophthong,mid-low,front,unrounded,short,voiced,,
+a,a,a,vowel,monophthong,low,front,unrounded,short,voiced,,
+# Front rounded
+y,y,y,vowel,monophthong,high,front,rounded,short,voiced,,
+ʏ,Y,Y,vowel,monophthong,mid-high,front,rounded,short,voiced,,
+ø,2,2,vowel,monophthong,mid-high,front,rounded,short,voiced,,
+œ,9,9,vowel,monophthong,mid-low,front,rounded,short,voiced,,
+ɶ,&,&,vowel,monophthong,low,front,rounded,short,voiced,,
+# Central unrounded
+ɨ,1,1,vowel,monophthong,high,centre,unrounded,short,voiced,,
+ɘ,@\,@\,vowel,monophthong,mid-high,centre,unrounded,short,voiced,,
+ə,@,@,vowel,monophthong,mid,centre,unrounded,short,voiced,,
+ɜ,3,3,vowel,monophthong,mid-low,centre,unrounded,short,voiced,,
+ɐ,6,6,vowel,monophthong,mid-low,centre,unrounded,short,voiced,,
+# Central rounded
+ʉ,},},vowel,monophthong,high,centre,rounded,short,voiced,,
+ɵ,8,8,vowel,monophthong,mid-high,centre,rounded,short,voiced,,
+ɞ,3\,3\,vowel,monophthong,mid-low,centre,rounded,short,voiced,,
+# Back unrounded
+ɯ,M,M,vowel,monophthong,high,back,unrounded,short,voiced,,
+ɤ,7,7,vowel,monophthong,mid-high,back,unrounded,short,voiced,,
+ʌ,V,V,vowel,monophthong,mid-low,back,unrounded,short,voiced,,
+ɑ,A,A,vowel,monophthong,low,back,unrounded,short,voiced,,
+# Back rounded
+u,u,u,vowel,monophthong,high,back,rounded,short,voiced,,
+ʊ,U,U,vowel,monophthong,mid-high,back,rounded,short,voiced,,
+o,o,o,vowel,monophthong,mid-high,back,rounded,short,voiced,,
+ɔ,O,O,vowel,monophthong,mid-low,back,rounded,short,voiced,,
+ɒ,Q,Q,vowel,monophthong,low,back,rounded,short,voiced,,
+# ============================================================
+# MONOPHTHONG VOWELS — long
+# ============================================================
+# Front unrounded long
+iː,i:,i:,vowel,monophthong,high,front,unrounded,long,voiced,,
+ɪː,I:,I:,vowel,monophthong,mid-high,front,unrounded,long,voiced,,
+eː,e:,e:,vowel,monophthong,mid-high,front,unrounded,long,voiced,,
+ɛː,E:,E:,vowel,monophthong,mid-low,front,unrounded,long,voiced,,
+æː,{:,{:,vowel,monophthong,mid-low,front,unrounded,long,voiced,,
+aː,a:,a:,vowel,monophthong,low,front,unrounded,long,voiced,,
+# Front rounded long
+yː,y:,y:,vowel,monophthong,high,front,rounded,long,voiced,,
+ʏː,Y:,Y:,vowel,monophthong,mid-high,front,rounded,long,voiced,,
+øː,2:,2:,vowel,monophthong,mid-high,front,rounded,long,voiced,,
+œː,9:,9:,vowel,monophthong,mid-low,front,rounded,long,voiced,,
+# Central unrounded long
+ɨː,1:,1:,vowel,monophthong,high,centre,unrounded,long,voiced,,
+əː,@:,@:,vowel,monophthong,mid,centre,unrounded,long,voiced,,
+ɜː,3:,3:,vowel,monophthong,mid-low,centre,unrounded,long,voiced,,
+ɐː,6:,6:,vowel,monophthong,mid-low,centre,unrounded,long,voiced,,
+# Central rounded long
+ʉː,}:,}:,vowel,monophthong,high,centre,rounded,long,voiced,,
+ɵː,8:,8:,vowel,monophthong,mid-high,centre,rounded,long,voiced,,
+# Back unrounded long
+ɯː,M:,M:,vowel,monophthong,high,back,unrounded,long,voiced,,
+ɤː,7:,7:,vowel,monophthong,mid-high,back,unrounded,long,voiced,,
+ʌː,V:,V:,vowel,monophthong,mid-low,back,unrounded,long,voiced,,
+ɑː,A:,A:,vowel,monophthong,low,back,unrounded,long,voiced,,
+# Back rounded long
+uː,u:,u:,vowel,monophthong,high,back,rounded,long,voiced,,
+ʊː,U:,U:,vowel,monophthong,mid-high,back,rounded,long,voiced,,
+oː,o:,o:,vowel,monophthong,mid-high,back,rounded,long,voiced,,
+ɔː,O:,O:,vowel,monophthong,mid-low,back,rounded,long,voiced,,
+ɒː,Q:,Q:,vowel,monophthong,low,back,rounded,long,voiced,,
+# ============================================================
+# COMMON DIPHTHONGS
+# ============================================================
+aɪ,aI,aI,vowel,diphthong,,,,short,voiced,,
+aʊ,aU,aU,vowel,diphthong,,,,short,voiced,,
+eɪ,eI,eI,vowel,diphthong,,,,short,voiced,,
+oʊ,oU,oU,vowel,diphthong,,,,short,voiced,,
+əʊ,@U,@U,vowel,diphthong,,,,short,voiced,,
+ɔɪ,OI,OI,vowel,diphthong,,,,short,voiced,,
+ɪə,I@,I@,vowel,diphthong,,,,short,voiced,,
+ɛə,E@,E@,vowel,diphthong,,,,short,voiced,,
+ʊə,U@,U@,vowel,diphthong,,,,short,voiced,,
+ɔʏ,OY,OY,vowel,diphthong,,,,short,voiced,,
+ae,ae,ae,vowel,diphthong,,,,short,voiced,,
+ai,ai,ai,vowel,diphthong,,,,short,voiced,,
+ao,ao,ao,vowel,diphthong,,,,short,voiced,,
+au,au,au,vowel,diphthong,,,,short,voiced,,
+ei,ei,ei,vowel,diphthong,,,,short,voiced,,
+eu,eu,eu,vowel,diphthong,,,,short,voiced,,
+ia,ia,ia,vowel,diphthong,,,,short,voiced,,
+ie,ie,ie,vowel,diphthong,,,,short,voiced,,
+io,io,io,vowel,diphthong,,,,short,voiced,,
+iu,iu,iu,vowel,diphthong,,,,short,voiced,,
+oe,oe,oe,vowel,diphthong,,,,short,voiced,,
+oi,oi,oi,vowel,diphthong,,,,short,voiced,,
+ou,ou,ou,vowel,diphthong,,,,short,voiced,,
+ua,ua,ua,vowel,diphthong,,,,short,voiced,,
+ue,ue,ue,vowel,diphthong,,,,short,voiced,,
+ui,ui,ui,vowel,diphthong,,,,short,voiced,,
+uo,uo,uo,vowel,diphthong,,,,short,voiced,,
+# Long diphthongs
+aɪː,aI:,aI:,vowel,diphthong,,,,long,voiced,,
+aʊː,aU:,aU:,vowel,diphthong,,,,long,voiced,,
+eɪː,eI:,eI:,vowel,diphthong,,,,long,voiced,,
+oʊː,oU:,oU:,vowel,diphthong,,,,long,voiced,,
+ɔɪː,OI:,OI:,vowel,diphthong,,,,long,voiced,,
+# ============================================================
+# PULMONIC CONSONANTS — Plosives
+# ============================================================
+p,p,p,consonant,,,,,,voiceless,bilabial,plosive
+b,b,b,consonant,,,,,,voiced,bilabial,plosive
+t,t,t,consonant,,,,,,voiceless,alveolar,plosive
+d,d,d,consonant,,,,,,voiced,alveolar,plosive
+ʈ,t`,t`,consonant,,,,,,voiceless,retroflex,plosive
+ɖ,d`,d`,consonant,,,,,,voiced,retroflex,plosive
+c,c,c,consonant,,,,,,voiceless,palatal,plosive
+ɟ,J\,J\,consonant,,,,,,voiced,palatal,plosive
+k,k,k,consonant,,,,,,voiceless,velar,plosive
+ɡ,g,g,consonant,,,,,,voiced,velar,plosive
+q,q,q,consonant,,,,,,voiceless,uvular,plosive
+ɢ,G\,G\,consonant,,,,,,voiced,uvular,plosive
+ʔ,?,?,consonant,,,,,,voiceless,glottal,plosive
+# ============================================================
+# PULMONIC CONSONANTS — Nasals
+# ============================================================
+m,m,m,consonant,,,,,,voiced,bilabial,nasal
+ɱ,F,F,consonant,,,,,,voiced,labiodental,nasal
+n,n,n,consonant,,,,,,voiced,alveolar,nasal
+ɳ,n`,n`,consonant,,,,,,voiced,retroflex,nasal
+ɲ,J,J,consonant,,,,,,voiced,palatal,nasal
+ŋ,N,N,consonant,,,,,,voiced,velar,nasal
+ɴ,N\,N\,consonant,,,,,,voiced,uvular,nasal
+# ============================================================
+# PULMONIC CONSONANTS — Trills
+# ============================================================
+ʙ,B\,B\,consonant,,,,,,voiced,bilabial,trill
+r,r,r,consonant,,,,,,voiced,alveolar,trill
+ʀ,R\,R\,consonant,,,,,,voiced,uvular,trill
+# ============================================================
+# PULMONIC CONSONANTS — Taps / Flaps
+# ============================================================
+ⱱ,v\,v\,consonant,,,,,,voiced,labiodental,tap
+ɾ,4,4,consonant,,,,,,voiced,alveolar,tap
+ɽ,r`,r`,consonant,,,,,,voiced,retroflex,tap
+# ============================================================
+# PULMONIC CONSONANTS — Fricatives
+# ============================================================
+ɸ,p\,p\,consonant,,,,,,voiceless,bilabial,fricative
+β,B,B,consonant,,,,,,voiced,bilabial,fricative
+f,f,f,consonant,,,,,,voiceless,labiodental,fricative
+v,v,v,consonant,,,,,,voiced,labiodental,fricative
+θ,T,T,consonant,,,,,,voiceless,dental,fricative
+ð,D,D,consonant,,,,,,voiced,dental,fricative
+s,s,s,consonant,,,,,,voiceless,alveolar,fricative
+z,z,z,consonant,,,,,,voiced,alveolar,fricative
+ʃ,S,S,consonant,,,,,,voiceless,postalveolar,fricative
+ʒ,Z,Z,consonant,,,,,,voiced,postalveolar,fricative
+ʂ,s`,s`,consonant,,,,,,voiceless,retroflex,fricative
+ʐ,z`,z`,consonant,,,,,,voiced,retroflex,fricative
+ɕ,s\,s\,consonant,,,,,,voiceless,alveolo-palatal,fricative
+ʑ,z\,z\,consonant,,,,,,voiced,alveolo-palatal,fricative
+ç,C,C,consonant,,,,,,voiceless,palatal,fricative
+ʝ,j\,j\,consonant,,,,,,voiced,palatal,fricative
+x,x,x,consonant,,,,,,voiceless,velar,fricative
+ɣ,G,G,consonant,,,,,,voiced,velar,fricative
+χ,X,X,consonant,,,,,,voiceless,uvular,fricative
+ʁ,R,R,consonant,,,,,,voiced,uvular,fricative
+ħ,X\,X\,consonant,,,,,,voiceless,pharyngeal,fricative
+ʕ,?\,?\,consonant,,,,,,voiced,pharyngeal,fricative
+h,h,h,consonant,,,,,,voiceless,glottal,fricative
+ɦ,h\,h\,consonant,,,,,,voiced,glottal,fricative
+# ============================================================
+# PULMONIC CONSONANTS — Lateral Fricatives
+# ============================================================
+ɬ,K,K,consonant,,,,,,voiceless,alveolar,lateral-fricative
+ɮ,K\,K\,consonant,,,,,,voiced,alveolar,lateral-fricative
+# ============================================================
+# PULMONIC CONSONANTS — Approximants
+# ============================================================
+ʋ,P,P,consonant,,,,,,voiced,labiodental,approximant
+ɹ,r\,r\,consonant,,,,,,voiced,alveolar,approximant
+ɻ,r\`,r\`,consonant,,,,,,voiced,retroflex,approximant
+j,j,j,consonant,,,,,,voiced,palatal,approximant
+ɰ,M\,M\,consonant,,,,,,voiced,velar,approximant
+w,w,w,consonant,,,,,,voiced,labio-velar,approximant
+ʍ,W,W,consonant,,,,,,voiceless,labio-velar,fricative
+ɥ,H,H,consonant,,,,,,voiced,labio-palatal,approximant
+# ============================================================
+# PULMONIC CONSONANTS — Lateral Approximants
+# ============================================================
+l,l,l,consonant,,,,,,voiced,alveolar,lateral-approximant
+ɭ,l`,l`,consonant,,,,,,voiced,retroflex,lateral-approximant
+ʎ,L,L,consonant,,,,,,voiced,palatal,lateral-approximant
+ʟ,L\,L\,consonant,,,,,,voiced,velar,lateral-approximant
+# ============================================================
+# AFFRICATES
+# ============================================================
+t͡s,ts,ts,consonant,,,,,,voiceless,alveolar,affricate
+d͡z,dz,dz,consonant,,,,,,voiced,alveolar,affricate
+t͡ʃ,tS,tS,consonant,,,,,,voiceless,postalveolar,affricate
+d͡ʒ,dZ,dZ,consonant,,,,,,voiced,postalveolar,affricate
+t͡ɕ,ts\,ts\,consonant,,,,,,voiceless,alveolo-palatal,affricate
+d͡ʑ,dz\,dz\,consonant,,,,,,voiced,alveolo-palatal,affricate
+ʈ͡ʂ,t`s`,t`s`,consonant,,,,,,voiceless,retroflex,affricate
+ɖ͡ʐ,d`z`,d`z`,consonant,,,,,,voiced,retroflex,affricate
+p͡f,pf,pf,consonant,,,,,,voiceless,bilabial-labiodental,affricate
+# ============================================================
+# NON-PULMONIC — Clicks
+# ============================================================
+ʘ,O\,O\,consonant,,,,,,voiceless,bilabial,click
+ǀ,|\,|\,consonant,,,,,,voiceless,dental,click
+ǃ,!\,!\,consonant,,,,,,voiceless,postalveolar,click
+ǂ,=\,=\,consonant,,,,,,voiceless,palatal,click
+ǁ,|\|\,|\|\,consonant,,,,,,voiceless,lateral,click
+# ============================================================
+# NON-PULMONIC — Implosives
+# ============================================================
+ɓ,b_<,b_<,consonant,,,,,,voiced,bilabial,implosive
+ɗ,d_<,d_<,consonant,,,,,,voiced,alveolar,implosive
+ʄ,J\_<,J\_<,consonant,,,,,,voiced,palatal,implosive
+ɠ,g_<,g_<,consonant,,,,,,voiced,velar,implosive
+ʛ,G\_<,G\_<,consonant,,,,,,voiced,uvular,implosive
+# ============================================================
+# NON-PULMONIC — Ejectives
+# ============================================================
+pʼ,p_>,p_>,consonant,,,,,,voiceless,bilabial,ejective
+tʼ,t_>,t_>,consonant,,,,,,voiceless,alveolar,ejective
+kʼ,k_>,k_>,consonant,,,,,,voiceless,velar,ejective
+qʼ,q_>,q_>,consonant,,,,,,voiceless,uvular,ejective
+sʼ,s_>,s_>,consonant,,,,,,voiceless,alveolar,ejective
+t͡sʼ,ts_>,ts_>,consonant,,,,,,voiceless,alveolar,ejective
+t͡ʃʼ,tS_>,tS_>,consonant,,,,,,voiceless,postalveolar,ejective
