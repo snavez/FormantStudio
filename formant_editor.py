@@ -2169,10 +2169,17 @@ class SpectrogramCanvas(QWidget):
                 if iv.xmin == boundary_time:
                     right_idx = i
             if left_idx is not None and right_idx is not None:
+                # Merge labels from both sides of the deleted boundary
+                left_text = tier.intervals[left_idx].text.strip()
+                right_text = tier.intervals[right_idx].text.strip()
+                if left_text and right_text:
+                    merged = f"{left_text} {right_text}"
+                else:
+                    merged = left_text or right_text
                 tier.intervals[left_idx] = Interval(
                     tier.intervals[left_idx].xmin,
                     tier.intervals[right_idx].xmax,
-                    tier.intervals[left_idx].text,
+                    merged,
                 )
                 tier.intervals.pop(right_idx)
                 return True
