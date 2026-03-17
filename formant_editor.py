@@ -3899,11 +3899,60 @@ class _DiphthongReviewDialog(QDialog):
         return result
 
 
-class _MultiSelectDropdown(QWidget):
-    """A button that opens a checkable dropdown list. Shows selected count.
+class _CheckablePopup(QWidget):
+    """Frameless popup containing checkboxes. Auto-closes on outside click."""
 
-    Clicking the button toggles the popup open/closed.  The popup also
-    closes when the user clicks anywhere else in the application.
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.Popup)
+        self.setStyleSheet(
+            "_CheckablePopup { background: #2a2a3a; border: 1px solid #555; }")
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(6, 6, 6, 6)
+        self._layout.setSpacing(0)
+        self._checkboxes = []
+
+    def add_item(self, key, display_text):
+        """Add a checkable item. Returns the QCheckBox."""
+        cb = QCheckBox(display_text)
+        cb.setChecked(True)
+        cb.setProperty("item_key", key)
+        cb.setStyleSheet("""
+            QCheckBox {
+                color: #cccccc; font-size: 13px; padding: 5px 8px;
+            }
+            QCheckBox:hover { background-color: #3a3a4a; }
+            QCheckBox::indicator { width: 15px; height: 15px; }
+            QCheckBox::indicator:checked {
+                border: 2px solid #6699cc; border-radius: 3px;
+                background-color: #4477aa;
+            }
+            QCheckBox::indicator:unchecked {
+                border: 2px solid #666; border-radius: 3px;
+                background-color: transparent;
+            }
+        """)
+        self._layout.addWidget(cb)
+        self._checkboxes.append(cb)
+        return cb
+
+    def checked_keys(self):
+        return [cb.property("item_key") for cb in self._checkboxes
+                if cb.isChecked()]
+
+    def popup(self, pos, min_width=200):
+        self.setMinimumWidth(min_width)
+        self.adjustSize()
+        self.move(pos)
+        self.show()
+
+
+class _MultiSelectDropdown(QWidget):
+    """A button that opens a checkable dropdown. Shows selected count.
+
+    Uses a custom ``_CheckablePopup`` (``Qt.WindowType.Popup``) which
+    auto-closes on any click outside the popup — including clicking the
+    button itself, clicking elsewhere in the wizard, or clicking another
+    application window.
     """
 
     def __init__(self, label, items, parent=None):
@@ -3919,67 +3968,27 @@ class _MultiSelectDropdown(QWidget):
         self._button = QPushButton("All selected  \u25BC")
         self._button.setMinimumWidth(250)
         self._button.setStyleSheet(
-            "QPushButton { text-align: left; padding: 4px 8px; }"
-        )
+            "QPushButton { text-align: left; padding: 4px 8px; }")
         self._button.clicked.connect(self._toggle_popup)
         layout.addWidget(self._button, 1)
 
-        # Popup list widget — plain widget positioned manually
-        self._popup = QListWidget()
-        self._popup.setWindowFlags(Qt.WindowType.Popup)
-        self._popup.setStyleSheet("""
-            QListWidget {
-                background-color: #2a2a3a; color: #cccccc;
-                border: 1px solid #555; font-size: 13px;
-                padding: 4px;
-            }
-            QListWidget::item { padding: 4px 8px; }
-            QListWidget::item:hover { background-color: #3a3a4a; }
-        """)
-
-        self._items_data = []
+        self._popup = _CheckablePopup()
         for key, display in items:
-            item = QListWidgetItem(display)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked)
-            item.setData(Qt.ItemDataRole.UserRole, key)
-            self._popup.addItem(item)
-            self._items_data.append((key, item))
+            cb = self._popup.add_item(key, display)
+            cb.toggled.connect(self._update_button_text)
 
-        self._popup.itemChanged.connect(self._update_button_text)
         self._update_button_text()
-
-        # Install app-wide event filter to catch clicks outside the popup
-        QApplication.instance().installEventFilter(self)
-
-    def eventFilter(self, obj, event):
-        """Close popup when user clicks outside it."""
-        if (self._popup.isVisible()
-                and event.type() == QEvent.Type.MouseButtonPress
-                and obj is not self._popup
-                and not self._popup.isAncestorOf(obj)):
-            # Check the click isn't on our own toggle button
-            if obj is not self._button:
-                self._popup.hide()
-        return False
 
     def _toggle_popup(self):
         if self._popup.isVisible():
             self._popup.hide()
             return
-        # Position below the button
         pos = self._button.mapToGlobal(self._button.rect().bottomLeft())
-        self._popup.setMinimumWidth(self._button.width())
-        row_h = max(self._popup.sizeHintForRow(0), 24)
-        h = min(row_h * len(self._items_data) + 12, 300)
-        self._popup.setFixedHeight(h)
-        self._popup.move(pos)
-        self._popup.show()
-        self._popup.setFocus()
+        self._popup.popup(pos, self._button.width())
 
     def _update_button_text(self):
         checked = self.selected_keys()
-        total = len(self._items_data)
+        total = len(self._popup._checkboxes)
         if len(checked) == total:
             self._button.setText(f"All selected ({total})  \u25BC")
         elif len(checked) == 0:
@@ -3988,8 +3997,7 @@ class _MultiSelectDropdown(QWidget):
             self._button.setText(f"{len(checked)} of {total} selected  \u25BC")
 
     def selected_keys(self):
-        return [key for key, item in self._items_data
-                if item.checkState() == Qt.CheckState.Checked]
+        return self._popup.checked_keys()
 
 
 class _CategorisationPage(QWizardPage):
