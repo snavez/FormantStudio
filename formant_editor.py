@@ -4990,13 +4990,20 @@ class MainWindow(QMainWindow):
                                     label_text = row[li]
                             lbl = label_text.split(";")[0].strip() if label_text else ""
                             if lbl in rejected:
-                                # Clear all cat columns for this tier
+                                # Reclassify as vowel-combination
                                 for hi, h in enumerate(headers):
-                                    if h.startswith(f"{tn}_"):
-                                        if hi < len(row):
-                                            row[hi] = ""
-                                if unmatched_labels is not None:
-                                    unmatched_labels.add((tn, lbl))
+                                    if hi >= len(row):
+                                        continue
+                                    if h == f"{tn}_type":
+                                        row[hi] = "vowel"
+                                    elif h == f"{tn}_V_subtype":
+                                        row[hi] = "vowel-combination"
+                                    elif h.startswith(f"{tn}_V_") or h.startswith(f"{tn}_C_"):
+                                        # Clear vowel/consonant detail cols
+                                        row[hi] = ""
+                                    elif h.startswith(f"{tn}_"):
+                                        # Keep diacritic modifier cols as-is
+                                        pass
 
         # Filter empty columns (categorisation columns only)
         if wizard.categorise and rows:
