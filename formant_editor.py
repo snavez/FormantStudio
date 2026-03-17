@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QSizePolicy, QScrollBar, QLineEdit, QDialog,
     QDialogButtonBox, QFormLayout, QGridLayout,
     QWizard, QWizardPage, QProgressDialog, QListWidget, QListWidgetItem,
-    QRadioButton, QButtonGroup
+    QRadioButton, QButtonGroup, QTabWidget, QScrollArea
 )
 from PyQt6.QtCore import Qt, QTimer, QEvent, QObject, pyqtSignal
 from PyQt6.QtGui import QAction, QKeySequence, QColor, QFont, QTransform
@@ -4007,6 +4007,337 @@ class _MultiSelectDropdown(QWidget):
         return self._popup.checked_keys()
 
 
+class _IPAChartDialog(QDialog):
+    """Floating IPA / SAMPA symbol reference panel.
+
+    Displays the standard IPA vowel trapezoid and consonant table with
+    clickable symbol buttons.  Clicking a symbol copies it to the clipboard
+    and inserts it into the active LabelEdit field (if one is focused).
+    A notation dropdown switches all symbols between IPA and SAMPA.
+    """
+
+    # Ordered lists matching the IPA chart layout
+    _VOWEL_HEIGHTS = ["high", "mid-high", "mid", "mid-low", "low"]
+    _VOWEL_FRONTINGS = ["front", "centre", "back"]
+
+    _CONSONANT_MANNERS = [
+        "plosive", "nasal", "trill", "tap", "fricative",
+        "lateral-fricative", "approximant", "lateral-approximant",
+        "affricate",
+    ]
+    _CONSONANT_PLACES = [
+        "bilabial", "labiodental", "dental", "alveolar",
+        "postalveolar", "retroflex", "alveolo-palatal", "palatal",
+        "velar", "uvular", "pharyngeal", "glottal",
+    ]
+    _PLACE_ABBREV = {
+        "bilabial": "Bilab", "labiodental": "Labdn", "dental": "Dent",
+        "alveolar": "Alv", "postalveolar": "PAlv", "retroflex": "Retr",
+        "alveolo-palatal": "AlvPl", "palatal": "Pal", "velar": "Vel",
+        "uvular": "Uvu", "pharyngeal": "Phar", "glottal": "Glot",
+    }
+    _MANNER_LABELS = {
+        "plosive": "Plosive", "nasal": "Nasal", "trill": "Trill",
+        "tap": "Tap/Flap", "fricative": "Fricative",
+        "lateral-fricative": "Lat. Fric.", "approximant": "Approximant",
+        "lateral-approximant": "Lat. Approx.", "affricate": "Affricate",
+    }
+
+    _BTN_STYLE = """
+        QPushButton {
+            background: #2a2a3a; color: #ddd; border: 1px solid #444;
+            border-radius: 3px; padding: 2px 4px; font-size: 14px;
+            min-width: 30px; min-height: 22px;
+        }
+        QPushButton:hover { background: #3a3a5a; border-color: #6699cc; }
+        QPushButton:pressed { background: #4a4a6a; }
+    """
+    _HDR_STYLE = "color: #999; font-weight: bold; font-size: 12px;"
+
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self._main_window = main_window
+        self.setWindowTitle("IPA Symbol Chart")
+        self.setWindowFlags(
+            Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        self.setMinimumSize(700, 480)
+        self.setStyleSheet(
+            "QDialog { background: #1e1e2e; }"
+            "QLabel { color: #cccccc; }"
+            "QTabWidget::pane { border: 1px solid #444; background: #1e1e2e; }"
+            "QTabBar::tab { background: #2a2a3a; color: #ccc; padding: 6px 14px;"
+            "  border: 1px solid #444; border-bottom: none; border-radius: 4px 4px 0 0; }"
+            "QTabBar::tab:selected { background: #1e1e2e; color: #fff; }"
+            "QComboBox { background: #2a2a3a; color: #ddd; border: 1px solid #555;"
+            "  padding: 3px 8px; min-width: 80px; }"
+            "QComboBox QAbstractItemView { background: #2a2a3a; color: #ddd; }"
+        )
+
+        self._symbol_buttons = []  # list of QPushButton (for notation switch)
+
+        # Load chart data
+        self._chart = _load_ipa_chart(_IPA_CHART_PATH)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        # Top bar — notation dropdown
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Notation:"))
+        self._notation_combo = QComboBox()
+        self._notation_combo.addItems(["IPA", "SAMPA"])
+        self._notation_combo.currentIndexChanged.connect(self._switch_notation)
+        top.addWidget(self._notation_combo)
+        top.addStretch()
+        hint = QLabel("Click a symbol to copy / insert")
+        hint.setStyleSheet("color: #777; font-style: italic;")
+        top.addWidget(hint)
+        layout.addLayout(top)
+
+        # Tab widget
+        tabs = QTabWidget()
+        tabs.addTab(self._build_vowel_tab(), "Vowels")
+        tabs.addTab(self._build_consonant_tab(), "Consonants")
+        layout.addWidget(tabs)
+
+    # ------------------------------------------------------------------
+    # Vowel tab
+    # ------------------------------------------------------------------
+    def _build_vowel_tab(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: #1e1e2e; }")
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(8, 8, 8, 8)
+
+        # --- Monophthong grid ---
+        mono_label = QLabel("Monophthongs (short)")
+        mono_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #aaa;")
+        outer.addWidget(mono_label)
+
+        grid = QGridLayout()
+        grid.setSpacing(4)
+
+        # Column headers
+        for col, fronting in enumerate(self._VOWEL_FRONTINGS):
+            lbl = QLabel(fronting.title())
+            lbl.setStyleSheet(self._HDR_STYLE)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(lbl, 0, col * 2 + 1, 1, 2)
+
+        # Build lookup: (height, fronting, rounding) -> (ipa, sampa)
+        vowel_lookup = {}
+        diph_list = []
+        for ipa_sym, props in self._chart["ipa"].items():
+            if props["type"] != "vowel":
+                continue
+            sampa_sym = ""
+            for s, p in self._chart["sampa"].items():
+                if p is props:
+                    sampa_sym = s
+                    break
+            if props["subtype"] == "diphthong":
+                diph_list.append((ipa_sym, sampa_sym, props))
+                continue
+            if props["length"] != "short":
+                continue
+            key = (props["height"], props["fronting"], props["rounding"])
+            vowel_lookup[key] = (ipa_sym, sampa_sym)
+
+        # Rows
+        for row, height in enumerate(self._VOWEL_HEIGHTS):
+            lbl = QLabel(height.title())
+            lbl.setStyleSheet(self._HDR_STYLE)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            grid.addWidget(lbl, row + 1, 0)
+
+            for col, fronting in enumerate(self._VOWEL_FRONTINGS):
+                unr = vowel_lookup.get((height, fronting, "unrounded"))
+                rnd = vowel_lookup.get((height, fronting, "rounded"))
+                cell = QHBoxLayout()
+                cell.setSpacing(2)
+                if unr:
+                    btn = self._make_btn(unr[0], unr[1])
+                    cell.addWidget(btn)
+                if unr and rnd:
+                    dot = QLabel("\u00B7")
+                    dot.setStyleSheet("color: #555; font-size: 12px;")
+                    dot.setFixedWidth(8)
+                    cell.addWidget(dot)
+                if rnd:
+                    btn = self._make_btn(rnd[0], rnd[1])
+                    cell.addWidget(btn)
+                if not unr and not rnd:
+                    cell.addStretch()
+                w = QWidget()
+                w.setLayout(cell)
+                grid.addWidget(w, row + 1, col * 2 + 1, 1, 2)
+
+        outer.addLayout(grid)
+
+        # --- Diphthongs ---
+        if diph_list:
+            outer.addSpacing(12)
+            dl = QLabel("Diphthongs")
+            dl.setStyleSheet("font-weight: bold; font-size: 13px; color: #aaa;")
+            outer.addWidget(dl)
+            flow = QHBoxLayout()
+            flow.setSpacing(4)
+            # Sort: short then long, alphabetical
+            diph_list.sort(key=lambda x: (x[2].get("length", ""), x[0]))
+            for ipa_sym, sampa_sym, props in diph_list:
+                btn = self._make_btn(ipa_sym, sampa_sym)
+                flow.addWidget(btn)
+            flow.addStretch()
+            # Wrap in a widget to allow line wrapping via flow layout
+            diph_widget = QWidget()
+            diph_widget.setLayout(flow)
+            outer.addWidget(diph_widget)
+
+        outer.addStretch()
+        scroll.setWidget(container)
+        return scroll
+
+    # ------------------------------------------------------------------
+    # Consonant tab
+    # ------------------------------------------------------------------
+    def _build_consonant_tab(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: #1e1e2e; }")
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(8, 8, 8, 8)
+
+        pul_label = QLabel("Pulmonic Consonants")
+        pul_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #aaa;")
+        outer.addWidget(pul_label)
+
+        grid = QGridLayout()
+        grid.setSpacing(3)
+
+        # Build lookup: (manner, place, voicing) -> (ipa, sampa)
+        cons_lookup = {}
+        non_pulmonic = []  # (ipa, sampa, props)
+        for ipa_sym, props in self._chart["ipa"].items():
+            if props["type"] != "consonant":
+                continue
+            sampa_sym = ""
+            for s, p in self._chart["sampa"].items():
+                if p is props:
+                    sampa_sym = s
+                    break
+            manner = props["manner"]
+            place = props["place"]
+            if manner in ("click", "implosive", "ejective"):
+                non_pulmonic.append((ipa_sym, sampa_sym, props))
+                continue
+            if place in ("labio-velar", "labio-palatal"):
+                non_pulmonic.append((ipa_sym, sampa_sym, props))
+                continue
+            key = (manner, place, props["voicing"])
+            cons_lookup[key] = (ipa_sym, sampa_sym)
+
+        # Column headers
+        for col, place in enumerate(self._CONSONANT_PLACES):
+            lbl = QLabel(self._PLACE_ABBREV.get(place, place[:4].title()))
+            lbl.setStyleSheet(self._HDR_STYLE + " font-size: 10px;")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(lbl, 0, col + 1)
+
+        # Rows
+        for row, manner in enumerate(self._CONSONANT_MANNERS):
+            lbl = QLabel(self._MANNER_LABELS.get(manner, manner.title()))
+            lbl.setStyleSheet(self._HDR_STYLE)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            grid.addWidget(lbl, row + 1, 0)
+
+            for col, place in enumerate(self._CONSONANT_PLACES):
+                vl = cons_lookup.get((manner, place, "voiceless"))
+                vd = cons_lookup.get((manner, place, "voiced"))
+                cell = QHBoxLayout()
+                cell.setSpacing(1)
+                cell.setContentsMargins(0, 0, 0, 0)
+                if vl:
+                    cell.addWidget(self._make_btn(vl[0], vl[1]))
+                if vl and vd:
+                    dot = QLabel("\u00B7")
+                    dot.setStyleSheet("color: #555; font-size: 10px;")
+                    dot.setFixedWidth(6)
+                    cell.addWidget(dot)
+                if vd:
+                    cell.addWidget(self._make_btn(vd[0], vd[1]))
+                if not vl and not vd:
+                    cell.addStretch()
+                w = QWidget()
+                w.setLayout(cell)
+                grid.addWidget(w, row + 1, col + 1)
+
+        outer.addLayout(grid)
+
+        # --- Non-pulmonic ---
+        if non_pulmonic:
+            outer.addSpacing(12)
+            np_label = QLabel("Other (clicks, implosives, ejectives, labio-velars)")
+            np_label.setStyleSheet(
+                "font-weight: bold; font-size: 13px; color: #aaa;")
+            outer.addWidget(np_label)
+            flow = QHBoxLayout()
+            flow.setSpacing(4)
+            non_pulmonic.sort(key=lambda x: (x[2]["manner"], x[0]))
+            for ipa_sym, sampa_sym, _ in non_pulmonic:
+                flow.addWidget(self._make_btn(ipa_sym, sampa_sym))
+            flow.addStretch()
+            np_widget = QWidget()
+            np_widget.setLayout(flow)
+            outer.addWidget(np_widget)
+
+        outer.addStretch()
+        scroll.setWidget(container)
+        return scroll
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _make_btn(self, ipa, sampa):
+        """Create a symbol button storing both notations."""
+        btn = QPushButton(ipa)  # default to IPA
+        btn.setProperty("ipa", ipa)
+        btn.setProperty("sampa", sampa)
+        btn.setToolTip(f"IPA: {ipa}   SAMPA: {sampa}")
+        btn.setStyleSheet(self._BTN_STYLE)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(lambda checked, b=btn: self._on_symbol_click(b))
+        self._symbol_buttons.append(btn)
+        return btn
+
+    def _on_symbol_click(self, btn):
+        """Copy symbol to clipboard and insert into active label edit."""
+        key = "ipa" if self._notation_combo.currentIndex() == 0 else "sampa"
+        symbol = btn.property(key)
+
+        # Copy to clipboard
+        QApplication.clipboard().setText(symbol)
+
+        # Insert into label edit if active
+        le = self._main_window.label_edit
+        if le.isEnabled():
+            pos = le.cursorPosition()
+            text = le.text()
+            le.setText(text[:pos] + symbol + text[pos:])
+            le.setCursorPosition(pos + len(symbol))
+            le.setFocus()
+
+        self._main_window.status.showMessage(f"Copied: {symbol}", 2000)
+
+    def _switch_notation(self):
+        """Update all buttons to show the selected notation."""
+        key = "ipa" if self._notation_combo.currentIndex() == 0 else "sampa"
+        for btn in self._symbol_buttons:
+            btn.setText(btn.property(key))
+
+
 class _CategorisationPage(QWizardPage):
     """Page 4: Phonetic categorisation options for CSV export."""
 
@@ -4421,6 +4752,9 @@ class MainWindow(QMainWindow):
         build_csv_action = QAction("&Build CSV...", self)
         build_csv_action.triggered.connect(self._build_csv)
         tools_menu.addAction(build_csv_action)
+        symbol_chart_action = QAction("&IPA Symbol Chart", self)
+        symbol_chart_action.triggered.connect(self._show_symbol_chart)
+        tools_menu.addAction(symbol_chart_action)
 
     def _menu_action(self, fn):
         """Run fn then re-render + update scrollbar (for View menu actions)."""
@@ -4869,6 +5203,14 @@ class MainWindow(QMainWindow):
             self.status.showMessage(f"Saved TextGrid: {os.path.basename(save_path)}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save TextGrid:\n{e}")
+
+    def _show_symbol_chart(self):
+        """Show (or raise) the floating IPA / SAMPA symbol chart."""
+        if not hasattr(self, '_symbol_chart_dialog') or self._symbol_chart_dialog is None:
+            self._symbol_chart_dialog = _IPAChartDialog(self)
+        self._symbol_chart_dialog.show()
+        self._symbol_chart_dialog.raise_()
+        self._symbol_chart_dialog.activateWindow()
 
     def _build_csv(self):
         """Launch the Build CSV wizard and run batch export."""
