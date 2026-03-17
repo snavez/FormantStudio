@@ -2422,6 +2422,9 @@ class SpectrogramCanvas(QWidget):
                 if bt is not None and dist <= threshold:
                     self._select_interval(tier_idx, time)
                     self._selected_boundary = None
+                    # Give focus to label edit so user can type immediately
+                    if self._label_edit is not None and self._label_edit.isEnabled():
+                        self._label_edit.setFocus()
                     self._start_boundary_drag(tier_idx, bt, event)
                     if old_active != tier_idx:
                         self.render()
@@ -2458,6 +2461,9 @@ class SpectrogramCanvas(QWidget):
                 return
             else:
                 self._select_interval(tier_idx, time)
+                # Give focus to label edit so user can type immediately
+                if self._label_edit is not None and self._label_edit.isEnabled():
+                    self._label_edit.setFocus()
                 if old_active != tier_idx:
                     self.render()
                 else:
@@ -4100,6 +4106,30 @@ class _IPAChartDialog(QDialog):
         tabs.addTab(self._build_consonant_tab(), "Consonants")
         layout.addWidget(tabs)
 
+    # Diacritics: (display_suffix_ipa, display_suffix_sampa, description)
+    # Shown on a dotted circle (◌) base character.
+    _DIACRITICS = [
+        ("\u02B0",  "_h",  "aspirated"),
+        ("\u0325",  "_0",  "voiceless"),
+        ("\u032A",  "_t",  "dental"),
+        ("\u0334",  "_k",  "velarized"),
+        ("\u02B7",  "_w",  "labialized"),
+        ("\u02B2",  "_j",  "palatalized"),
+        ("\u0303",  "_~",  "nasalized"),
+        ("\u0324",  "_d",  "breathy voice"),
+        ("\u0330",  "_c",  "creaky voice"),
+        ("\u02D0",  ":",   "long"),
+        ("\u0329",  "=",   "syllabic"),
+        ("\u032F",  "_^",  "non-syllabic"),
+        ("\u031A",  "_}",  "no audible release"),
+        ("\u0339",  "_O",  "more rounded"),
+        ("\u031C",  "_c",  "less rounded"),
+        ("\u031D",  "_r",  "raised"),
+        ("\u031E",  "_o",  "lowered"),
+        ("\u0318",  "_A",  "advanced tongue root"),
+        ("\u0319",  "_q",  "retracted tongue root"),
+    ]
+
     # ------------------------------------------------------------------
     # Vowel tab
     # ------------------------------------------------------------------
@@ -4112,88 +4142,96 @@ class _IPAChartDialog(QDialog):
         outer.setContentsMargins(8, 8, 8, 8)
 
         # --- Monophthong grid ---
-        mono_label = QLabel("Monophthongs (short)")
+        mono_label = QLabel("Monophthongs (click two vowels for a diphthong)")
         mono_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #aaa;")
         outer.addWidget(mono_label)
 
         grid = QGridLayout()
-        grid.setSpacing(4)
+        grid.setSpacing(2)
+        grid.setContentsMargins(0, 0, 0, 0)
 
-        # Column headers
-        for col, fronting in enumerate(self._VOWEL_FRONTINGS):
+        # Two-level column headers:  fronting on top, unrounded / rounded below
+        #  Col layout:  0=row-label, then for each fronting: unrounded, rounded
+        col_base = 1
+        for fi, fronting in enumerate(self._VOWEL_FRONTINGS):
+            c = col_base + fi * 2
             lbl = QLabel(fronting.title())
             lbl.setStyleSheet(self._HDR_STYLE)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            grid.addWidget(lbl, 0, col * 2 + 1, 1, 2)
+            grid.addWidget(lbl, 0, c, 1, 2)  # span 2 cols
+            for si, sub in enumerate(["unrnd", "rnd"]):
+                sl = QLabel(sub)
+                sl.setStyleSheet("color: #777; font-size: 10px;")
+                sl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                grid.addWidget(sl, 1, c + si)
 
         # Build lookup: (height, fronting, rounding) -> (ipa, sampa)
         vowel_lookup = {}
-        diph_list = []
         for ipa_sym, props in self._chart["ipa"].items():
             if props["type"] != "vowel":
+                continue
+            if props["subtype"] != "monophthong" or props["length"] != "short":
                 continue
             sampa_sym = ""
             for s, p in self._chart["sampa"].items():
                 if p is props:
                     sampa_sym = s
                     break
-            if props["subtype"] == "diphthong":
-                diph_list.append((ipa_sym, sampa_sym, props))
-                continue
-            if props["length"] != "short":
-                continue
             key = (props["height"], props["fronting"], props["rounding"])
             vowel_lookup[key] = (ipa_sym, sampa_sym)
 
-        # Rows
+        # Rows (start at row 2 — after fronting + rounding headers)
         for row, height in enumerate(self._VOWEL_HEIGHTS):
             lbl = QLabel(height.title())
             lbl.setStyleSheet(self._HDR_STYLE)
-            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            grid.addWidget(lbl, row + 1, 0)
+            lbl.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            grid.addWidget(lbl, row + 2, 0)
 
-            for col, fronting in enumerate(self._VOWEL_FRONTINGS):
-                unr = vowel_lookup.get((height, fronting, "unrounded"))
-                rnd = vowel_lookup.get((height, fronting, "rounded"))
-                cell = QHBoxLayout()
-                cell.setSpacing(2)
-                if unr:
-                    btn = self._make_btn(unr[0], unr[1])
-                    cell.addWidget(btn)
-                if unr and rnd:
-                    dot = QLabel("\u00B7")
-                    dot.setStyleSheet("color: #555; font-size: 12px;")
-                    dot.setFixedWidth(8)
-                    cell.addWidget(dot)
-                if rnd:
-                    btn = self._make_btn(rnd[0], rnd[1])
-                    cell.addWidget(btn)
-                if not unr and not rnd:
-                    cell.addStretch()
-                w = QWidget()
-                w.setLayout(cell)
-                grid.addWidget(w, row + 1, col * 2 + 1, 1, 2)
+            for fi, fronting in enumerate(self._VOWEL_FRONTINGS):
+                c = col_base + fi * 2
+                for ri, rounding in enumerate(["unrounded", "rounded"]):
+                    entry = vowel_lookup.get((height, fronting, rounding))
+                    if entry:
+                        btn = self._make_btn(entry[0], entry[1])
+                        grid.addWidget(btn, row + 2, c + ri,
+                                       alignment=Qt.AlignmentFlag.AlignCenter)
 
         outer.addLayout(grid)
 
-        # --- Diphthongs ---
-        if diph_list:
-            outer.addSpacing(12)
-            dl = QLabel("Diphthongs")
-            dl.setStyleSheet("font-weight: bold; font-size: 13px; color: #aaa;")
-            outer.addWidget(dl)
-            flow = QHBoxLayout()
-            flow.setSpacing(4)
-            # Sort: short then long, alphabetical
-            diph_list.sort(key=lambda x: (x[2].get("length", ""), x[0]))
-            for ipa_sym, sampa_sym, props in diph_list:
-                btn = self._make_btn(ipa_sym, sampa_sym)
-                flow.addWidget(btn)
-            flow.addStretch()
-            # Wrap in a widget to allow line wrapping via flow layout
-            diph_widget = QWidget()
-            diph_widget.setLayout(flow)
-            outer.addWidget(diph_widget)
+        # --- Diacritics ---
+        outer.addSpacing(14)
+        dia_label = QLabel("Diacritics (combining marks)")
+        dia_label.setStyleSheet(
+            "font-weight: bold; font-size: 13px; color: #aaa;")
+        outer.addWidget(dia_label)
+        dia_grid = QGridLayout()
+        dia_grid.setSpacing(3)
+        cols = 4  # diacritics per row
+        for i, (ipa_suf, sampa_suf, desc) in enumerate(self._DIACRITICS):
+            r, c = divmod(i, cols)
+            # Show on dotted circle base (◌)
+            ipa_display = "\u25CC" + ipa_suf
+            sampa_display = sampa_suf
+            btn = self._make_btn(ipa_suf, sampa_suf)
+            # Override display to show on dotted circle
+            btn.setText(ipa_display)
+            btn.setProperty("ipa_display", ipa_display)
+            btn.setProperty("sampa_display", sampa_suf)
+            btn.setToolTip(f"{desc}\nIPA: {ipa_display}   SAMPA: {sampa_suf}")
+            btn.setMinimumWidth(40)
+            cell = QHBoxLayout()
+            cell.setSpacing(4)
+            cell.setContentsMargins(0, 0, 0, 0)
+            cell.addWidget(btn)
+            lbl = QLabel(desc)
+            lbl.setStyleSheet("color: #888; font-size: 11px;")
+            cell.addWidget(lbl)
+            cell.addStretch()
+            w = QWidget()
+            w.setLayout(cell)
+            dia_grid.addWidget(w, r, c)
+        outer.addLayout(dia_grid)
 
         outer.addStretch()
         scroll.setWidget(container)
@@ -4333,9 +4371,14 @@ class _IPAChartDialog(QDialog):
 
     def _switch_notation(self):
         """Update all buttons to show the selected notation."""
-        key = "ipa" if self._notation_combo.currentIndex() == 0 else "sampa"
+        is_ipa = self._notation_combo.currentIndex() == 0
         for btn in self._symbol_buttons:
-            btn.setText(btn.property(key))
+            # Diacritic buttons have special display properties
+            disp = btn.property("ipa_display" if is_ipa else "sampa_display")
+            if disp is not None:
+                btn.setText(disp)
+            else:
+                btn.setText(btn.property("ipa" if is_ipa else "sampa"))
 
 
 class _CategorisationPage(QWizardPage):
