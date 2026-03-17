@@ -1324,6 +1324,10 @@ class SpectrogramCanvas(QWidget):
         self._on_textgrid_edited = None
         self._on_view_changed_callback = None
 
+        # Snap-to-boundary settings (set by MainWindow)
+        self._snap_enabled_cb = None       # QCheckBox reference
+        self._snap_tolerance_spin = None   # QDoubleSpinBox reference
+
         self._setup_empty_axes()
 
     # -------------------------------------------------------------------
@@ -2515,6 +2519,33 @@ class SpectrogramCanvas(QWidget):
         self._spec_plot.addItem(self._stroke_scatter)
         self._apply_edit(time, y)
 
+    def _snap_to_boundary(self, time, exclude_tier_idx, exclude_time):
+        """If snap is enabled, return the nearest boundary on any other tier
+        within tolerance, otherwise return *time* unchanged."""
+        if (self._snap_enabled_cb is None
+                or not self._snap_enabled_cb.isChecked()):
+            return time
+        tolerance = self._snap_tolerance_spin.value()
+        best_t = time
+        best_dist = tolerance
+        for ti, tier in enumerate(self.textgrid_data.tiers):
+            if ti == exclude_tier_idx:
+                continue
+            if tier.tier_class == "IntervalTier":
+                for iv in tier.intervals:
+                    for bt in (iv.xmin, iv.xmax):
+                        d = abs(bt - time)
+                        if d < best_dist:
+                            best_dist = d
+                            best_t = bt
+            elif tier.tier_class == "TextTier":
+                for pt in tier.points:
+                    d = abs(pt.time - time)
+                    if d < best_dist:
+                        best_dist = d
+                        best_t = pt.time
+        return best_t
+
     def _start_boundary_drag(self, tier_idx, bt, event):
         """Start a boundary drag operation."""
         self._dragging_boundary = True
@@ -2562,6 +2593,13 @@ class SpectrogramCanvas(QWidget):
             if time is not None:
                 final_time = max(self._drag_min_time,
                                  min(self._drag_max_time, time))
+                # Snap to nearest boundary on other tiers if enabled
+                snapped = self._snap_to_boundary(
+                    final_time, self._drag_tier_index,
+                    self._drag_original_time)
+                # Only snap if result is still within drag constraints
+                if self._drag_min_time <= snapped <= self._drag_max_time:
+                    final_time = snapped
             self._move_boundary(self._drag_tier_index,
                                 self._drag_original_time, final_time)
             for a_tier_idx, a_time in self._drag_aligned:
@@ -3151,6 +3189,26 @@ class ControlPanel(QWidget):
         self._tier_checkboxes = []  # list of QCheckBox
         self._tier_group.setVisible(False)  # hidden until TextGrid loaded
         layout.addWidget(self._tier_group)
+
+        # --- Boundary Snap ---
+        snap_group = QGroupBox("Boundary Snap")
+        snap_layout = QVBoxLayout(snap_group)
+
+        self.snap_enabled_cb = QCheckBox("Snap to nearest boundary")
+        self.snap_enabled_cb.setChecked(False)
+        snap_layout.addWidget(self.snap_enabled_cb)
+
+        tol_row = QHBoxLayout()
+        tol_row.addWidget(QLabel("Tolerance (s):"))
+        self.snap_tolerance_spin = QDoubleSpinBox()
+        self.snap_tolerance_spin.setRange(0.001, 0.200)
+        self.snap_tolerance_spin.setValue(0.010)
+        self.snap_tolerance_spin.setSingleStep(0.005)
+        self.snap_tolerance_spin.setDecimals(3)
+        tol_row.addWidget(self.snap_tolerance_spin)
+        snap_layout.addLayout(tol_row)
+
+        layout.addWidget(snap_group)
 
         layout.addStretch()
 
@@ -4664,6 +4722,8 @@ class MainWindow(QMainWindow):
 
         # Control panel
         self.controls = ControlPanel()
+        self.canvas._snap_enabled_cb = self.controls.snap_enabled_cb
+        self.canvas._snap_tolerance_spin = self.controls.snap_tolerance_spin
 
         # Splitter for resizability
         splitter = QSplitter(Qt.Orientation.Horizontal)
