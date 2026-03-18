@@ -5096,7 +5096,7 @@ class MainWindow(QMainWindow):
                 event.accept()
                 return
 
-        # Delete — remove selected boundary
+        # Delete — remove selected boundary or point
         if key == Qt.Key.Key_Delete:
             if self.canvas._selected_boundary is not None:
                 tier_idx, bt = self.canvas._selected_boundary
@@ -5109,6 +5109,21 @@ class MainWindow(QMainWindow):
                     self.status.showMessage("Cannot delete tier start/end boundary")
                 event.accept()
                 return
+            # Delete selected point on a TextTier
+            if self.canvas._selected_interval is not None:
+                tier_idx, pt_idx = self.canvas._selected_interval
+                tier = self.canvas.textgrid_data.tiers[tier_idx]
+                if tier.tier_class == "TextTier" and 0 <= pt_idx < len(tier.points):
+                    tier.points.pop(pt_idx)
+                    self._textgrid_dirty = True
+                    self.canvas._selected_interval = None
+                    if self.canvas._label_edit is not None:
+                        self.canvas._label_edit.setEnabled(False)
+                        self.canvas._label_edit.clear()
+                    self.canvas.render()
+                    self.status.showMessage("Point deleted")
+                    event.accept()
+                    return
 
         # F key — toggle formant visibility
         if key == Qt.Key.Key_F and not event.modifiers():
