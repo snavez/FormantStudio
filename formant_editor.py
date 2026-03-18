@@ -2519,17 +2519,19 @@ class SpectrogramCanvas(QWidget):
         self._spec_plot.addItem(self._stroke_scatter)
         self._apply_edit(time, y)
 
-    def _snap_to_boundary(self, time, exclude_tier_idx, exclude_time):
-        """If snap is enabled, return the nearest boundary on any other tier
-        within tolerance, otherwise return *time* unchanged."""
+    def _snap_to_boundary(self, time, exclude_tier_indices, exclude_time):
+        """If snap is enabled, return the nearest boundary on any tier NOT
+        in *exclude_tier_indices* within tolerance, else return *time*."""
         if (self._snap_enabled_cb is None
                 or not self._snap_enabled_cb.isChecked()):
             return time
+        if isinstance(exclude_tier_indices, int):
+            exclude_tier_indices = {exclude_tier_indices}
         tolerance = self._snap_tolerance_spin.value()
         best_t = time
         best_dist = tolerance
         for ti, tier in enumerate(self.textgrid_data.tiers):
-            if ti == exclude_tier_idx:
+            if ti in exclude_tier_indices:
                 continue
             if tier.tier_class == "IntervalTier":
                 for iv in tier.intervals:
@@ -2593,9 +2595,12 @@ class SpectrogramCanvas(QWidget):
             if time is not None:
                 final_time = max(self._drag_min_time,
                                  min(self._drag_max_time, time))
-                # Snap to nearest boundary on other tiers if enabled
+                # Snap to nearest boundary on tiers NOT in the drag group
+                exclude = {self._drag_tier_index}
+                for a_ti, _ in self._drag_aligned:
+                    exclude.add(a_ti)
                 snapped = self._snap_to_boundary(
-                    final_time, self._drag_tier_index,
+                    final_time, exclude,
                     self._drag_original_time)
                 # Only snap if result is still within drag constraints
                 if self._drag_min_time <= snapped <= self._drag_max_time:
@@ -3051,6 +3056,15 @@ class ControlPanel(QWidget):
             QPushButton:hover { background-color: #445566; }
             QPushButton:checked { background-color: #cc5544; border-color: #ee7766; }
             QLabel { font-size: 11px; }
+            QCheckBox::indicator {
+                width: 14px; height: 14px;
+                border: 2px solid #888; border-radius: 3px;
+                background-color: transparent;
+            }
+            QCheckBox::indicator:checked {
+                border-color: #6699cc;
+                background-color: #4477aa;
+            }
             QComboBox, QDoubleSpinBox {
                 background-color: #334455; border: 1px solid #556677;
                 border-radius: 3px; padding: 3px; color: #cccccc;
