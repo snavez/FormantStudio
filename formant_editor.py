@@ -1280,6 +1280,8 @@ class SpectrogramCanvas(QWidget):
         self._playback_start_time = 0.0
         self._playback_start_wall = 0.0
         self._playback_end_time = 0.0
+        self._playback_latency = 0.0
+        self._playback_stream = None
         self._playback_timer = None
         self._click_time = None
         self._hover_time = None
@@ -2806,6 +2808,8 @@ class SpectrogramCanvas(QWidget):
             return
         if self._playback_playing:
             self.stop_playback()
+        else:
+            sd.stop()  # ensure any draining audio from previous play is stopped
 
         sr = int(self.sound.sampling_frequency)
         samples = self.sound.values[0]
@@ -2814,12 +2818,46 @@ class SpectrogramCanvas(QWidget):
         if end_sample <= start_sample:
             return
 
-        audio_chunk = samples[start_sample:end_sample].copy()
+        audio_chunk = samples[start_sample:end_sample].astype('float32')
         self._playback_start_time = start_time
         self._playback_end_time = end_time
         self._playback_playing = True
 
-        sd.play(audio_chunk, sr)
+        # Use OutputStream with callback for reliable, gapless playback.
+        # sd.play() + wall-clock sd.stop() cuts audio short because the
+        # device output buffer hasn't drained yet.  With a callback stream
+        # the audio plays to the last sample, and finished_callback tells
+        # us when the device has truly finished.
+        self._play_pos = 0
+        self._play_data = audio_chunk
+
+        def _audio_cb(outdata, frames, time_info, status):
+            remaining = len(self._play_data) - self._play_pos
+            if remaining == 0:
+                outdata[:] = 0
+                raise sd.CallbackStop()
+            n = min(frames, remaining)
+            outdata[:n, 0] = self._play_data[self._play_pos:self._play_pos + n]
+            if n < frames:
+                outdata[n:] = 0
+            self._play_pos += n
+            if n < frames:
+                raise sd.CallbackStop()
+
+        def _on_finished():
+            # Schedule visual cleanup on the Qt main thread
+            QTimer.singleShot(0, self._on_playback_stream_finished)
+
+        self._playback_stream = sd.OutputStream(
+            samplerate=sr,
+            channels=1,
+            dtype='float32',
+            callback=_audio_cb,
+            finished_callback=_on_finished,
+            latency='low',
+        )
+        self._playback_stream.start()
+        self._playback_latency = self._playback_stream.latency
         self._playback_start_wall = _time.monotonic()
 
         # Create green cursor lines on all plots
@@ -2834,11 +2872,14 @@ class SpectrogramCanvas(QWidget):
         self._playback_timer.timeout.connect(self._update_playback_cursor)
         self._playback_timer.start(30)
 
-    def stop_playback(self):
-        """Stop audio playback and clean up cursor."""
+    def _on_playback_stream_finished(self):
+        """Called (on Qt thread) when the audio stream has truly finished."""
         if not self._playback_playing:
             return
-        sd.stop()
+        self._cleanup_playback_visuals()
+
+    def _cleanup_playback_visuals(self):
+        """Remove cursor lines and timer without stopping the audio device."""
         self._playback_playing = False
         if self._playback_timer is not None:
             self._playback_timer.stop()
@@ -2849,17 +2890,40 @@ class SpectrogramCanvas(QWidget):
             except Exception:
                 pass
         self._playback_cursors = []
+        if self._playback_stream is not None:
+            try:
+                self._playback_stream.close()
+            except Exception:
+                pass
+            self._playback_stream = None
         self.render()
+
+    def stop_playback(self):
+        """Stop audio playback immediately (user-initiated)."""
+        if not self._playback_playing:
+            sd.stop()  # stop any draining audio
+            return
+        if self._playback_stream is not None:
+            try:
+                self._playback_stream.stop()
+                self._playback_stream.close()
+            except Exception:
+                pass
+            self._playback_stream = None
+        else:
+            sd.stop()
+        self._cleanup_playback_visuals()
 
     def _update_playback_cursor(self):
         """Timer callback: update playback cursor position."""
         if not self._playback_playing:
             return
         elapsed = _time.monotonic() - self._playback_start_wall
-        current_time = self._playback_start_time + elapsed
-        if current_time >= self._playback_end_time:
-            self.stop_playback()
-            return
+        # Compensate for output latency so cursor matches audible position
+        audible_elapsed = max(0.0, elapsed - self._playback_latency)
+        current_time = self._playback_start_time + audible_elapsed
+        # Clamp to end — stream's finished_callback handles actual cleanup
+        current_time = min(current_time, self._playback_end_time)
         for _, line in self._playback_cursors:
             line.setValue(current_time)
 
