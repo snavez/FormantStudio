@@ -2611,7 +2611,16 @@ class SpectrogramCanvas(QWidget):
                                 self._drag_original_time, final_time)
             for a_tier_idx, a_time in self._drag_aligned:
                 self._move_boundary(a_tier_idx, a_time, final_time)
-            self._selected_boundary = (self._drag_tier_index, final_time)
+            # For TextTier points, keep _selected_interval (set during
+            # mouse press) so Delete key can find the point.  Only set
+            # _selected_boundary for IntervalTier boundaries.
+            tier = self.textgrid_data.tiers[self._drag_tier_index]
+            if tier.tier_class == "TextTier":
+                # Re-select the moved point so _selected_interval is up
+                # to date with the (possibly dragged) new time.
+                self._select_interval(self._drag_tier_index, final_time)
+            else:
+                self._selected_boundary = (self._drag_tier_index, final_time)
             if self._on_textgrid_edited is not None:
                 self._on_textgrid_edited()
             # Clean up drag lines
