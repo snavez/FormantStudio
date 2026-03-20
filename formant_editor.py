@@ -22,7 +22,6 @@ import time as _time
 import numpy as np
 import parselmouth
 from parselmouth import praat
-import sounddevice as sd
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -33,7 +32,8 @@ from PyQt6.QtWidgets import (
     QWizard, QWizardPage, QProgressDialog, QListWidget, QListWidgetItem,
     QRadioButton, QButtonGroup, QTabWidget, QScrollArea
 )
-from PyQt6.QtCore import Qt, QTimer, QEvent, QObject, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QEvent, QObject, pyqtSignal, QByteArray, QBuffer, QIODevice
+from PyQt6.QtMultimedia import QAudioSink, QAudioFormat
 from PyQt6.QtGui import QAction, QKeySequence, QColor, QFont, QTransform
 
 import pyqtgraph as pg
@@ -1280,8 +1280,8 @@ class SpectrogramCanvas(QWidget):
         self._playback_start_time = 0.0
         self._playback_start_wall = 0.0
         self._playback_end_time = 0.0
-        self._playback_latency = 0.0
-        self._playback_stream = None
+        self._playback_audio_sink = None
+        self._playback_audio_buf = None
         self._playback_timer = None
         self._click_time = None
         self._hover_time = None
@@ -2802,45 +2802,12 @@ class SpectrogramCanvas(QWidget):
     # Audio playback
     # -------------------------------------------------------------------
 
-    @staticmethod
-    def _find_wasapi_output_device():
-        """Find the WASAPI variant of the default output device.
-
-        Windows MME (the default host API) has ~90-180 ms latency which
-        causes short segments to be clipped or feel laggy.  WASAPI gives
-        ~3 ms latency.  We match by device name so the user still hears
-        audio on the same speakers/headset they have selected in Windows.
-        Returns the device index, or ``None`` to fall back to the default.
-        """
-        try:
-            default_out = sd.query_devices(sd.default.device[1], 'output')
-            default_name = default_out['name']
-            # Host-API index for WASAPI
-            wasapi_api = None
-            for idx, api in enumerate(sd.query_hostapis()):
-                if 'WASAPI' in api['name']:
-                    wasapi_api = idx
-                    break
-            if wasapi_api is None:
-                return None
-            # Find the WASAPI device whose name matches the default output
-            for i, d in enumerate(sd.query_devices()):
-                if (d['hostapi'] == wasapi_api
-                        and d['max_output_channels'] > 0
-                        and d['name'] == default_name):
-                    return i
-        except Exception:
-            pass
-        return None
-
     def play_audio(self, start_time, end_time):
         """Play audio from start_time to end_time with animated cursor."""
         if self.sound is None:
             return
         if self._playback_playing:
             self.stop_playback()
-        else:
-            sd.stop()  # ensure any draining audio from previous play is stopped
 
         sr = int(self.sound.sampling_frequency)
         samples = self.sound.values[0]
@@ -2854,44 +2821,23 @@ class SpectrogramCanvas(QWidget):
         self._playback_end_time = end_time
         self._playback_playing = True
 
-        # Use OutputStream with callback for reliable, gapless playback.
-        # sd.play() + wall-clock sd.stop() cuts audio short because the
-        # device output buffer hasn't drained yet.  With a callback stream
-        # the audio plays to the last sample, and finished_callback tells
-        # us when the device has truly finished.
-        self._play_pos = 0
-        self._play_data = audio_chunk
+        # Use Qt's native QAudioSink instead of sounddevice/PortAudio.
+        # PortAudio's bundled DLL in the PyInstaller exe defaults to the
+        # high-latency MME backend, causing short segments to be clipped.
+        # QAudioSink uses the Windows audio stack directly and works
+        # identically in both the Python script and the frozen exe.
+        fmt = QAudioFormat()
+        fmt.setSampleRate(sr)
+        fmt.setChannelCount(1)
+        fmt.setSampleFormat(QAudioFormat.SampleFormat.Float)
 
-        def _audio_cb(outdata, frames, time_info, status):
-            remaining = len(self._play_data) - self._play_pos
-            if remaining == 0:
-                outdata[:] = 0
-                raise sd.CallbackStop()
-            n = min(frames, remaining)
-            outdata[:n, 0] = self._play_data[self._play_pos:self._play_pos + n]
-            if n < frames:
-                outdata[n:] = 0
-            self._play_pos += n
-            if n < frames:
-                raise sd.CallbackStop()
+        self._playback_audio_buf = QBuffer()
+        self._playback_audio_buf.setData(QByteArray(audio_chunk.tobytes()))
+        self._playback_audio_buf.open(QIODevice.OpenModeFlag.ReadOnly)
 
-        def _on_finished():
-            # Schedule visual cleanup on the Qt main thread
-            QTimer.singleShot(0, self._on_playback_stream_finished)
-
-        # Prefer WASAPI (~3 ms latency) over MME (~90 ms) on Windows
-        wasapi_dev = self._find_wasapi_output_device()
-        self._playback_stream = sd.OutputStream(
-            samplerate=sr,
-            channels=1,
-            dtype='float32',
-            device=wasapi_dev,
-            callback=_audio_cb,
-            finished_callback=_on_finished,
-            latency='low',
-        )
-        self._playback_stream.start()
-        self._playback_latency = self._playback_stream.latency
+        self._playback_audio_sink = QAudioSink(fmt)
+        self._playback_audio_sink.stateChanged.connect(self._on_audio_state_changed)
+        self._playback_audio_sink.start(self._playback_audio_buf)
         self._playback_start_wall = _time.monotonic()
 
         # Create green cursor lines on all plots
@@ -2906,14 +2852,14 @@ class SpectrogramCanvas(QWidget):
         self._playback_timer.timeout.connect(self._update_playback_cursor)
         self._playback_timer.start(30)
 
-    def _on_playback_stream_finished(self):
-        """Called (on Qt thread) when the audio stream has truly finished."""
-        if not self._playback_playing:
-            return
-        self._cleanup_playback_visuals()
+    def _on_audio_state_changed(self, state):
+        """Called when QAudioSink transitions state (e.g. idle = done)."""
+        from PyQt6.QtMultimedia import QAudio
+        if state == QAudio.State.IdleState and self._playback_playing:
+            self._cleanup_playback_visuals()
 
     def _cleanup_playback_visuals(self):
-        """Remove cursor lines and timer without stopping the audio device."""
+        """Remove cursor lines, timer, and audio resources."""
         self._playback_playing = False
         if self._playback_timer is not None:
             self._playback_timer.stop()
@@ -2924,28 +2870,18 @@ class SpectrogramCanvas(QWidget):
             except Exception:
                 pass
         self._playback_cursors = []
-        if self._playback_stream is not None:
-            try:
-                self._playback_stream.close()
-            except Exception:
-                pass
-            self._playback_stream = None
+        if self._playback_audio_sink is not None:
+            self._playback_audio_sink.stop()
+            self._playback_audio_sink = None
+        if self._playback_audio_buf is not None:
+            self._playback_audio_buf.close()
+            self._playback_audio_buf = None
         self.render()
 
     def stop_playback(self):
         """Stop audio playback immediately (user-initiated)."""
         if not self._playback_playing:
-            sd.stop()  # stop any draining audio
             return
-        if self._playback_stream is not None:
-            try:
-                self._playback_stream.stop()
-                self._playback_stream.close()
-            except Exception:
-                pass
-            self._playback_stream = None
-        else:
-            sd.stop()
         self._cleanup_playback_visuals()
 
     def _update_playback_cursor(self):
@@ -2953,10 +2889,7 @@ class SpectrogramCanvas(QWidget):
         if not self._playback_playing:
             return
         elapsed = _time.monotonic() - self._playback_start_wall
-        # Compensate for output latency so cursor matches audible position
-        audible_elapsed = max(0.0, elapsed - self._playback_latency)
-        current_time = self._playback_start_time + audible_elapsed
-        # Clamp to end — stream's finished_callback handles actual cleanup
+        current_time = self._playback_start_time + elapsed
         current_time = min(current_time, self._playback_end_time)
         for _, line in self._playback_cursors:
             line.setValue(current_time)
