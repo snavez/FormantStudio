@@ -2844,9 +2844,6 @@ class SpectrogramCanvas(QWidget):
         self._playback_audio_buf.open(QIODevice.OpenModeFlag.ReadOnly)
 
         self._playback_audio_sink = QAudioSink(fmt)
-        # Use a small buffer (4096 bytes ≈ 1024 float32 samples ≈ 23ms
-        # at 44.1 kHz) to minimise start-up latency.
-        self._playback_audio_sink.setBufferSize(4096)
         self._playback_audio_sink.stateChanged.connect(self._on_audio_state_changed)
         self._playback_audio_sink.start(self._playback_audio_buf)
         self._playback_start_wall = _time.monotonic()
