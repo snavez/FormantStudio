@@ -2023,7 +2023,7 @@ class SpectrogramCanvas(QWidget):
                     )
                     self._add_overlay(region, plot)
 
-        # Selected interval highlight
+        # Selected interval / point highlight
         if self._selected_interval is not None:
             sel_tier_idx, sel_i = self._selected_interval
             if (self.textgrid_data is not None
@@ -2041,6 +2041,22 @@ class SpectrogramCanvas(QWidget):
                             pen=pg.mkPen(None),
                         )
                         self._add_overlay(region, sel_plot)
+                elif (tier.tier_class == "TextTier"
+                      and sel_i < len(tier.points)):
+                    pt = tier.points[sel_i]
+                    sel_plot = self._plot_for_tier(sel_tier_idx)
+                    if sel_plot is not None:
+                        red_pen = pg.mkPen('#ff0000', width=2.5)
+                        line = pg.InfiniteLine(
+                            pos=pt.time, angle=90, pen=red_pen)
+                        self._add_overlay(line, sel_plot)
+                    # Also show on spec and wave plots
+                    for p in [self._spec_plot, self._wave_plot]:
+                        if p is not None:
+                            red_pen = pg.mkPen('#ff0000', width=2.5)
+                            line = pg.InfiniteLine(
+                                pos=pt.time, angle=90, pen=red_pen)
+                            self._add_overlay(line, p)
 
         # Selected boundary highlight + shadows
         if self._selected_boundary is not None:
