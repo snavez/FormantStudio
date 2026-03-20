@@ -2831,11 +2831,22 @@ class SpectrogramCanvas(QWidget):
         fmt.setChannelCount(1)
         fmt.setSampleFormat(QAudioFormat.SampleFormat.Float)
 
+        # Pad with ~50ms of silence so the audio sink fully flushes the
+        # last real samples before transitioning to IdleState.  Without
+        # this, short segments can appear to cut off early because the
+        # sink stops before the tail of the buffer reaches the DAC.
+        pad_samples = int(sr * 0.05)
+        silence = np.zeros(pad_samples, dtype='float32')
+        padded = np.concatenate([audio_chunk, silence])
+
         self._playback_audio_buf = QBuffer()
-        self._playback_audio_buf.setData(QByteArray(audio_chunk.tobytes()))
+        self._playback_audio_buf.setData(QByteArray(padded.tobytes()))
         self._playback_audio_buf.open(QIODevice.OpenModeFlag.ReadOnly)
 
         self._playback_audio_sink = QAudioSink(fmt)
+        # Use a small buffer (4096 bytes ≈ 1024 float32 samples ≈ 23ms
+        # at 44.1 kHz) to minimise start-up latency.
+        self._playback_audio_sink.setBufferSize(4096)
         self._playback_audio_sink.stateChanged.connect(self._on_audio_state_changed)
         self._playback_audio_sink.start(self._playback_audio_buf)
         self._playback_start_wall = _time.monotonic()
