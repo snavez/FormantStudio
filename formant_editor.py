@@ -2802,6 +2802,37 @@ class SpectrogramCanvas(QWidget):
     # Audio playback
     # -------------------------------------------------------------------
 
+    @staticmethod
+    def _find_wasapi_output_device():
+        """Find the WASAPI variant of the default output device.
+
+        Windows MME (the default host API) has ~90-180 ms latency which
+        causes short segments to be clipped or feel laggy.  WASAPI gives
+        ~3 ms latency.  We match by device name so the user still hears
+        audio on the same speakers/headset they have selected in Windows.
+        Returns the device index, or ``None`` to fall back to the default.
+        """
+        try:
+            default_out = sd.query_devices(sd.default.device[1], 'output')
+            default_name = default_out['name']
+            # Host-API index for WASAPI
+            wasapi_api = None
+            for idx, api in enumerate(sd.query_hostapis()):
+                if 'WASAPI' in api['name']:
+                    wasapi_api = idx
+                    break
+            if wasapi_api is None:
+                return None
+            # Find the WASAPI device whose name matches the default output
+            for i, d in enumerate(sd.query_devices()):
+                if (d['hostapi'] == wasapi_api
+                        and d['max_output_channels'] > 0
+                        and d['name'] == default_name):
+                    return i
+        except Exception:
+            pass
+        return None
+
     def play_audio(self, start_time, end_time):
         """Play audio from start_time to end_time with animated cursor."""
         if self.sound is None:
@@ -2848,10 +2879,13 @@ class SpectrogramCanvas(QWidget):
             # Schedule visual cleanup on the Qt main thread
             QTimer.singleShot(0, self._on_playback_stream_finished)
 
+        # Prefer WASAPI (~3 ms latency) over MME (~90 ms) on Windows
+        wasapi_dev = self._find_wasapi_output_device()
         self._playback_stream = sd.OutputStream(
             samplerate=sr,
             channels=1,
             dtype='float32',
+            device=wasapi_dev,
             callback=_audio_cb,
             finished_callback=_on_finished,
             latency='low',
