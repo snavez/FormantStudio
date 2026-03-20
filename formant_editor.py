@@ -1146,6 +1146,12 @@ class LabelEdit(QLineEdit):
             self.clearFocus()
             event.accept()
             return
+        # Delete key with empty label or no selection: clear focus and let
+        # the main window handle it (e.g. delete a TextTier point).
+        if key == Qt.Key.Key_Delete and not self.text():
+            self.clearFocus()
+            event.ignore()
+            return
         super().keyPressEvent(event)
 
 
@@ -2444,9 +2450,10 @@ class SpectrogramCanvas(QWidget):
                 if bt is not None and dist <= threshold:
                     self._select_interval(tier_idx, time)
                     self._selected_boundary = None
-                    # Give focus to label edit so user can type immediately
-                    if self._label_edit is not None and self._label_edit.isEnabled():
-                        self._label_edit.setFocus()
+                    # Don't auto-focus label edit for TextTier points —
+                    # this allows Delete key to reach the main window for
+                    # point deletion.  User can click the label field to
+                    # edit if needed.
                     self._start_boundary_drag(tier_idx, bt, event)
                     if old_active != tier_idx:
                         self.render()
