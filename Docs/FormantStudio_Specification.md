@@ -4,10 +4,10 @@
 
 | Field | Value |
 |-------|-------|
-| Version | 0.3.0 (Milestone 3) |
-| Date | February 2026 |
-| Status | In Development |
-| Platform | Windows / macOS / Linux |
+| Version | 1.1.0 |
+| Date | March 2026 |
+| Status | Released |
+| Platform | Windows (exe) / macOS / Linux (from source) |
 | Analysis Engine | Praat (via Parselmouth) |
 
 ---
@@ -49,9 +49,11 @@ FormantStudio is a standalone desktop application that uses Praat's actual analy
 |-----------|-----------|---------|
 | Analysis Engine | Parselmouth 0.4.x | Python bindings to Praat's C++ source code |
 | GUI Framework | PyQt6 | Cross-platform desktop UI |
-| Visualisation | Matplotlib | Spectrogram rendering, formant overlay |
+| Visualisation | pyqtgraph | High-performance spectrogram and formant overlay rendering |
+| Audio Playback | Qt QAudioSink | Cross-platform audio output (replaced sounddevice/PortAudio) |
 | Data Handling | NumPy | Array operations for formant/spectrogram data |
 | File Format | JSON (.formants) | Editable, human-readable, version-trackable |
+| Packaging | PyInstaller | Windows executable distribution |
 
 ---
 
@@ -59,7 +61,7 @@ FormantStudio is a standalone desktop application that uses Praat's actual analy
 
 ### 2.1 Spectrogram Display
 
-The main area of the application displays a wideband spectrogram computed by Praat's spectrogram algorithm. The spectrogram is rendered using Matplotlib's `imshow` with bilinear interpolation and the `gray_r` colourmap (greyscale, dark = high intensity), limited to ≤10 seconds of visible audio for performance. A waveform display sits above the spectrogram showing the audio amplitude.
+The main area of the application displays a wideband spectrogram computed by Praat's spectrogram algorithm. The spectrogram is rendered using pyqtgraph's `ImageItem` with a greyscale colourmap (dark = high intensity), limited to ≤10 seconds of visible audio for performance. A waveform display sits above the spectrogram showing the audio amplitude with an RMS readout in the status bar.
 
 #### 2.1.1 Display Controls
 
@@ -92,22 +94,22 @@ Formant tracks are overlaid on the spectrogram as scatter plots with the followi
 | Formant | Colour | Hex |
 |---------|--------|-----|
 | F1 | Blue | #3399FF |
-| F2 | Yellow | #ffe600 |
+| F2 | Yellow/Gold | #FFD700 |
 | F3 | Red | #FF4444 |
 | F4 | Green | #44CC44 |
 | F5 | Magenta | #CC44CC |
 
-Unedited formant points are rendered as small white dots (current default Praat size) with a thin black outline to distinguish them from the background. Manually edited points are rendered in the same size, but with the colouring described above.
+Unedited formant points are rendered as small dots (size 3) with no outline. Manually edited points are rendered slightly larger (size 4) with a thin white edge to visually distinguish them from the Praat defaults.
 
 ### 2.3 Formant Editing
 
 #### 2.3.1 Activating Edit Mode
 
-The user activates edit mode by clicking the "EDIT MODE" button in the control panel. When active, the button turns red and the title bar displays the currently selected formant with its colour. Edit mode can be toggled off by clicking the button again.
+The user activates edit mode by clicking the "EDIT MODE" button in the control panel or pressing Ctrl+E. When active, the button turns red and the title bar displays the currently selected formant with its colour. Edit mode can be toggled off by clicking the button again or pressing Ctrl+E.
 
 #### 2.3.2 Drawing Formants
 
-While edit mode is active, the user holds the left mouse button and drags across the spectrogram. The cursor position is mapped to the nearest analysis frame (by time) and the frequency axis (by vertical position). The formant value at each frame under the cursor is overwritten with the cursor's frequency. Fast mouse movement fills skipped frames with linear interpolation between consecutive edit positions. A visual marker is drawn immediately for responsiveness (using blitting), with a full re-render on mouse release.
+While edit mode is active, the user holds the left mouse button and drags across the spectrogram. The cursor position is mapped to the nearest analysis frame (by time) and the frequency axis (by vertical position). The formant value at each frame under the cursor is overwritten with the cursor's frequency. Fast mouse movement fills skipped frames with linear interpolation between consecutive edit positions. A visual marker is drawn immediately for responsiveness, with a full re-render on mouse release.
 
 #### 2.3.2a Eraser Tool (Right-Click Drag)
 
@@ -129,11 +131,89 @@ The F1 through F5 keyboard keys select which formant is being edited, but only w
 
 Two reset options are provided: "Reset Current Formant" reverts only the active formant to its Praat-calculated values; "Reset All Edits" reverts all formants. Reset operations clear the edited_mask for the affected formant(s) and restore the original_values array.
 
-### 2.4 File Format (.formants)
+### 2.4 TextGrid Editing
+
+#### 2.4.1 Create or Load
+
+When a WAV file is opened, FormantStudio presents a dialog offering the choice to create a new TextGrid (specifying tier names and types) or load an existing TextGrid file. If a TextGrid file with a matching filename is auto-detected, it is offered as the default load option.
+
+#### 2.4.2 Tier Display
+
+TextGrid tiers are displayed below the spectrogram in synchronised, separately-labelled panels. IntervalTiers show labelled segments with boundary lines; TextTiers show labelled point markers. Tier visibility can be toggled via checkboxes. Dynamic tier label widths adjust to content.
+
+#### 2.4.3 Boundary and Point Editing
+
+| Operation | Action |
+|-----------|--------|
+| Add boundary | Press Enter at the cursor/hover position on an IntervalTier |
+| Delete boundary | Select a boundary, then press Del — merges adjacent intervals with combined labels |
+| Drag boundary | Click and drag a boundary to a new time position |
+| Shift+drag | Move boundaries aligned across multiple tiers simultaneously |
+| Snap-to-boundary | Boundaries snap to nearby boundaries on other tiers within an adjustable tolerance |
+| Add point | Press Enter at the cursor position on a TextTier |
+| Delete point | Click to select a point (highlighted with bold line), then press Del |
+| Edit labels | Click on an interval or point label to edit inline; changes update live |
+
+#### 2.4.4 Tier Management
+
+Users can add new tiers (IntervalTier or TextTier) to an existing TextGrid. TextGrid files are saved in Praat's normal text format via Ctrl+Shift+S.
+
+### 2.5 Audio Playback
+
+Audio playback uses Qt's QAudioSink for reliable cross-platform output. The audio is played as 32-bit float mono at the file's native sample rate. A small silence pad (~50 ms) is appended to ensure the audio sink fully flushes the last samples before stopping, preventing short segments from being cut off.
+
+| Action | Trigger |
+|--------|---------|
+| Play selection or visible range | Tab key |
+| Stop playback | Esc key |
+
+An animated playback cursor sweeps across the spectrogram during playback to indicate the current position.
+
+### 2.6 Navigation
+
+| Action | Method |
+|--------|--------|
+| Zoom in | Ctrl+I or scroll wheel up (cursor-centred) |
+| Zoom out | Ctrl+O or scroll wheel down (cursor-centred) |
+| Zoom to selection | Ctrl+N |
+| Zoom to fit all | Ctrl+A |
+| Scroll/pan | Scrollbar with ◀/▶ arrow buttons (2/3 window overlap) |
+| Time selection | Click-drag on spectrogram (when not in edit mode) |
+| Crosshair cursor | Displays time/frequency/RMS in the status bar |
+
+### 2.7 Batch CSV Export
+
+The Build CSV wizard (Tools > Build CSV) provides batch extraction of formant values, durations, and optional phonetic categorisation across multiple annotated files.
+
+#### 2.7.1 Wizard Pages
+
+1. **File Selection:** Add individual WAV files or scan directories. Files must have corresponding `.formants` and `.TextGrid` files.
+2. **Tier Selection:** Choose which IntervalTier(s) to extract formant data from. Optionally select TextTier point tiers and associate them with parent interval tiers.
+3. **Data Options:** Configure extraction mode:
+   - **Percentage-based:** Extract formant values at specified percentages through each interval (e.g., 25%, 50%, 75%)
+   - **Absolute time:** Extract at fixed time offsets from interval start
+   - Choose which formants (F1–F5) to include
+   - Duration column is always included
+4. **Phonetic Categorisation (optional):** Classify interval labels by phonetic features using an IPA/SAMPA chart:
+   - Manner of articulation
+   - Place of articulation
+   - Voicing
+   - Vowel height, backness, rounding
+   - Automatic diphthong detection and vowel-combination classification
+
+#### 2.7.2 Output Format
+
+The CSV output includes columns for filename, tier name, interval label, start/end times, duration, formant values at each extraction point, point tier labels (if selected), and categorisation columns (if enabled).
+
+### 2.8 IPA/SAMPA Reference Chart
+
+A built-in IPA/SAMPA reference panel (View > IPA/SAMPA Chart) provides a tabbed display of consonant and vowel symbols organised by phonetic features. The chart includes a diacritics section and supports click-to-copy for convenient label entry.
+
+### 2.9 File Format (.formants)
 
 Edited formant data is saved as a JSON file with the .formants extension, placed in the same directory as the source audio file with a matching base filename (e.g., `recording.wav` → `recording.formants`).
 
-#### 2.4.1 Schema
+#### 2.9.1 Schema
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -147,17 +227,27 @@ Edited formant data is saved as a JSON file with the .formants extension, placed
 | values | float[][] | 2D array [n_formants][n_frames]. Each value is frequency in Hz, or null where no formant was detected. |
 | edited_mask | bool[][] | 2D array [n_formants][n_frames]. true where the value has been manually edited. |
 
-#### 2.4.2 Time Alignment
+#### 2.9.2 Time Alignment
 
 The times array provides the exact centre time of each analysis frame. Combined with time_step_seconds, this allows any downstream tool to precisely align formant values with TextGrid interval or point tier boundaries. When extracting formant values for a labelled segment, the standard approach is to find all frames whose times fall within the segment's start and end times.
 
-#### 2.4.3 Null Handling
+#### 2.9.3 Null Handling
 
 Where Praat's algorithm does not detect a formant at a given frame (or where the user has not drawn a value), the corresponding entry in the values array is null (JSON) / NaN (internal NumPy representation). This ensures that all formant tracks have the same number of entries, and that alignment is maintained even when data is sparse.
 
-#### 2.4.4 Save/Load Behaviour
+#### 2.9.4 Save/Load Behaviour
 
 Ctrl+S saves the .formants file. On opening a WAV file, FormantStudio checks for an existing .formants file with a matching name and offers to load it. The loaded data replaces the Praat-calculated formants (the loaded values become the new "original" baseline for reset purposes). The user can also manually load a .formants file via Ctrl+L.
+
+### 2.10 Unsaved Changes Protection
+
+FormantStudio tracks whether formant edits or TextGrid modifications have been made since the last save. If the user attempts to open a new file or close the application with unsaved changes, a confirmation dialog is shown. An "Undo Last Edit" button is available for quick revert of the most recent change.
+
+### 2.11 Application Identity
+
+- Custom app icon displayed in the title bar and Windows taskbar
+- Title bar shows the currently loaded audio filename
+- Dark theme UI (Qt Fusion style with custom dark palette)
 
 ---
 
@@ -167,53 +257,71 @@ Ctrl+S saves the .formants file. On opening a WAV file, FormantStudio checks for
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Open WAV files | ✅ COMPLETE | Also supports AIFF, MP3 |
-| Spectrogram display (Praat engine) | ✅ COMPLETE | Greyscale (`gray_r`), bilinear interpolation, ≤10s view limit |
-| Waveform display | ✅ COMPLETE | Amplitude waveform above spectrogram |
-| Dynamic range / brightness sliders | ✅ COMPLETE | Real-time update |
-| Pre-emphasis control | ✅ COMPLETE | Affects formant re-analysis |
-| Max frequency control | ✅ COMPLETE | Recomputes spectrogram |
-| Spectrogram window length slider | ✅ COMPLETE | Adjustable analysis window |
-| Formant analysis (Praat Burg method) | ✅ COMPLETE | Configurable parameters |
-| Colour-coded formant overlay | ✅ COMPLETE | F1–F5, edited points highlighted |
-| Click-drag formant editing | ✅ COMPLETE | Per-frame overwrite with interpolation |
-| F1–F5 key selection | ✅ COMPLETE | Active only in edit mode |
-| Save .formants file (Ctrl+S) | ✅ COMPLETE | JSON format, alongside WAV |
-| Load .formants file (Ctrl+L / auto) | ✅ COMPLETE | Auto-detect on WAV open |
-| Reset edits (per-formant / all) | ✅ COMPLETE | Restores original values, undoable |
-| Re-analyse with changed parameters | ✅ COMPLETE | Button in control panel |
-| Dark theme UI | ✅ COMPLETE | Fusion style + custom palette |
+| Open WAV files | ✅ | Also supports AIFF, MP3 |
+| Spectrogram display (Praat engine) | ✅ | Greyscale, pyqtgraph ImageItem, ≤10s view limit |
+| Waveform display | ✅ | Amplitude waveform above spectrogram with RMS readout |
+| Dynamic range / brightness sliders | ✅ | Real-time update |
+| Pre-emphasis control | ✅ | Affects formant re-analysis |
+| Max frequency control | ✅ | Recomputes spectrogram |
+| Spectrogram window length slider | ✅ | Adjustable analysis window |
+| Formant analysis (Praat Burg method) | ✅ | Configurable parameters |
+| Colour-coded formant overlay | ✅ | F1–F5, edited points highlighted with white edge |
+| Click-drag formant editing | ✅ | Per-frame overwrite with interpolation |
+| F1–F5 key selection | ✅ | Active only in edit mode |
+| Save .formants file (Ctrl+S) | ✅ | JSON format, alongside WAV |
+| Load .formants file (Ctrl+L / auto) | ✅ | Auto-detect on WAV open |
+| Reset edits (per-formant / all) | ✅ | Restores original values, undoable |
+| Re-analyse with changed parameters | ✅ | Button in control panel |
+| Dark theme UI | ✅ | Fusion style + custom palette |
 
 ### 3.2 Milestone 2 — TextGrid Integration & Navigation ✅ COMPLETE
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Display TextGrid tiers below spectrogram | ✅ COMPLETE | IntervalTier + TextTier, batch rendering |
-| Load/save TextGrid files | ✅ COMPLETE | Normal and short format parsing, normal format save |
-| TextGrid boundary editing | ✅ COMPLETE | Add (Enter), delete (Del), drag boundaries |
-| Shift+drag aligned boundaries | ✅ COMPLETE | Multi-tier aligned boundary movement |
-| Interval/point label editing | ✅ COMPLETE | Inline label editor, live update |
-| Create new TextGrid | ✅ COMPLETE | Dialog for creating from scratch |
-| Add tier to existing TextGrid | ✅ COMPLETE | IntervalTier or TextTier |
-| Zoom in/out (time axis) | ✅ COMPLETE | Mouse scroll wheel + Ctrl+I/O |
-| Scroll / pan through audio | ✅ COMPLETE | Scrollbar with ◀/▶ arrow buttons (2/3 window step) |
-| Click-to-play audio selection | ✅ COMPLETE | Tab to play, selection/click/view range |
-| Drag time selection on spectrogram | ✅ COMPLETE | Click-drag in non-edit mode |
-| Crosshair cursor | ✅ COMPLETE | Time/frequency readout in status bar |
-| Boundary lines on spectrogram + waveform | ✅ COMPLETE | Interval (thick) and point (thin) dashed lines |
+| Display TextGrid tiers below spectrogram | ✅ | IntervalTier + TextTier, batch rendering |
+| Load/save TextGrid files | ✅ | Normal and short format parsing, normal format save |
+| TextGrid boundary editing | ✅ | Add (Enter), delete (Del), drag boundaries |
+| Shift+drag aligned boundaries | ✅ | Multi-tier aligned boundary movement |
+| Interval/point label editing | ✅ | Inline label editor, live update |
+| Create new TextGrid | ✅ | Dialog for creating from scratch |
+| Add tier to existing TextGrid | ✅ | IntervalTier or TextTier |
+| Zoom in/out (time axis) | ✅ | Mouse scroll wheel + Ctrl+I/O |
+| Scroll / pan through audio | ✅ | Scrollbar with ◀/▶ arrow buttons (2/3 window step) |
+| Audio playback | ✅ | Tab to play, selection/click/view range, Qt QAudioSink |
+| Drag time selection on spectrogram | ✅ | Click-drag in non-edit mode |
+| Crosshair cursor | ✅ | Time/frequency/RMS readout in status bar |
+| Boundary lines on spectrogram + waveform | ✅ | Interval (thick) and point (thin) dashed lines |
 
-### 3.3 Milestone 3 — Editing Refinements (Current)
+### 3.3 Milestone 3 — Editing Refinements ✅ COMPLETE
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Undo/redo (Ctrl+Z / Ctrl+Y) | ✅ COMPLETE | Command-based, per-frame diffs, 100-entry stack |
-| Frame interpolation during drawing | ✅ COMPLETE | Fills skipped frames with linear interpolation |
-| Eraser tool (right-click drag) | ✅ COMPLETE | Reverts to original Praat values, grey feedback |
-| Interpolate between edited points | ✅ COMPLETE | Button in control panel, respects selection range |
-| Drag-to-adjust existing formant points | 🔲 DEFERRED | Removed due to conflict with freehand draw; needs modifier key |
-| Adjustable formant time resolution | 🔵 FUTURE | Low priority |
+| Undo/redo (Ctrl+Z / Ctrl+Y) | ✅ | Command-based, per-frame diffs, 100-entry stack |
+| Frame interpolation during drawing | ✅ | Fills skipped frames with linear interpolation |
+| Eraser tool (right-click drag) | ✅ | Reverts to original Praat values, grey feedback |
+| Interpolate between edited points | ✅ | Button in control panel, respects selection range |
+| Snap-to-boundary | ✅ | Adjustable tolerance for precise boundary alignment |
+| Boundary deletion with label merge | ✅ | Del key merges labels from both adjacent intervals |
+| Point tier selection and deletion | ✅ | Click to select (bold highlight), Del to remove |
+| Unsaved changes warning | ✅ | Prompts before close/open with unsaved edits |
+| Undo Last Edit button | ✅ | Quick revert in the UI |
 
-### 3.4 Known Issues
+### 3.4 Milestone 4 — Export & Distribution ✅ COMPLETE
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Batch CSV export wizard | ✅ | Tools > Build CSV, multi-file extraction |
+| Percentage-based formant extraction | ✅ | Configurable extraction points within intervals |
+| Absolute time extraction | ✅ | Fixed offsets from interval start |
+| Point tier data in CSV | ✅ | TextTier labels and times included |
+| Phonetic categorisation | ✅ | IPA/SAMPA-based manner/place/voicing/height/backness/rounding |
+| Diphthong detection | ✅ | Automatic classification of diphthongs and vowel combinations |
+| IPA/SAMPA reference chart | ✅ | View menu, tabbed consonant/vowel display with diacritics |
+| PyInstaller packaging (.exe) | ✅ | Windows executable, GitHub release |
+| App icon | ✅ | Custom icon in title bar and Windows taskbar |
+| Filename in title bar | ✅ | Shows currently loaded audio file |
+
+### 3.5 Known Issues
 
 - Parselmouth's Spectrogram object does not expose `get_frequency_from_frequency_bin_number`; resolved by using the `.xs()` and `.ys()` methods instead.
 - The pre-emphasis slider minimum must be 1 Hz (not 0), as Praat's Burg method requires a positive value.
@@ -223,15 +331,15 @@ Ctrl+S saves the .formants file. On opening a WAV file, FormantStudio checks for
 
 ## 4. Roadmap
 
-### 4.1 Milestone 4 — Export & Distribution
+### 4.1 Future Features
 
-| Feature | Status | Priority |
-|---------|--------|----------|
-| Export to Praat Formant object format | 🔵 FUTURE | Medium |
-| Export formant values as CSV | 🔵 FUTURE | Medium |
-| Batch processing (directory of files) | 🔵 FUTURE | Low |
-| PyInstaller packaging (.exe) | 🔵 FUTURE | High |
-| pip-installable package | 🔵 FUTURE | Medium |
+| Feature | Priority | Notes |
+|---------|----------|-------|
+| Export to Praat Formant object format | Medium | Allow round-trip back to Praat |
+| Adjustable formant time resolution | Low | Currently uses Praat's auto time step |
+| Batch processing beyond CSV | Low | Directory-level operations (e.g. batch re-analysis) |
+| pip-installable package | Medium | For non-Windows users |
+| Drag-to-adjust existing formant points | Low | Needs modifier key approach to avoid freehand conflict |
 
 ---
 
@@ -246,8 +354,10 @@ The application is a single Python file (`formant_editor.py`) organised into the
 | FormantData | Data container for formant values (original + edited), with save/load to JSON .formants format, edit tracking via edited_mask, and per-formant reset. |
 | Interval, Point, Tier, TextGrid | TextGrid data model — parsing (normal + short format), serialisation, and in-memory representation. |
 | LabelEdit | Inline QLineEdit for editing interval/point labels with Tab-play and Escape support. |
-| SpectrogramCanvas | Matplotlib FigureCanvas embedded in Qt. Handles spectrogram/waveform/TextGrid rendering, formant overlay, mouse interaction (editing, boundary drag, selection), audio playback with animated cursor, zoom/scroll, crosshair, undo/redo. |
+| SpectrogramCanvas | pyqtgraph-based widget embedded in Qt. Handles spectrogram/waveform/TextGrid rendering, formant overlay, mouse interaction (editing, boundary drag, selection), audio playback with animated cursor, zoom/scroll, crosshair, undo/redo. |
 | ControlPanel | Qt widget containing all sliders, spin boxes, buttons, and the edit mode controls. |
+| BuildCSVWizard | Multi-page QWizard for batch CSV export. Contains sub-pages: _PathsPage, _TierSelectionPage, _DataOptionsPage, _CategorisationPage. |
+| _IPAChartDialog | Tabbed dialog displaying IPA/SAMPA consonant and vowel charts with diacritics. |
 | MainWindow | QMainWindow subclass. Orchestrates file operations, formant analysis, keyboard events, menu bar, signal routing, and scrollbar management. |
 
 ### 5.2 Data Flow
@@ -255,17 +365,25 @@ The application is a single Python file (`formant_editor.py`) organised into the
 1. User opens a WAV file → Parselmouth loads it as a Sound object.
 2. Sound → `to_spectrogram()` → spectrogram data (power values, frequency bins, time bins) for display.
 3. Sound → `to_formant_burg()` → Formant object → extracted into FormantData (NumPy arrays of times and values).
-4. SpectrogramCanvas renders spectrogram via `imshow`, waveform, formant scatter points, and TextGrid tiers using a GridSpec layout with shared x-axis.
+4. SpectrogramCanvas renders spectrogram via pyqtgraph ImageItem, waveform, formant scatter points, and TextGrid tiers using synchronised plot panels with shared x-axis.
 5. Mouse editing writes directly to `FormantData.values` and sets `edited_mask`. Changes are recorded in the undo stack as per-frame diffs.
 6. Save serialises FormantData to JSON; load deserialises and replaces the current FormantData.
-7. TextGrid files are parsed into the Tier/Interval/Point data model, displayed as synchronised axes, and saved back in Praat normal text format.
+7. TextGrid files are parsed into the Tier/Interval/Point data model, displayed as synchronised plot panels, and saved back in Praat normal text format.
+8. Build CSV wizard reads multiple .formants + .TextGrid file pairs, extracts formant values at configured points, optionally classifies labels, and writes a combined CSV.
 
-### 5.3 Key Design Decisions
+### 5.3 Audio Playback Architecture
+
+Audio playback was migrated from sounddevice (PortAudio) to Qt's QAudioSink to resolve reliability issues in the PyInstaller-packaged executable. The PortAudio DLL bundled by PyInstaller defaulted to a high-latency backend (MME/DirectSound), causing short segments to be cut off. QAudioSink uses the platform's native audio stack directly (Windows Media Foundation, CoreAudio, PulseAudio) and is already properly bundled as part of PyQt6.
+
+A ~50 ms silence pad is appended to each playback buffer to ensure the audio sink fully flushes before transitioning to idle state, preventing the tail of short segments from being lost.
+
+### 5.4 Key Design Decisions
 
 - **JSON file format:** Chosen over binary formats for human readability, version control compatibility, and ease of integration with analysis scripts (Python, R). The slight file size increase is negligible for formant data.
 - **5 formant slots always stored:** Even when only F1–F3 are calculated, the data structure holds 5 rows (with NaN for unused formants). This prevents schema changes if the user later increases the analysis to F1–F5.
 - **Separate original_values:** The original Praat-calculated values are stored alongside edited values, enabling per-point reset without re-running the analysis.
-- **Matplotlib for rendering:** While a custom OpenGL canvas could be faster for large files, matplotlib provides well-tested spectrogram rendering, scientific colour maps, and a familiar API. Performance is adequate for typical phonetics files (up to several minutes of audio). `imshow` with bilinear interpolation is used instead of `pcolormesh` (Gouraud shading was too slow for large spectrograms). Blitting is used for responsive mouse interactions (drawing, boundary drag, selection, crosshair).
+- **pyqtgraph for rendering:** Migrated from matplotlib to pyqtgraph for significantly improved rendering performance. pyqtgraph's ScatterPlotItem and ImageItem provide hardware-accelerated rendering with lower overhead for large datasets. The shared-axis ViewBox system enables synchronised zoom/pan across spectrogram, waveform, and TextGrid panels.
+- **Qt QAudioSink for playback:** Replaced sounddevice/PortAudio to eliminate cross-platform bundling issues. Qt's multimedia stack uses native platform audio APIs and is already a dependency via PyQt6.
 
 ---
 
@@ -420,8 +538,11 @@ These tests exercise the full pipeline from audio to saved file and back.
 | `test_pipeline_edit_then_reanalyse` | After editing, re-analysing replaces FormantData with fresh Praat values (edits are lost, as expected) |
 | `test_pipeline_save_location_matches_wav` | Saving formants for `/path/to/recording.wav` creates `/path/to/recording.formants` |
 | `test_pipeline_auto_detect_formants_file` | If `recording.formants` exists when `recording.wav` is opened, it is detected |
-| `test_pipeline_time_alignment_with_textgrid` | Formant frame times can be used to extract values within TextGrid interval boundaries (using textgrid library to parse a test TextGrid) |
+| `test_pipeline_time_alignment_with_textgrid` | Formant frame times can be used to extract values within TextGrid interval boundaries |
 | `test_pipeline_large_file_performance` | A 5-minute audio file completes analysis in under 10 seconds |
+| `test_csv_export_basic` | Build CSV produces valid CSV with correct column headers |
+| `test_csv_export_percentage_mode` | Percentage extraction points produce values at correct time offsets |
+| `test_csv_export_categorisation` | Phonetic categorisation columns are populated correctly for known labels |
 
 ### 6.7 GUI Tests
 
@@ -452,7 +573,7 @@ GUI tests use `pytest-qt` and operate on the actual Qt widgets with simulated ev
 
 #### 6.7.3 Mouse Editing
 
-These tests simulate mouse events on the matplotlib canvas. They require a loaded audio file.
+These tests simulate mouse events on the canvas. They require a loaded audio file.
 
 | Test | Assertion |
 |------|-----------|
@@ -472,6 +593,9 @@ These tests are added as bugs are discovered and fixed, to prevent recurrence.
 | `test_pre_emphasis_minimum_1` | Bug: Pre-emphasis of 0 crashes Praat | Pre-emphasis value passed to Praat is always ≥ 1.0 |
 | `test_time_step_none_not_zero` | Bug: `time_step=0.0` rejected by Parselmouth | Auto time step passes `None`, not `0.0` |
 | `test_n_formants_is_float` | Bug: Parselmouth expects float for max_number_of_formants | The value passed is `float(n_formants)` |
+| `test_boundary_delete_merges_labels` | Bug: Boundary deletion lost one interval's label | Del key merges labels from both adjacent intervals |
+| `test_point_tier_delete` | Bug: Del key didn't work on TextTier points | Point selection persists after mouse release; Del removes selected point |
+| `test_short_segment_playback` | Bug: Short audio segments cut off in exe | QAudioSink with silence padding plays full segment |
 
 ### 6.9 Test Execution
 
@@ -498,6 +622,7 @@ QT_QPA_PLATFORM=offscreen pytest tests/ -v -k "gui"
 | FormantData | 100% | Core data structure; every code path must be verified |
 | extract_formants_from_praat | 95%+ | Critical analysis pipeline; edge cases may be hard to trigger |
 | SpectrogramCanvas (data logic) | 90%+ | Rendering code is hard to test, but data manipulation should be covered |
+| BuildCSVWizard | 85%+ | Data extraction logic must be correct; wizard UI less critical |
 | ControlPanel | 80%+ | Widget wiring; some visual-only code excluded |
 | MainWindow | 80%+ | Orchestration logic; file dialogs are mocked |
 

@@ -1834,7 +1834,7 @@ class SpectrogramCanvas(QWidget):
             if np.any(unedited_mask):
                 sc = pg.ScatterPlotItem(
                     x=fd.times[unedited_mask], y=vals[unedited_mask],
-                    size=2, pen=pg.mkPen(None),
+                    size=3, pen=pg.mkPen(None),
                     brush=pg.mkBrush(qcolor.red(), qcolor.green(), qcolor.blue(), 180),
                 )
                 self._spec_plot.addItem(sc)
