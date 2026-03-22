@@ -461,10 +461,16 @@ def extract_formants_from_praat(sound, n_formants=5, max_formant=5500.0,
                                  pre_emphasis=50.0):
     """
     Run Praat's Burg formant analysis and return a FormantData object.
+
+    Always requests 5 formants from Praat so that all tracks are available
+    for display regardless of the current dropdown setting.  The *n_formants*
+    parameter is accepted for backwards compatibility but ignored — the
+    display_n_formants attribute on SpectrogramCanvas controls how many
+    tracks are rendered.
     """
     formant_obj = sound.to_formant_burg(
         time_step=time_step if time_step > 0 else None,
-        max_number_of_formants=float(n_formants),
+        max_number_of_formants=5.0,
         maximum_formant=max_formant,
         window_length=window_length,
         pre_emphasis_from=max(pre_emphasis, 1.0),
@@ -480,7 +486,7 @@ def extract_formants_from_praat(sound, n_formants=5, max_formant=5500.0,
         actual_time_step = window_length * 0.25  # Praat default
 
     values = np.full((5, n_frames), np.nan)  # Always store 5 slots
-    for f_idx in range(n_formants):
+    for f_idx in range(5):
         for t_idx in range(n_frames):
             try:
                 val = formant_obj.get_value_at_time(f_idx + 1, times[t_idx])
@@ -1602,6 +1608,15 @@ class SpectrogramCanvas(QWidget):
         self._draw_spectrogram()
         if self._wave_plot is not None:
             self._draw_waveform()
+
+        # Remove old formant scatters (must happen even when hiding formants)
+        for key, sc in self._formant_scatters.items():
+            try:
+                self._spec_plot.removeItem(sc)
+            except Exception:
+                pass
+        self._formant_scatters = {}
+
         if self.show_formants and self.formant_data is not None:
             self._draw_formants()
         if self.textgrid_data is not None and len(self._tier_plots) > 0:
@@ -1804,13 +1819,7 @@ class SpectrogramCanvas(QWidget):
 
     def _draw_formants(self):
         """Draw formant overlay on the spectrogram."""
-        # Remove old formant scatters
-        for key, sc in self._formant_scatters.items():
-            try:
-                self._spec_plot.removeItem(sc)
-            except Exception:
-                pass
-        self._formant_scatters = {}
+        # Old scatters already removed by render() before this call
 
         fd = self.formant_data
         t_mask = ((fd.times >= self.view_start) & (fd.times <= self.view_end))
@@ -3097,6 +3106,27 @@ class SpectrogramCanvas(QWidget):
 
 
 
+# ---------------------------------------------------------------------------
+# Jump-to-click slider
+# ---------------------------------------------------------------------------
+
+class _JumpSlider(QSlider):
+    """QSlider subclass that jumps directly to the clicked position."""
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            # Calculate the value at the click position
+            opt_width = self.width()
+            click_x = event.position().x()
+            val = self.minimum() + (self.maximum() - self.minimum()) * click_x / opt_width
+            val = max(self.minimum(), min(self.maximum(), round(val)))
+            self.setValue(int(val))
+            event.accept()
+            self.sliderReleased.emit()
+        else:
+            super().mousePressEvent(event)
+
+
 # Control Panel (sliders, settings)
 # ---------------------------------------------------------------------------
 
@@ -3264,6 +3294,11 @@ class ControlPanel(QWidget):
 
         # Interpolate button
         self.interpolate_btn = QPushButton("Interpolate Between Points")
+        self.interpolate_btn.setToolTip(
+            "Fill unedited gaps between sparse edited points with a linear ramp.\n"
+            "Click individual frames (don't draw) to place anchor points,\n"
+            "then press this button to connect them smoothly."
+        )
         edit_layout.addWidget(self.interpolate_btn)
 
         layout.addWidget(edit_group)
@@ -3300,9 +3335,10 @@ class ControlPanel(QWidget):
     def _make_slider(self, label_text, min_val, max_val, default, parent_layout):
         lbl = QLabel(f"{label_text}: {default}")
         parent_layout.addWidget(lbl)
-        slider = QSlider(Qt.Orientation.Horizontal)
+        slider = _JumpSlider(Qt.Orientation.Horizontal)
         slider.setRange(min_val, max_val)
         slider.setValue(default)
+        slider.setPageStep(1)
         slider.valueChanged.connect(lambda v, l=lbl, t=label_text: l.setText(f"{t}: {v}"))
         parent_layout.addWidget(slider)
         return slider
@@ -5151,19 +5187,41 @@ class MainWindow(QMainWindow):
                 return
 
         # Enter/Return — add boundary at hover (or click) position on active tier
+        # If a selection region exists, create boundaries at both ends.
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if not self.label_edit.hasFocus():
                 c = self.canvas
-                boundary_time = c._hover_time or c._click_time
-                if (c._active_tier is not None and boundary_time is not None
+                if (c._active_tier is not None
                         and c.textgrid_data is not None):
-                    if c._add_boundary(c._active_tier, boundary_time):
-                        self._textgrid_dirty = True
-                        c._select_interval(c._active_tier, boundary_time)
-                        c.render()
-                        self.status.showMessage("Boundary added")
+                    # Selection region → two boundaries
+                    if (c._selection_start is not None
+                            and c._selection_end is not None
+                            and c._selection_start != c._selection_end):
+                        added = 0
+                        for bt in (c._selection_start, c._selection_end):
+                            if c._add_boundary(c._active_tier, bt):
+                                added += 1
+                        if added:
+                            self._textgrid_dirty = True
+                            mid = (c._selection_start + c._selection_end) / 2
+                            c._select_interval(c._active_tier, mid)
+                            c.render()
+                            self.status.showMessage(
+                                f"{added} boundar{'ies' if added > 1 else 'y'} added"
+                            )
+                        else:
+                            self.status.showMessage("Cannot add boundaries here")
                     else:
-                        self.status.showMessage("Cannot add boundary here")
+                        # Single cursor position
+                        boundary_time = c._hover_time or c._click_time
+                        if boundary_time is not None:
+                            if c._add_boundary(c._active_tier, boundary_time):
+                                self._textgrid_dirty = True
+                                c._select_interval(c._active_tier, boundary_time)
+                                c.render()
+                                self.status.showMessage("Boundary added")
+                            else:
+                                self.status.showMessage("Cannot add boundary here")
                 event.accept()
                 return
 
@@ -5864,7 +5922,8 @@ class MainWindow(QMainWindow):
                 f"Interpolated {count} frames for {fn}")
         else:
             self.status.showMessage(
-                "Need at least 2 edited points to interpolate")
+                "No gaps to fill — interpolation connects sparse edited "
+                "points (click individual frames, don't draw strokes)")
 
     def _undo_last_edit(self):
         """Undo last formant edit via button click."""
