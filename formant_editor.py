@@ -30,7 +30,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QSizePolicy, QScrollBar, QLineEdit, QDialog,
     QDialogButtonBox, QFormLayout, QGridLayout,
     QWizard, QWizardPage, QProgressDialog, QListWidget, QListWidgetItem,
-    QRadioButton, QButtonGroup, QTabWidget, QScrollArea
+    QRadioButton, QButtonGroup, QTabWidget, QScrollArea, QInputDialog
 )
 from PyQt6.QtCore import Qt, QTimer, QEvent, QObject, pyqtSignal, QByteArray, QBuffer, QIODevice
 from PyQt6.QtMultimedia import QAudioSink, QAudioFormat
@@ -4883,6 +4883,10 @@ class MainWindow(QMainWindow):
         add_tier_action.triggered.connect(self._add_tier_to_textgrid)
         file_menu.addAction(add_tier_action)
 
+        delete_tier_action = QAction("&Delete Tier...", self)
+        delete_tier_action.triggered.connect(self._delete_tier_from_textgrid)
+        file_menu.addAction(delete_tier_action)
+
         file_menu.addSeparator()
 
         save_tg_action = QAction("Save Text&Grid", self)
@@ -5778,6 +5782,67 @@ class MainWindow(QMainWindow):
             self.canvas._setup_axes()
             self.canvas.render()
             self.status.showMessage(f"Added tier \"{new_tier.name}\"")
+
+    def _delete_tier_from_textgrid(self):
+        """Show a tier selection dialog and delete the chosen tier."""
+        tg = self.canvas.textgrid_data
+        if tg is None:
+            self.status.showMessage("No TextGrid loaded")
+            return
+        if len(tg.tiers) == 0:
+            self.status.showMessage("TextGrid has no tiers to delete")
+            return
+
+        # Build list of tier names for selection
+        tier_names = [f"{i + 1}. {t.name}" for i, t in enumerate(tg.tiers)]
+        choice, ok = QInputDialog.getItem(
+            self, "Delete Tier", "Select tier to delete:",
+            tier_names, 0, False
+        )
+        if not ok:
+            return
+
+        tier_idx = tier_names.index(choice)
+        tier_name = tg.tiers[tier_idx].name
+
+        # Confirmation
+        reply = QMessageBox.warning(
+            self, "Delete Tier",
+            f"This will delete tier \"{tier_name}\" and all its boundaries, "
+            f"intervals, and labels.\n\nAre you sure?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Remove the tier
+        tg.tiers.pop(tier_idx)
+        self._textgrid_dirty = True
+
+        # Adjust active tier
+        if self.canvas._active_tier is not None:
+            if tier_idx == self.canvas._active_tier:
+                self.canvas._active_tier = 0 if len(tg.tiers) > 0 else None
+            elif tier_idx < self.canvas._active_tier:
+                self.canvas._active_tier -= 1
+
+        # Shift hidden tier indices
+        new_hidden = set()
+        for h in self.canvas.hidden_tiers:
+            if h == tier_idx:
+                continue  # removed tier
+            new_hidden.add(h - 1 if h > tier_idx else h)
+        self.canvas.hidden_tiers = new_hidden
+
+        # Clear any selection referencing the deleted tier
+        self.canvas._selected_boundary = None
+        self.canvas._selected_interval = None
+
+        self._setup_tier_checkboxes()
+        self.canvas._setup_axes()
+        self.canvas.render()
+        self.status.showMessage(f"Deleted tier \"{tier_name}\"")
 
     # -------------------------------------------------------------------
     # Formant analysis
