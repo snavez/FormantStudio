@@ -5092,13 +5092,18 @@ class MainWindow(QMainWindow):
             if self.canvas.edit_mode:
                 f_idx = key - Qt.Key.Key_F1  # 0-indexed
                 n_display = self.controls.num_formants_combo.currentData()
-                if f_idx < n_display:
-                    self.canvas.active_formant = f_idx
-                    self.controls.update_active_formant_display(f_idx)
-                    self.canvas.render()
-                    self.status.showMessage(
-                        f"Now editing {FORMANT_LABELS[f_idx + 1]}"
-                    )
+                # Auto-expand display range if needed
+                if f_idx >= n_display:
+                    new_n = f_idx + 1
+                    combo_idx = new_n - 1  # combo entries: 0→F1, 1→F1-F2, ...
+                    self.controls.num_formants_combo.setCurrentIndex(combo_idx)
+                    # Signal fires _on_num_formants_display_changed automatically
+                self.canvas.active_formant = f_idx
+                self.controls.update_active_formant_display(f_idx)
+                self.canvas.render()
+                self.status.showMessage(
+                    f"Now editing {FORMANT_LABELS[f_idx + 1]}"
+                )
                 event.accept()
                 return
 
