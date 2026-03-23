@@ -26,7 +26,6 @@ Praat's automatic formant tracking is excellent but not infallible — particula
 - **Click-and-drag drawing**: Enter edit mode, select a formant (F1–F5 keys), draw corrections
 - **Frame interpolation**: Fast mouse movement fills skipped frames automatically
 - **Eraser tool**: Right-click drag reverts points to original Praat values
-- **Interpolate between points**: Fills gaps between edited points with linear ramp
 - **Undo/redo**: Ctrl+Z / Ctrl+Y (100-step history)
 - **Unsaved changes warning**: Prompts before closing or opening a new file with unsaved edits
 - **Reset**: Per-formant or all-formant reset (undoable)
