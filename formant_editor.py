@@ -5735,11 +5735,10 @@ class MainWindow(QMainWindow):
         if tg is not None:
             self.canvas.textgrid_data = tg
             self._textgrid_dirty = True
-            tier_names = [t.name for t in tg.tiers]
-            self.controls.populate_tier_checkboxes(tier_names, set())
-            self.canvas._rebuild_tier_plots()
+            self._setup_tier_checkboxes()
+            self.canvas._setup_axes()
             self.canvas.render()
-            tier_desc = ", ".join(tier_names)
+            tier_desc = ", ".join(t.name for t in tg.tiers)
             self.status.showMessage(
                 f"Created TextGrid "
                 f"({len(tg.tiers)} tier{'s' if len(tg.tiers) != 1 else ''}: {tier_desc})"
