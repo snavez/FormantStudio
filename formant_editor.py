@@ -4846,30 +4846,38 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self.open_file)
         file_menu.addAction(open_action)
 
-        save_action = QAction("&Save Formants", self)
-        save_action.setShortcut(QKeySequence("Ctrl+S"))
-        save_action.triggered.connect(self.save_formants)
-        file_menu.addAction(save_action)
-
-        load_fmt_action = QAction("&Load Formants...", self)
-        load_fmt_action.setShortcut(QKeySequence("Ctrl+L"))
-        load_fmt_action.triggered.connect(self.load_formants)
-        file_menu.addAction(load_fmt_action)
+        file_menu.addSeparator()
 
         load_tg_action = QAction("Load &TextGrid...", self)
         load_tg_action.setShortcut(QKeySequence("Ctrl+T"))
         load_tg_action.triggered.connect(lambda: self.load_textgrid())
         file_menu.addAction(load_tg_action)
 
-        save_tg_action = QAction("Save Text&Grid", self)
-        save_tg_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
-        save_tg_action.triggered.connect(self.save_textgrid)
-        file_menu.addAction(save_tg_action)
+        load_fmt_action = QAction("&Load Formants...", self)
+        load_fmt_action.setShortcut(QKeySequence("Ctrl+L"))
+        load_fmt_action.triggered.connect(self.load_formants)
+        file_menu.addAction(load_fmt_action)
+
+        create_tg_action = QAction("&Create TextGrid...", self)
+        create_tg_action.triggered.connect(self._create_textgrid_from_menu)
+        file_menu.addAction(create_tg_action)
 
         add_tier_action = QAction("Add &Tier...", self)
         add_tier_action.setShortcut(QKeySequence("Ctrl+Shift+T"))
         add_tier_action.triggered.connect(self._add_tier_to_textgrid)
         file_menu.addAction(add_tier_action)
+
+        file_menu.addSeparator()
+
+        save_tg_action = QAction("Save Text&Grid", self)
+        save_tg_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        save_tg_action.triggered.connect(self.save_textgrid)
+        file_menu.addAction(save_tg_action)
+
+        save_action = QAction("&Save Formants", self)
+        save_action.setShortcut(QKeySequence("Ctrl+S"))
+        save_action.triggered.connect(self.save_formants)
+        file_menu.addAction(save_action)
 
         file_menu.addSeparator()
 
@@ -5697,6 +5705,25 @@ class MainWindow(QMainWindow):
                 )
         elif clicked is btn_load:
             self.load_textgrid()
+
+    def _create_textgrid_from_menu(self):
+        """File > Create TextGrid — show the creation dialog and apply."""
+        if self.canvas.sound is None:
+            self.status.showMessage("Open a WAV file first")
+            return
+        tg = self._create_textgrid_from_dialog()
+        if tg is not None:
+            self.canvas.textgrid_data = tg
+            self._textgrid_dirty = True
+            tier_names = [t.name for t in tg.tiers]
+            self.controls.populate_tier_checkboxes(tier_names, set())
+            self.canvas._rebuild_tier_plots()
+            self.canvas.render()
+            tier_desc = ", ".join(tier_names)
+            self.status.showMessage(
+                f"Created TextGrid "
+                f"({len(tg.tiers)} tier{'s' if len(tg.tiers) != 1 else ''}: {tier_desc})"
+            )
 
     def _create_textgrid_from_dialog(self):
         """Show CreateTextGridDialog and return a TextGrid or None."""
