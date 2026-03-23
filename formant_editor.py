@@ -3179,6 +3179,14 @@ class ControlPanel(QWidget):
         freq_row.addWidget(self.max_freq_spin)
         spec_layout.addLayout(freq_row)
 
+        self.spec_defaults_btn = QPushButton("Reset to Defaults")
+        self.spec_defaults_btn.setToolTip(
+            f"Dynamic Range: {int(DEFAULT_DYNAMIC_RANGE)} dB, Brightness: 0, "
+            f"Window: {int(DEFAULT_SPEC_WINDOW * 1000)} ms, "
+            f"Max Freq: {int(DEFAULT_SPEC_MAX_FREQ)} Hz"
+        )
+        spec_layout.addWidget(self.spec_defaults_btn)
+
         layout.addWidget(spec_group)
 
         # --- Formant Settings ---
@@ -3224,6 +3232,14 @@ class ControlPanel(QWidget):
         # Re-analyse button
         self.reanalyse_btn = QPushButton("Re-analyse Formants")
         fmt_layout.addWidget(self.reanalyse_btn)
+
+        self.fmt_defaults_btn = QPushButton("Reset to Defaults")
+        self.fmt_defaults_btn.setToolTip(
+            f"Max Formant: {int(MAX_FORMANT_HZ)} Hz, "
+            f"Window: {DEFAULT_WINDOW_LENGTH} s, "
+            f"Pre-emphasis: {int(DEFAULT_PRE_EMPHASIS)} Hz"
+        )
+        fmt_layout.addWidget(self.fmt_defaults_btn)
 
         # Show/hide formants
         self.show_formants_cb = QCheckBox("Show formants")
@@ -4999,7 +5015,11 @@ class MainWindow(QMainWindow):
 
         # Formant settings
         ctrl.reanalyse_btn.clicked.connect(self._reanalyse_formants)
+        ctrl.fmt_defaults_btn.clicked.connect(self._reset_formant_defaults)
         ctrl.show_formants_cb.toggled.connect(self._on_show_formants_toggled)
+
+        # Spectrogram defaults
+        ctrl.spec_defaults_btn.clicked.connect(self._reset_spec_defaults)
 
         # Edit mode
         ctrl.edit_btn.toggled.connect(self._on_edit_toggled)
@@ -5877,6 +5897,33 @@ class MainWindow(QMainWindow):
     def _on_show_formants_toggled(self, checked):
         self.canvas.show_formants = checked
         self.canvas.render()
+
+    def _reset_spec_defaults(self):
+        """Reset Spectrogram Display settings to defaults."""
+        ctrl = self.controls
+        ctrl.dynamic_range_slider.setValue(int(DEFAULT_DYNAMIC_RANGE))
+        ctrl.brightness_slider.setValue(0)
+        ctrl.spec_window_slider.setValue(int(DEFAULT_SPEC_WINDOW * 1000))
+        ctrl.max_freq_spin.setValue(DEFAULT_SPEC_MAX_FREQ)
+        # Apply the window change (needs recompute)
+        self.canvas.spec_window_length = DEFAULT_SPEC_WINDOW
+        if self.canvas.sound is not None:
+            self.canvas._compute_spectrogram()
+            self.canvas.render()
+        self.status.showMessage("Spectrogram display reset to defaults")
+
+    def _reset_formant_defaults(self):
+        """Reset Formant Analysis settings to defaults and re-analyse."""
+        ctrl = self.controls
+        ctrl.max_formant_spin.setValue(MAX_FORMANT_HZ)
+        ctrl.window_length_spin.setValue(DEFAULT_WINDOW_LENGTH)
+        ctrl.contrast_slider.setValue(int(DEFAULT_PRE_EMPHASIS))
+        if self.canvas.sound is not None:
+            self.status.showMessage("Re-analysing formants (defaults restored)...")
+            QApplication.processEvents()
+            self._run_formant_analysis()
+            self.canvas.render()
+        self.status.showMessage("Formant analysis reset to defaults")
 
     def _on_preemphasis_changed(self):
         """Pre-emphasis slider released — re-analyse formants."""
