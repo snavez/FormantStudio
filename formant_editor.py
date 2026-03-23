@@ -1152,9 +1152,10 @@ class LabelEdit(QLineEdit):
             self.clearFocus()
             event.accept()
             return
-        # Delete key with empty label or no selection: clear focus and let
-        # the main window handle it (e.g. delete a TextTier point).
-        if key == Qt.Key.Key_Delete and not self.text():
+        # Delete key always clears focus and lets the main window handle it
+        # (e.g. delete a TextTier point or boundary).  Use Backspace for
+        # removing characters from the label text.
+        if key == Qt.Key.Key_Delete:
             self.clearFocus()
             event.ignore()
             return
@@ -2409,7 +2410,15 @@ class SpectrogramCanvas(QWidget):
             self._select_interval(tier_idx, time)
             if self._label_edit is not None:
                 self._label_edit.setFocus()
-                self._label_edit.selectAll()
+                # For point tiers, place cursor at end so Delete key
+                # can remove the point; for intervals, select all for
+                # easy text replacement.
+                tier = self.textgrid_data.tiers[tier_idx]
+                if tier.tier_class == "TextTier":
+                    self._label_edit.deselect()
+                    self._label_edit.setCursorPosition(len(self._label_edit.text()))
+                else:
+                    self._label_edit.selectAll()
             if old_active != tier_idx:
                 self.render()
             else:
@@ -2502,6 +2511,11 @@ class SpectrogramCanvas(QWidget):
                 # Give focus to label edit so user can type immediately
                 if self._label_edit is not None and self._label_edit.isEnabled():
                     self._label_edit.setFocus()
+                    tier = self.textgrid_data.tiers[tier_idx]
+                    if tier.tier_class == "TextTier":
+                        self._label_edit.deselect()
+                        self._label_edit.setCursorPosition(
+                            len(self._label_edit.text()))
                 if old_active != tier_idx:
                     self.render()
                 else:
@@ -3319,17 +3333,24 @@ class ControlPanel(QWidget):
 # ---------------------------------------------------------------------------
 
 class _TabPlayFilter(QObject):
-    """Application event filter: intercepts Tab for audio playback."""
+    """Application event filter: intercepts Tab for audio playback
+    and F4 for formant selection (F4 is otherwise consumed by combo boxes)."""
 
     def __init__(self, main_window):
         super().__init__(main_window)
         self._mw = main_window
 
     def eventFilter(self, obj, event):
-        if (event.type() == QEvent.Type.KeyPress
-                and event.key() == Qt.Key.Key_Tab
-                and self._mw.isActiveWindow()):
+        if event.type() != QEvent.Type.KeyPress or not self._mw.isActiveWindow():
+            return False
+        key = event.key()
+        if key == Qt.Key.Key_Tab:
             self._mw._play_selection()
+            return True
+        # F4 is a Windows combo-box shortcut; intercept it so our
+        # keyPressEvent can route it to formant selection in edit mode.
+        if key == Qt.Key.Key_F4 and self._mw.canvas.edit_mode:
+            self._mw.keyPressEvent(event)
             return True
         return False
 
