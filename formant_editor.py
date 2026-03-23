@@ -2665,6 +2665,13 @@ class SpectrogramCanvas(QWidget):
                 # Re-select the moved point so _selected_interval is up
                 # to date with the (possibly dragged) new time.
                 self._select_interval(self._drag_tier_index, final_time)
+                # Focus the label edit with cursor at end so user can
+                # edit text (Backspace) or delete the point (Delete).
+                if self._label_edit is not None and self._label_edit.isEnabled():
+                    self._label_edit.setFocus()
+                    self._label_edit.deselect()
+                    self._label_edit.setCursorPosition(
+                        len(self._label_edit.text()))
             else:
                 self._selected_boundary = (self._drag_tier_index, final_time)
             if self._on_textgrid_edited is not None:
@@ -3076,20 +3083,25 @@ class SpectrogramCanvas(QWidget):
 # ---------------------------------------------------------------------------
 
 class _JumpSlider(QSlider):
-    """QSlider subclass that jumps directly to the clicked position."""
+    """QSlider subclass that jumps directly to the clicked position.
+
+    On click anywhere on the groove, the handle jumps to that position
+    and then normal drag behaviour continues (so the user can fine-tune
+    by holding and dragging after the initial jump).
+    """
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            # Calculate the value at the click position
+            # Jump the handle to the click position
             opt_width = self.width()
             click_x = event.position().x()
             val = self.minimum() + (self.maximum() - self.minimum()) * click_x / opt_width
             val = max(self.minimum(), min(self.maximum(), round(val)))
             self.setValue(int(val))
-            event.accept()
+            # Emit sliderReleased so the spectrogram recomputes
             self.sliderReleased.emit()
-        else:
-            super().mousePressEvent(event)
+        # Always call super so Qt starts handle tracking for drag
+        super().mousePressEvent(event)
 
 
 # Control Panel (sliders, settings)
@@ -5053,12 +5065,13 @@ class MainWindow(QMainWindow):
             if self.canvas.edit_mode:
                 f_idx = key - Qt.Key.Key_F1  # 0-indexed
                 n_display = self.controls.num_formants_combo.currentData()
-                # Auto-expand display range if needed
                 if f_idx >= n_display:
-                    new_n = f_idx + 1
-                    combo_idx = new_n - 1  # combo entries: 0→F1, 1→F1-F2, ...
-                    self.controls.num_formants_combo.setCurrentIndex(combo_idx)
-                    # Signal fires _on_num_formants_display_changed automatically
+                    self.status.showMessage(
+                        f"{FORMANT_LABELS[f_idx + 1]} not visible — "
+                        f"increase Show Formants to F1–F{f_idx + 1} first"
+                    )
+                    event.accept()
+                    return
                 self.canvas.active_formant = f_idx
                 self.controls.update_active_formant_display(f_idx)
                 self.canvas.render()
