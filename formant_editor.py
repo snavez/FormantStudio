@@ -5230,6 +5230,15 @@ class MainWindow(QMainWindow):
                                 self._textgrid_dirty = True
                                 c._select_interval(c._active_tier, boundary_time)
                                 c.render()
+                                # Auto-focus label edit so user can type immediately
+                                if (c._label_edit is not None
+                                        and c._label_edit.isEnabled()):
+                                    c._label_edit.setFocus()
+                                    tier = c.textgrid_data.tiers[c._active_tier]
+                                    if tier.tier_class == "TextTier":
+                                        c._label_edit.deselect()
+                                        c._label_edit.setCursorPosition(
+                                            len(c._label_edit.text()))
                                 self.status.showMessage("Boundary added")
                             else:
                                 self.status.showMessage("Cannot add boundary here")
