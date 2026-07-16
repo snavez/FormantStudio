@@ -690,6 +690,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     duration_tier_names, point_tier_parents=None,
                     progress_callback=None,
                     include_point_times=False,
+                    time_step_ms=None,
                     categorise=False, cat_chart=None,
                     cat_notation="ipa", cat_tier_names=None,
                     cat_vowel_props=None, cat_consonant_props=None,
@@ -700,6 +701,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     *formant_mode* can be ``"at_points"``, ``"for_segments"``, or ``"both"``.
     *point_tier_parents* maps point tier names to their parent interval tier
     name (determined by hierarchy order — the nearest interval tier above).
+    When *time_step_ms* is set, segment formant columns use fixed time offsets
+    (ms from onset) instead of percentage markers.
     When *categorise* is True, classification columns are appended.
     *auto_diphthong_candidates* and *unmatched_labels* are mutable sets
     that collect data for post-processing.
@@ -715,6 +718,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         cat_consonant_props = []
     do_at_points = formant_mode in ("at_points", "both") if extract_formants else False
     do_for_segments = formant_mode in ("for_segments", "both") if extract_formants else False
+    time_mode = time_step_ms is not None and do_for_segments
 
     # Discover audio files
     audio_exts = {".wav", ".aiff", ".mp3"}
@@ -722,6 +726,41 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         f for f in os.listdir(audio_dir)
         if os.path.splitext(f)[1].lower() in audio_exts
     )
+
+    # Pre-scan for max segment duration when using time-based sampling.
+    # This determines how many time-offset columns the CSV needs.
+    time_offsets_ms = []
+    if time_mode:
+        max_dur_s = 0.0
+        for af in audio_files:
+            bn = os.path.splitext(af)[0]
+            tg_path = None
+            for ext in (".TextGrid", ".textgrid"):
+                candidate = os.path.join(textgrid_dir, bn + ext)
+                if os.path.exists(candidate):
+                    tg_path = candidate
+                    break
+            if tg_path is None:
+                continue
+            try:
+                tg = TextGrid.from_file(tg_path)
+            except Exception:
+                continue
+            for tier in tg.tiers:
+                if tier.name == segment_tier_name \
+                        and tier.tier_class == "IntervalTier":
+                    for iv in tier.intervals:
+                        if iv.text.strip():
+                            d = iv.xmax - iv.xmin
+                            if d > max_dur_s:
+                                max_dur_s = d
+                    break
+
+        step_s = time_step_ms / 1000.0
+        t = 0.0
+        while t <= max_dur_s + 1e-9:
+            time_offsets_ms.append(round(t * 1000.0, 4))
+            t += step_s
 
     # --- Build header ---
     headers = ["filename"]
@@ -743,11 +782,18 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             headers.append(f"{pt_suffix}_time")
         headers.extend([f"F1_{pt_suffix}", f"F2_{pt_suffix}", f"F3_{pt_suffix}"])
 
-    # Formant columns — for-segments (F1_P%, F2_P%, F3_P% per percentage)
+    # Formant columns — for-segments
     if do_for_segments:
-        for pct in percentage_markers:
-            pct_s = f"{pct:g}"
-            headers.extend([f"F1_{pct_s}%", f"F2_{pct_s}%", f"F3_{pct_s}%"])
+        if time_mode:
+            for ms in time_offsets_ms:
+                ms_s = f"{ms:g}"
+                headers.extend([f"F1_{ms_s}ms", f"F2_{ms_s}ms",
+                                f"F3_{ms_s}ms"])
+        else:
+            for pct in percentage_markers:
+                pct_s = f"{pct:g}"
+                headers.extend([f"F1_{pct_s}%", f"F2_{pct_s}%",
+                                f"F3_{pct_s}%"])
 
     # Duration columns
     if extract_durations:
@@ -902,6 +948,30 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     cols.append(f"{civ.xmax - civ.xmin:.4f}" if civ else "")
             return cols
 
+        def _segment_formant_cols(iv):
+            """Return formant value cells for one interval's segment sampling."""
+            cols = []
+            dur = iv.xmax - iv.xmin
+            if time_mode:
+                for ms in time_offsets_ms:
+                    offset_s = ms / 1000.0
+                    if offset_s <= dur + 1e-9:
+                        t = iv.xmin + offset_s
+                        f1, f2, f3 = _get_formant_at_time(fd, t)
+                        for v in (f1, f2, f3):
+                            cols.append(
+                                f"{v:.1f}" if not np.isnan(v) else "")
+                    else:
+                        cols.extend(["", "", ""])
+            else:
+                for pct in percentage_markers:
+                    t = iv.xmin + dur * pct / 100.0
+                    f1, f2, f3 = _get_formant_at_time(fd, t)
+                    for v in (f1, f2, f3):
+                        cols.append(
+                            f"{v:.1f}" if not np.isnan(v) else "")
+            return cols
+
         # Helper: categorisation columns for a row (given label_cols already built)
         def _cat_cols(label_cols_list):
             """Return list of categorisation cell values."""
@@ -992,12 +1062,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                         if include_point_times:
                             row.append("")  # empty time
                         row.extend(["", "", ""])  # empty at-point F1/F2/F3
-                        dur = iv.xmax - iv.xmin
-                        for pct in percentage_markers:
-                            t = iv.xmin + dur * pct / 100.0
-                            f1, f2, f3 = _get_formant_at_time(fd, t)
-                            for v in (f1, f2, f3):
-                                row.append(f"{v:.1f}" if not np.isnan(v) else "")
+                        row.extend(_segment_formant_cols(iv))
                         if extract_durations:
                             row.extend(_dur_cols(iv))
                         row.extend(_cat_cols(lc_np))
@@ -1054,14 +1119,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     for v in (f1, f2, f3):
                         row.append(f"{v:.1f}" if not np.isnan(v) else "")
 
-                    # Segment percentage formant values (if also requested)
                     if do_for_segments:
-                        dur = iv.xmax - iv.xmin
-                        for pct in percentage_markers:
-                            t = iv.xmin + dur * pct / 100.0
-                            f1, f2, f3 = _get_formant_at_time(fd, t)
-                            for v in (f1, f2, f3):
-                                row.append(f"{v:.1f}" if not np.isnan(v) else "")
+                        row.extend(_segment_formant_cols(iv))
 
                     if extract_durations:
                         row.extend(_dur_cols(iv))
@@ -1080,14 +1139,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 lc = _label_cols(iv)
                 row = [audio_file] + lc
 
-                # Segment percentage formant values
                 if do_for_segments:
-                    dur = iv.xmax - iv.xmin
-                    for pct in percentage_markers:
-                        t = iv.xmin + dur * pct / 100.0
-                        f1, f2, f3 = _get_formant_at_time(fd, t)
-                        for v in (f1, f2, f3):
-                            row.append(f"{v:.1f}" if not np.isnan(v) else "")
+                    row.extend(_segment_formant_cols(iv))
 
                 if extract_durations:
                     row.extend(_dur_cols(iv))
@@ -3871,8 +3924,8 @@ class _DataOptionsPage(QWizardPage):
         self._pt_time_cb = QCheckBox("Include point times in output")
         fmt_layout.addWidget(self._pt_time_cb)
 
-        # For segments (checkbox, not radio)
-        self._for_segments_cb = QCheckBox("For segments (at percentage markers)")
+        # For segments
+        self._for_segments_cb = QCheckBox("For segments")
         self._for_segments_cb.setChecked(True)
         fmt_layout.addWidget(self._for_segments_cb)
 
@@ -3883,18 +3936,31 @@ class _DataOptionsPage(QWizardPage):
         seg_row.addWidget(self._seg_tier_combo, 1)
         fmt_layout.addLayout(seg_row)
 
-        pct_row = QHBoxLayout()
-        self._pct_label = QLabel("Percentage markers:")
-        pct_row.addWidget(self._pct_label)
-        self._pct_edit = QLineEdit("0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100")
-        pct_row.addWidget(self._pct_edit, 1)
-        fmt_layout.addLayout(pct_row)
+        mode_row = QHBoxLayout()
+        self._sampling_mode_label = QLabel("Sampling mode:")
+        mode_row.addWidget(self._sampling_mode_label)
+        self._sampling_mode_combo = QComboBox()
+        self._sampling_mode_combo.addItems([
+            "Percentage list", "Percentage step", "Time step (ms)",
+        ])
+        mode_row.addWidget(self._sampling_mode_combo, 1)
+        fmt_layout.addLayout(mode_row)
+
+        value_row = QHBoxLayout()
+        self._sampling_value_label = QLabel("Percentage markers:")
+        value_row.addWidget(self._sampling_value_label)
+        self._sampling_value_edit = QLineEdit(
+            "0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100")
+        value_row.addWidget(self._sampling_value_edit, 1)
+        fmt_layout.addLayout(value_row)
 
         layout.addWidget(self._fmt_group)
         self._fmt_group.setVisible(False)
         self._fmt_cb.toggled.connect(self._fmt_group.setVisible)
         self._at_points_cb.toggled.connect(self._update_fmt_ui)
         self._for_segments_cb.toggled.connect(self._update_fmt_ui)
+        self._sampling_mode_combo.currentIndexChanged.connect(
+            self._on_sampling_mode_changed)
 
         # --- Durations ---
         self._dur_cb = QCheckBox("Extract durations")
@@ -3945,9 +4011,27 @@ class _DataOptionsPage(QWizardPage):
             widget.setEnabled(at_pts)
             widget.setStyleSheet("" if at_pts else "color: #555555;")
         for widget in (self._seg_tier_combo, self._seg_label,
-                       self._pct_edit, self._pct_label):
+                       self._sampling_mode_combo, self._sampling_mode_label,
+                       self._sampling_value_edit, self._sampling_value_label):
             widget.setEnabled(for_seg)
             widget.setStyleSheet("" if for_seg else "color: #555555;")
+
+    def _on_sampling_mode_changed(self, _index):
+        mode = self._sampling_mode_combo.currentText()
+        if mode == "Percentage list":
+            self._sampling_value_label.setText("Percentage markers:")
+            self._sampling_value_edit.setPlaceholderText(
+                "e.g. 0, 10, 20, ..., 100")
+            self._sampling_value_edit.setText(
+                "0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100")
+        elif mode == "Percentage step":
+            self._sampling_value_label.setText("Step size (%):")
+            self._sampling_value_edit.setPlaceholderText("e.g. 5")
+            self._sampling_value_edit.setText("10")
+        elif mode == "Time step (ms)":
+            self._sampling_value_label.setText("Step size (ms):")
+            self._sampling_value_edit.setPlaceholderText("e.g. 5")
+            self._sampling_value_edit.setText("5")
 
     def validatePage(self):
         wiz = self.wizard()
@@ -3993,38 +4077,87 @@ class _DataOptionsPage(QWizardPage):
                 wiz.point_tier_name = None
                 wiz.include_point_times = False
 
-            # Segment tier + percentages
+            # Segment tier + sampling
             if for_seg:
                 wiz.segment_tier_name = self._seg_tier_combo.currentText()
                 if not wiz.segment_tier_name:
                     QMessageBox.warning(
                         self, "Error", "No segment tier available.")
                     return False
-                try:
-                    pcts = [float(x.strip())
-                            for x in self._pct_edit.text().split(",")
-                            if x.strip()]
-                    if not pcts:
-                        raise ValueError("empty")
-                    for p in pcts:
-                        if p < 0 or p > 100:
-                            raise ValueError(f"{p} out of range")
-                    wiz.percentage_markers = pcts
-                except ValueError as e:
-                    QMessageBox.warning(
-                        self, "Error",
-                        f"Invalid percentage markers: {e}\n"
-                        "Enter comma-separated numbers 0–100.")
-                    return False
+
+                mode_text = self._sampling_mode_combo.currentText()
+                raw = self._sampling_value_edit.text().strip()
+
+                if mode_text == "Percentage list":
+                    wiz.sampling_mode = "pct_list"
+                    wiz.time_step_ms = None
+                    try:
+                        pcts = [float(x.strip())
+                                for x in raw.split(",") if x.strip()]
+                        if not pcts:
+                            raise ValueError("empty")
+                        for p in pcts:
+                            if p < 0 or p > 100:
+                                raise ValueError(f"{p} out of range")
+                        wiz.percentage_markers = pcts
+                    except ValueError as e:
+                        QMessageBox.warning(
+                            self, "Error",
+                            f"Invalid percentage markers: {e}\n"
+                            "Enter comma-separated numbers 0\u2013100.")
+                        return False
+
+                elif mode_text == "Percentage step":
+                    wiz.sampling_mode = "pct_step"
+                    wiz.time_step_ms = None
+                    try:
+                        step = float(raw)
+                        if step <= 0 or step > 100:
+                            raise ValueError(
+                                "step must be > 0 and \u2264 100")
+                        pcts = []
+                        v = 0.0
+                        while v <= 100.0 + 1e-9:
+                            pcts.append(round(v, 4))
+                            v += step
+                        if pcts[-1] < 100.0:
+                            pcts.append(100.0)
+                        wiz.percentage_markers = pcts
+                    except ValueError as e:
+                        QMessageBox.warning(
+                            self, "Error",
+                            f"Invalid percentage step: {e}\n"
+                            "Enter a number > 0 and \u2264 100.")
+                        return False
+
+                elif mode_text == "Time step (ms)":
+                    wiz.sampling_mode = "time_step"
+                    wiz.percentage_markers = []
+                    try:
+                        step_ms = float(raw)
+                        if step_ms <= 0:
+                            raise ValueError(
+                                "time step must be positive")
+                        wiz.time_step_ms = step_ms
+                    except ValueError as e:
+                        QMessageBox.warning(
+                            self, "Error",
+                            f"Invalid time step: {e}\n"
+                            "Enter a positive number (ms).")
+                        return False
             else:
                 wiz.segment_tier_name = None
+                wiz.sampling_mode = "pct_list"
                 wiz.percentage_markers = []
+                wiz.time_step_ms = None
         else:
             wiz.formant_mode = None
             wiz.point_tier_name = None
             wiz.include_point_times = False
             wiz.segment_tier_name = None
+            wiz.sampling_mode = "pct_list"
             wiz.percentage_markers = []
+            wiz.time_step_ms = None
 
         if wiz.extract_durations:
             dur_names = [name for cb, name in self._dur_checks
@@ -4697,7 +4830,9 @@ class BuildCSVWizard(QWizard):
         self.point_tier_name = None
         self.include_point_times = False
         self.segment_tier_name = None
+        self.sampling_mode = "pct_list"  # "pct_list" | "pct_step" | "time_step"
         self.percentage_markers = []
+        self.time_step_ms = None
         self.extract_durations = False
         self.duration_tier_names = []
 
@@ -5572,6 +5707,7 @@ class MainWindow(QMainWindow):
                 point_tier_parents=wizard.point_tier_parents,
                 progress_callback=on_progress,
                 include_point_times=wizard.include_point_times,
+                time_step_ms=wizard.time_step_ms,
                 categorise=wizard.categorise,
                 cat_chart=cat_chart,
                 cat_notation=wizard.cat_notation,
