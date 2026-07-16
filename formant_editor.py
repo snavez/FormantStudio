@@ -2302,6 +2302,7 @@ class SpectrogramCanvas(QWidget):
                     if self._label_edit is not None:
                         self._label_edit.setEnabled(True)
                         self._label_edit.setText(iv.text)
+                    self._push_selection_status()
                     return True
         elif tier.tier_class == "TextTier":
             threshold = self._time_threshold_for_pixels(10)
@@ -2321,6 +2322,7 @@ class SpectrogramCanvas(QWidget):
                 if self._label_edit is not None:
                     self._label_edit.setEnabled(True)
                     self._label_edit.setText(pt.mark)
+                self._push_selection_status()
                 return True
         return False
 
@@ -2333,6 +2335,42 @@ class SpectrogramCanvas(QWidget):
         if self._label_edit is not None:
             self._label_edit.setEnabled(False)
             self._label_edit.clear()
+
+    def _selection_time_text(self):
+        """Time portion of the status readout for the current selection.
+
+        Returns None when nothing is selected (caller falls back to the
+        cursor position).
+        """
+        if self._selected_interval is not None and self.textgrid_data is not None:
+            tier_idx, item_idx = self._selected_interval
+            if 0 <= tier_idx < len(self.textgrid_data.tiers):
+                tier = self.textgrid_data.tiers[tier_idx]
+                if (tier.tier_class == "TextTier"
+                        and 0 <= item_idx < len(tier.points)):
+                    pt = tier.points[item_idx]
+                    return f"Point: {pt.time:.4f} s"
+                if (tier.tier_class == "IntervalTier"
+                        and 0 <= item_idx < len(tier.intervals)):
+                    iv = tier.intervals[item_idx]
+                    return (f"Start: {iv.xmin:.4f} s  |  "
+                            f"End: {iv.xmax:.4f} s  |  "
+                            f"Duration: {iv.xmax - iv.xmin:.4f} s")
+        if (self._selection_start is not None
+                and self._selection_end is not None
+                and self._selection_end > self._selection_start):
+            return (f"Start: {self._selection_start:.4f} s  |  "
+                    f"End: {self._selection_end:.4f} s  |  "
+                    f"Duration: {self._selection_end - self._selection_start:.4f} s")
+        return None
+
+    def _push_selection_status(self):
+        """Show the current selection's time info in the status bar."""
+        if self._status_callback is None:
+            return
+        text = self._selection_time_text()
+        if text is not None:
+            self._status_callback(text)
 
     # -------------------------------------------------------------------
     # Mouse event coordinate mapping
@@ -2713,6 +2751,7 @@ class SpectrogramCanvas(QWidget):
                     self._selection_end = None
             self._spec_drag_start = None
             self._draw_selection_overlay()
+            self._push_selection_status()
             return
 
         # --- End formant edit stroke ---
@@ -2795,16 +2834,20 @@ class SpectrogramCanvas(QWidget):
             self._hover_time = time
             self._update_crosshair(time, y, on_spectrogram=True)
             if self._status_callback and not self.is_drawing:
+                time_part = (self._selection_time_text()
+                             or f"Time: {time:.4f} s")
                 self._status_callback(
-                    f"Time: {time:.4f} s  |  Frequency: {y:.1f} Hz")
+                    f"{time_part}  |  Frequency: {y:.1f} Hz")
         elif name == 'wave' and time is not None:
             self._hover_time = time
             self._update_crosshair(time, y, on_spectrogram=False)
             if self._status_callback and not self.is_drawing:
                 rms = self._get_rms_at_time(time)
                 rms_db = 20 * np.log10(rms + 1e-20)
+                time_part = (self._selection_time_text()
+                             or f"Time: {time:.4f} s")
                 self._status_callback(
-                    f"Time: {time:.4f} s  |  RMS: {rms:.4f} ({rms_db:.1f} dB)")
+                    f"{time_part}  |  RMS: {rms:.4f} ({rms_db:.1f} dB)")
         elif self._crosshair_visible:
             self._hide_crosshair()
 
