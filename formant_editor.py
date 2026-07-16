@@ -1330,13 +1330,15 @@ class SpectrogramCanvas(QWidget):
         self._tier_style_cache = {}   # tier plot → (name, is_active)
         self._wave_fill = None        # pg.FillBetweenItem for envelope
 
-        # Cached pens/fonts shared across renders
+        # Cached pens/fonts shared across renders.  The spectrogram/waveform
+        # marker pens are translucent SOLID width-1.0 lines: Qt's dash
+        # stroker costs ~30 ms/frame on a few hundred full-height dashed
+        # lines, and any width other than 1.0 skips the raster engine's
+        # hairline fast path — both dominated scroll/zoom paint latency.
         self._tier_boundary_pen = pg.mkPen('#4444aa', width=0.8)
         self._tier_point_pen = pg.mkPen('#cc4400', width=1.0)
-        self._marker_iv_pen = pg.mkPen('#4488ff', width=1.5,
-                                       style=Qt.PenStyle.DashLine)
-        self._marker_pt_pen = pg.mkPen('#ff6622', width=0.7,
-                                       style=Qt.PenStyle.DashLine)
+        self._marker_iv_pen = pg.mkPen((68, 136, 255, 170), width=1.0)
+        self._marker_pt_pen = pg.mkPen((255, 102, 34, 150), width=1.0)
         self._tier_label_font = QFont("Segoe UI", 10, QFont.Weight.Bold)
 
         # Crosshair items
@@ -1439,6 +1441,7 @@ class SpectrogramCanvas(QWidget):
         self._active_tier = None
 
         # Debounce timers
+        self._last_render_time = 0.0
         self._render_timer = QTimer()
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(30)
@@ -1736,6 +1739,19 @@ class SpectrogramCanvas(QWidget):
         """Slot for debounce timers — just calls render()."""
         self.render()
 
+    def request_render(self):
+        """Render now if idle, otherwise debounce.
+
+        The first scroll/zoom event of a gesture repaints immediately
+        (no 30 ms debounce lag); rapid follow-up events coalesce onto
+        the timer as before.
+        """
+        if _time.monotonic() - self._last_render_time > 0.08:
+            self._render_timer.stop()
+            self.render()
+        else:
+            self._render_timer.start()
+
     def render(self):
         """Full re-render of spectrogram + formants + TextGrid tiers."""
         if self._playback_playing:
@@ -1776,6 +1792,8 @@ class SpectrogramCanvas(QWidget):
 
         # Selection/boundary overlays
         self._draw_selection_overlay()
+
+        self._last_render_time = _time.monotonic()
 
     def _clear_transient_items(self):
         """Remove transient items from all plots."""
@@ -1949,6 +1967,18 @@ class SpectrogramCanvas(QWidget):
         i1 = int(np.searchsorted(fd.times, self.view_end, side='right'))
         times = fd.times[i0:i1]
 
+        # Display stride for unedited points: cap at ~2 points per pixel
+        # column.  At wide views tens of thousands of points overlap on
+        # screen; painting them all costs frames without adding detail.
+        # Edited (user-drawn) points are never dropped.
+        vb = self._spec_plot.getViewBox() if self._spec_plot is not None else None
+        width_px = vb.width() if vb is not None else 0
+        n_vis = i1 - i0
+        if width_px > 0 and n_vis > 2 * width_px:
+            stride = int(np.ceil(n_vis / (2.0 * width_px)))
+        else:
+            stride = 1
+
         # Drop scatters for formants beyond the current display count
         for key in [k for k in self._formant_scatters
                     if k[0] >= self.display_n_formants]:
@@ -1967,12 +1997,16 @@ class SpectrogramCanvas(QWidget):
             edited = fd.edited_mask[f_idx][i0:i1]
             valid = ~np.isnan(vals)
 
-            # (kind, mask, size, pen, brush): unedited = small dots,
-            # edited = larger with white edge
-            for kind, mask, size, pen, brush in (
-                ('unedited', valid & ~edited, 3, pg.mkPen(None),
+            unedited_mask = (valid & ~edited)[::stride]
+
+            # (kind, x, y, mask, size, pen, brush): unedited = small dots
+            # (display-strided), edited = larger with white edge (all kept)
+            for kind, x, y, mask, size, pen, brush in (
+                ('unedited', times[::stride], vals[::stride], unedited_mask,
+                 3, pg.mkPen(None),
                  pg.mkBrush(qcolor.red(), qcolor.green(), qcolor.blue(), 180)),
-                ('edited', valid & edited, 4, pg.mkPen('white', width=0.3),
+                ('edited', times, vals, valid & edited,
+                 4, pg.mkPen('white', width=0.3),
                  pg.mkBrush(qcolor.red(), qcolor.green(), qcolor.blue(), 255)),
             ):
                 key = (f_idx, kind)
@@ -1985,24 +2019,47 @@ class SpectrogramCanvas(QWidget):
                     sc = pg.ScatterPlotItem(size=size, pen=pen, brush=brush)
                     self._spec_plot.addItem(sc)
                     self._formant_scatters[key] = sc
-                sc.setData(x=times[mask], y=vals[mask])
+                sc.setData(x=x[mask], y=y[mask])
 
     # -------------------------------------------------------------------
     # TextGrid drawing
     # -------------------------------------------------------------------
 
-    def _set_batched_lines(self, key, plot, pen, times, y0, y1):
+    def _decimate_to_pixels(self, times, plot, px_gap=1.0):
+        """Drop lines closer than *px_gap* pixels apart at the current zoom.
+
+        *times* must be sorted. Painting sub-pixel-spaced lines (especially
+        dashed ones) costs real milliseconds and is invisible on screen.
+        """
+        n = len(times)
+        if n < 2:
+            return times
+        vb = plot.getViewBox()
+        width_px = vb.width() if vb is not None else 0
+        view_width = self.view_width
+        if width_px <= 0 or view_width <= 0 or n <= width_px / px_gap:
+            return times
+        t = np.asarray(times, dtype=float)
+        px = ((t - self.view_start)
+              * (width_px / (view_width * px_gap))).astype(np.int64)
+        keep = np.ones(n, dtype=bool)
+        keep[1:] = px[1:] != px[:-1]  # first line in each pixel bin wins
+        return t[keep]
+
+    def _set_batched_lines(self, key, plot, pen, times, y0, y1, px_gap=1.0):
         """Draw many vertical line segments as ONE PlotDataItem.
 
         Uses connect='pairs' so each (x, y0)-(x, y1) pair is a separate
         segment. The item is persistent (keyed) and updated in place —
-        vastly cheaper than one InfiniteLine per boundary.
+        vastly cheaper than one InfiniteLine per boundary. *times* must be
+        sorted.
         """
         item = self._batched_lines.get(key)
         if item is None:
             item = pg.PlotDataItem(pen=pen, connect='pairs')
             plot.addItem(item)
             self._batched_lines[key] = item
+        times = self._decimate_to_pixels(times, plot, px_gap)
         n = len(times)
         if n == 0:
             item.setData([], [])
@@ -2104,42 +2161,66 @@ class SpectrogramCanvas(QWidget):
                     self._tier_point_scatters[tier_plot] = sc
                 sc.setData(x=times, y=[0.5] * len(times))
 
-                # Labels
-                for pt in vis:
-                    if pt.mark:
-                        labels.append(("  " + pt.mark, pt.time, (0.0, 0.5)))
+                # Labels — LOD: skip marks when points average under ~12 px
+                # apart (they overlap into unreadable text and cost paint),
+                # mirroring the 20 px LOD on interval labels.
+                if (ax_width_px <= 0
+                        or len(times) <= ax_width_px / 12.0):
+                    for pt in vis:
+                        if pt.mark:
+                            labels.append(("  " + pt.mark, pt.time, (0.0, 0.5)))
 
-            # Show labels through a pool of reusable TextItems
+            # Show labels through a pool of reusable TextItems.  setText
+            # re-lays-out the text document and setPos rebuilds transforms,
+            # so both are skipped when unchanged (common while zooming).
             pool = self._tier_text_pools.setdefault(tier_plot, [])
             for i, (text, x, anchor) in enumerate(labels):
                 if i < len(pool):
                     t = pool[i]
-                    t.setText(text)
+                    if t._fs_text != text:
+                        t.setText(text)
+                        t._fs_text = text
                 else:
                     t = pg.TextItem(text, color='#000000', anchor=anchor)
+                    t._fs_text = text
+                    t._fs_pos = None
                     t.setFont(self._tier_label_font)
                     tier_plot.addItem(t)
                     pool.append(t)
-                t.setPos(x, 0.5)
+                if t._fs_pos != x:
+                    t.setPos(x, 0.5)
+                    t._fs_pos = x
                 t.setVisible(True)
             for t in pool[len(labels):]:
                 t.setVisible(False)
+            # Trim a pool that grew far beyond current needs — even hidden
+            # items pay per-paint transform bookkeeping.
+            max_pool = 2 * len(labels) + 16
+            if len(pool) > max_pool:
+                for t in pool[max_pool:]:
+                    try:
+                        tier_plot.removeItem(t)
+                    except Exception:
+                        pass
+                del pool[max_pool:]
 
         # Boundary/point marker lines on spectrogram + waveform (batched)
         b_sorted = sorted(spec_interval_boundaries)
+        pt_sorted = sorted(spec_point_times)
         self._set_batched_lines('spec_iv', self._spec_plot,
                                 self._marker_iv_pen, b_sorted,
-                                0.0, self.max_freq)
+                                0.0, self.max_freq, px_gap=2.5)
         self._set_batched_lines('spec_pt', self._spec_plot,
-                                self._marker_pt_pen, spec_point_times,
-                                0.0, self.max_freq)
+                                self._marker_pt_pen, pt_sorted,
+                                0.0, self.max_freq, px_gap=2.5)
         if self._wave_plot is not None:
             wy0, wy1 = self._wave_plot.viewRange()[1]
             self._set_batched_lines('wave_iv', self._wave_plot,
-                                    self._marker_iv_pen, b_sorted, wy0, wy1)
+                                    self._marker_iv_pen, b_sorted,
+                                    wy0, wy1, px_gap=2.5)
             self._set_batched_lines('wave_pt', self._wave_plot,
-                                    self._marker_pt_pen, spec_point_times,
-                                    wy0, wy1)
+                                    self._marker_pt_pen, pt_sorted,
+                                    wy0, wy1, px_gap=2.5)
 
     # -------------------------------------------------------------------
     # Title
@@ -2581,7 +2662,7 @@ class SpectrogramCanvas(QWidget):
             return
         if self._on_view_changed_callback:
             self._on_view_changed_callback()
-        self._render_timer.start()
+        self.request_render()
 
     # -------------------------------------------------------------------
     # Mouse double click
@@ -6207,7 +6288,7 @@ class MainWindow(QMainWindow):
         new_start = value / 1000.0
         width = c.view_width
         c.set_view(new_start, new_start + width)
-        c._render_timer.start()  # debounced render
+        c.request_render()  # immediate when idle, debounced in bursts
 
     def _scroll_backward(self):
         """Arrow button: scroll backward by 2/3 of visible window."""

@@ -292,7 +292,7 @@ FormantStudio tracks whether formant edits or TextGrid modifications have been m
 | Audio playback | ✅ | Tab to play, selection/click/view range, Qt QAudioSink |
 | Drag time selection on spectrogram | ✅ | Click-drag in non-edit mode |
 | Crosshair cursor | ✅ | Time/frequency/RMS readout in status bar |
-| Boundary lines on spectrogram + waveform | ✅ | Interval (thick) and point (thin) dashed lines |
+| Boundary lines on spectrogram + waveform | ✅ | Interval (blue) and point (orange) translucent hairlines (solid width-1.0; dashed pens and wider strokes bypass Qt's fast paint path and cost ~30 ms/frame) |
 
 ### 3.3 Milestone 3 — Editing Refinements ✅ COMPLETE
 
