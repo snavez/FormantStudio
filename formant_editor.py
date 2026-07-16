@@ -5336,6 +5336,16 @@ class MainWindow(QMainWindow):
         self._formants_path = None
         self._formants_dirty = False
         self._textgrid_dirty = False
+        # Discard any TextGrid from the previously opened file — it does not
+        # match the new audio.  If the user later skips the TextGrid prompt,
+        # no stale tier panes must remain.
+        self.canvas.textgrid_data = None
+        self.canvas.hidden_tiers = set()
+        self.canvas._active_tier = None
+        self.canvas._clear_selection()
+        self.canvas._click_time = None
+        self.canvas._hover_time = None
+        self._setup_tier_checkboxes()
         self.status.showMessage(f"Loading {os.path.basename(filepath)}...")
         QApplication.processEvents()
 
