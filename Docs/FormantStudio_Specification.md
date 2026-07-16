@@ -181,6 +181,8 @@ An animated playback cursor sweeps across the spectrogram during playback to ind
 | Time selection | Click-drag on spectrogram (when not in edit mode) |
 | Crosshair cursor | Displays time/frequency/RMS in the status bar |
 
+The time portion of the status bar readout is selection-aware: a selected point shows its time (`Point: t`), a selected interval or drag selection shows `Start | End | Duration`, and with no selection it falls back to the cursor position. The frequency (spectrogram) or RMS (waveform) of the cursor is appended while hovering.
+
 ### 2.7 Batch CSV Export
 
 The Build CSV wizard (Tools > Build CSV) provides batch extraction of formant values, durations, and optional phonetic categorisation across multiple annotated files.
