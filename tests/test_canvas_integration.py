@@ -178,7 +178,8 @@ class TestTextGridRendering:
         c.render()
         assert len(c._tier_plots) == 2
         assert len(c.tier_axes) == 2
-        assert len(c._transient_items) > 0
+        # Boundary lines are batched into persistent per-plot items
+        assert len(c._batched_lines) > 0
 
     def test_render_with_point_tier(self, canvas_with_sound, point_textgrid):
         c = canvas_with_sound

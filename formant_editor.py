@@ -1278,6 +1278,24 @@ class SpectrogramCanvas(QWidget):
         self._transient_items = []    # items cleared each render
         self._overlay_items = []      # selection/boundary overlay items
 
+        # Persistent TextGrid render items, updated in place each render
+        # (creating/removing hundreds of QGraphicsItems per render is the
+        # main scroll/zoom cost, so lines are batched and text is pooled).
+        self._batched_lines = {}      # key → PlotDataItem ('pairs'-connected)
+        self._tier_point_scatters = {}  # tier plot → ScatterPlotItem
+        self._tier_text_pools = {}    # tier plot → [TextItem, ...]
+        self._tier_style_cache = {}   # tier plot → (name, is_active)
+        self._wave_fill = None        # pg.FillBetweenItem for envelope
+
+        # Cached pens/fonts shared across renders
+        self._tier_boundary_pen = pg.mkPen('#4444aa', width=0.8)
+        self._tier_point_pen = pg.mkPen('#cc4400', width=1.0)
+        self._marker_iv_pen = pg.mkPen('#4488ff', width=1.5,
+                                       style=Qt.PenStyle.DashLine)
+        self._marker_pt_pen = pg.mkPen('#ff6622', width=0.7,
+                                       style=Qt.PenStyle.DashLine)
+        self._tier_label_font = QFont("Segoe UI", 10, QFont.Weight.Bold)
+
         # Crosshair items
         self._crosshair_v = None      # InfiniteLine on spec
         self._crosshair_h = None      # InfiniteLine on spec
@@ -1302,6 +1320,7 @@ class SpectrogramCanvas(QWidget):
         # Data
         self.sound = None
         self.spectrogram_data = None
+        self._spec_db = None        # cached 10*log10(spectrogram_data)
         self.spec_times = None
         self.spec_freqs = None
         self.formant_data = None
@@ -1427,6 +1446,11 @@ class SpectrogramCanvas(QWidget):
         self._tier_plot_indices = []
         self.tier_axes = []
         self.wave_ax = None
+        self._batched_lines = {}
+        self._tier_point_scatters = {}
+        self._tier_text_pools = {}
+        self._tier_style_cache = {}
+        self._wave_fill = None
 
     def _setup_axes(self):
         """Recreate plot layout based on loaded data."""
@@ -1444,6 +1468,11 @@ class SpectrogramCanvas(QWidget):
         self._formant_scatters = {}
         self._transient_items = []
         self._overlay_items = []
+        self._batched_lines = {}
+        self._tier_point_scatters = {}
+        self._tier_text_pools = {}
+        self._tier_style_cache = {}
+        self._wave_fill = None
         self._crosshair_v = None
         self._crosshair_h = None
         self._crosshair_wave_v = None
@@ -1544,6 +1573,25 @@ class SpectrogramCanvas(QWidget):
         self._spec_image.setLookupTable(self._gray_r_lut)
         self._spec_plot.addItem(self._spec_image)
 
+        # Persistent waveform items (updated in place each render)
+        if self._wave_plot is not None:
+            self._wave_line = self._wave_plot.plot(
+                [], [], pen=pg.mkPen('#66ccff', width=0.5))
+            self._wave_fill_pos = pg.PlotDataItem(pen=pg.mkPen(None))
+            self._wave_fill_neg = pg.PlotDataItem(pen=pg.mkPen(None))
+            self._wave_fill = pg.FillBetweenItem(
+                self._wave_fill_pos, self._wave_fill_neg,
+                brush=pg.mkBrush(102, 204, 255, 180))
+            self._wave_plot.addItem(self._wave_fill_pos)
+            self._wave_plot.addItem(self._wave_fill_neg)
+            self._wave_plot.addItem(self._wave_fill)
+            self._wave_zero = pg.InfiniteLine(
+                pos=0, angle=0,
+                pen=pg.mkPen('#555577', width=0.5,
+                             style=Qt.PenStyle.SolidLine),
+            )
+            self._wave_plot.addItem(self._wave_zero)
+
         # Crosshair
         self._setup_crosshair()
 
@@ -1599,6 +1647,10 @@ class SpectrogramCanvas(QWidget):
             frequency_step=20.0,
         )
         self.spectrogram_data = spec_obj.values  # shape: (n_freq, n_time)
+        # Cache the dB conversion — doing 10*log10 over the visible slice on
+        # every render dominates scroll/zoom cost.
+        self._spec_db = (10.0 * np.log10(self.spectrogram_data + 1e-20)
+                         ).astype(np.float32)
         self.spec_freqs = np.array(spec_obj.ys())
         self.spec_times = np.array(spec_obj.xs())
 
@@ -1663,16 +1715,16 @@ class SpectrogramCanvas(QWidget):
         if self._wave_plot is not None:
             self._draw_waveform()
 
-        # Remove old formant scatters (must happen even when hiding formants)
-        for key, sc in self._formant_scatters.items():
-            try:
-                self._spec_plot.removeItem(sc)
-            except Exception:
-                pass
-        self._formant_scatters = {}
-
         if self.show_formants and self.formant_data is not None:
+            # Scatter items persist across renders and are updated in place
             self._draw_formants()
+        else:
+            for key, sc in self._formant_scatters.items():
+                try:
+                    self._spec_plot.removeItem(sc)
+                except Exception:
+                    pass
+            self._formant_scatters = {}
         if self.textgrid_data is not None and len(self._tier_plots) > 0:
             self._draw_textgrid()
 
@@ -1731,24 +1783,30 @@ class SpectrogramCanvas(QWidget):
             self._zoom_text = None
 
         if show_spectrogram:
-            # Slice spectrogram to visible time range
-            t_mask = ((self.spec_times >= self.view_start) &
-                      (self.spec_times <= self.view_end))
-            vis_times = self.spec_times[t_mask]
-            vis_data = self.spectrogram_data[:, t_mask]
+            if self._spec_db is None:
+                self._spec_db = (10.0 * np.log10(self.spectrogram_data + 1e-20)
+                                 ).astype(np.float32)
+
+            # Slice spectrogram to visible time range (times are sorted, so
+            # a contiguous slice avoids boolean-mask copies)
+            i0 = int(np.searchsorted(self.spec_times, self.view_start,
+                                     side='left'))
+            i1 = int(np.searchsorted(self.spec_times, self.view_end,
+                                     side='right'))
+            vis_times = self.spec_times[i0:i1]
 
             if len(vis_times) > 0:
-                power_db = 10 * np.log10(vis_data + 1e-20)
-                peak_db = np.max(power_db)
+                power_db = self._spec_db[:, i0:i1]
+                peak_db = float(power_db.max())
                 vmax = peak_db + self.brightness
                 vmin = vmax - self.dynamic_range
 
                 # Normalize to 0-255 uint8 for LUT
-                img = np.clip((power_db - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
+                img = np.clip((power_db - vmin) * (255.0 / (vmax - vmin)),
+                              0, 255).astype(np.uint8)
 
                 # ImageItem expects (width, height) = (n_time, n_freq)
                 self._spec_image.setImage(img.T, autoLevels=False)
-                self._spec_image.setLookupTable(self._gray_r_lut)
 
                 # Position: translate to (t0, f0), scale to fill time/freq range
                 t0 = vis_times[0]
@@ -1785,35 +1843,11 @@ class SpectrogramCanvas(QWidget):
     # -------------------------------------------------------------------
 
     def _draw_waveform(self):
-        """Draw waveform into the wave plot."""
-        if self._wave_plot is None or self.sound is None:
+        """Draw waveform into the wave plot (persistent items, updated
+        in place)."""
+        if (self._wave_plot is None or self.sound is None
+                or self._wave_line is None):
             return
-
-        # Remove old waveform items
-        if self._wave_line is not None:
-            try:
-                self._wave_plot.removeItem(self._wave_line)
-            except Exception:
-                pass
-            self._wave_line = None
-        if self._wave_fill_pos is not None:
-            try:
-                self._wave_plot.removeItem(self._wave_fill_pos)
-            except Exception:
-                pass
-            self._wave_fill_pos = None
-        if self._wave_fill_neg is not None:
-            try:
-                self._wave_plot.removeItem(self._wave_fill_neg)
-            except Exception:
-                pass
-            self._wave_fill_neg = None
-        if self._wave_zero is not None:
-            try:
-                self._wave_plot.removeItem(self._wave_zero)
-            except Exception:
-                pass
-            self._wave_zero = None
 
         samples = self.sound.values[0]
         sr = self.sound.sampling_frequency
@@ -1832,10 +1866,11 @@ class SpectrogramCanvas(QWidget):
 
         if n_vis <= target_chunks * 2:
             times = (i_start + np.arange(n_vis)) / sr
-            self._wave_line = self._wave_plot.plot(
-                times, vis_samples,
-                pen=pg.mkPen('#66ccff', width=0.5),
-            )
+            self._wave_line.setData(times, vis_samples)
+            self._wave_line.setVisible(True)
+            self._wave_fill_pos.setData([], [])
+            self._wave_fill_neg.setData([], [])
+            self._wave_fill.setVisible(False)
         else:
             # Min/max envelope downsampling
             chunk_size = n_vis // target_chunks
@@ -1845,23 +1880,11 @@ class SpectrogramCanvas(QWidget):
             env_max = reshaped.max(axis=1)
             chunk_times = (i_start + (np.arange(target_chunks) + 0.5) * chunk_size) / sr
 
-            # Fill between using two curves
-            self._wave_fill_pos = pg.PlotDataItem(chunk_times, env_max, pen=pg.mkPen(None))
-            self._wave_fill_neg = pg.PlotDataItem(chunk_times, env_min, pen=pg.mkPen(None))
-            fill = pg.FillBetweenItem(self._wave_fill_pos, self._wave_fill_neg,
-                                       brush=pg.mkBrush(102, 204, 255, 180))
-            self._wave_plot.addItem(self._wave_fill_pos)
-            self._wave_plot.addItem(self._wave_fill_neg)
-            self._wave_plot.addItem(fill)
-            # Track fill for cleanup
-            self._wave_line = fill  # reuse for removal
-
-        # Zero line
-        self._wave_zero = pg.InfiniteLine(
-            pos=0, angle=0,
-            pen=pg.mkPen('#555577', width=0.5, style=Qt.PenStyle.SolidLine),
-        )
-        self._wave_plot.addItem(self._wave_zero)
+            self._wave_fill_pos.setData(chunk_times, env_max)
+            self._wave_fill_neg.setData(chunk_times, env_min)
+            self._wave_fill.setVisible(True)
+            self._wave_line.setData([], [])
+            self._wave_line.setVisible(False)
 
         # Y limits
         vis_max = max(abs(vis_samples.min()), abs(vis_samples.max()), 0.01)
@@ -1872,55 +1895,85 @@ class SpectrogramCanvas(QWidget):
     # -------------------------------------------------------------------
 
     def _draw_formants(self):
-        """Draw formant overlay on the spectrogram."""
-        # Old scatters already removed by render() before this call
+        """Draw formant overlay on the spectrogram.
 
+        Scatter items persist across renders; only their data changes.
+        """
         fd = self.formant_data
-        t_mask = ((fd.times >= self.view_start) & (fd.times <= self.view_end))
+
+        # Visible slice (times are sorted) — avoids full-array boolean masks
+        i0 = int(np.searchsorted(fd.times, self.view_start, side='left'))
+        i1 = int(np.searchsorted(fd.times, self.view_end, side='right'))
+        times = fd.times[i0:i1]
+
+        # Drop scatters for formants beyond the current display count
+        for key in [k for k in self._formant_scatters
+                    if k[0] >= self.display_n_formants]:
+            sc = self._formant_scatters.pop(key)
+            try:
+                self._spec_plot.removeItem(sc)
+            except Exception:
+                pass
 
         for f_idx in range(self.display_n_formants):
             fn = f_idx + 1
             color = FORMANT_COLORS.get(fn, "#ffffff")
             qcolor = QColor(color)
 
-            vals = fd.values[f_idx]
-            edited = fd.edited_mask[f_idx]
-            valid = ~np.isnan(vals) & t_mask
+            vals = fd.values[f_idx][i0:i1]
+            edited = fd.edited_mask[f_idx][i0:i1]
+            valid = ~np.isnan(vals)
 
-            if not np.any(valid):
-                continue
-
-            is_active = (self.edit_mode and f_idx == self.active_formant)
-
-            # Unedited points: small
-            unedited_mask = valid & ~edited
-            if np.any(unedited_mask):
-                sc = pg.ScatterPlotItem(
-                    x=fd.times[unedited_mask], y=vals[unedited_mask],
-                    size=3, pen=pg.mkPen(None),
-                    brush=pg.mkBrush(qcolor.red(), qcolor.green(), qcolor.blue(), 180),
-                )
-                self._spec_plot.addItem(sc)
-                self._formant_scatters[(f_idx, 'unedited')] = sc
-
-            # Edited points: larger with white edge
-            edited_valid = valid & edited
-            if np.any(edited_valid):
-                sc = pg.ScatterPlotItem(
-                    x=fd.times[edited_valid], y=vals[edited_valid],
-                    size=4,
-                    pen=pg.mkPen('white', width=0.3),
-                    brush=pg.mkBrush(qcolor.red(), qcolor.green(), qcolor.blue(), 255),
-                )
-                self._spec_plot.addItem(sc)
-                self._formant_scatters[(f_idx, 'edited')] = sc
+            # (kind, mask, size, pen, brush): unedited = small dots,
+            # edited = larger with white edge
+            for kind, mask, size, pen, brush in (
+                ('unedited', valid & ~edited, 3, pg.mkPen(None),
+                 pg.mkBrush(qcolor.red(), qcolor.green(), qcolor.blue(), 180)),
+                ('edited', valid & edited, 4, pg.mkPen('white', width=0.3),
+                 pg.mkBrush(qcolor.red(), qcolor.green(), qcolor.blue(), 255)),
+            ):
+                key = (f_idx, kind)
+                sc = self._formant_scatters.get(key)
+                if not np.any(mask):
+                    if sc is not None:
+                        sc.setData(x=[], y=[])
+                    continue
+                if sc is None:
+                    sc = pg.ScatterPlotItem(size=size, pen=pen, brush=brush)
+                    self._spec_plot.addItem(sc)
+                    self._formant_scatters[key] = sc
+                sc.setData(x=times[mask], y=vals[mask])
 
     # -------------------------------------------------------------------
     # TextGrid drawing
     # -------------------------------------------------------------------
 
+    def _set_batched_lines(self, key, plot, pen, times, y0, y1):
+        """Draw many vertical line segments as ONE PlotDataItem.
+
+        Uses connect='pairs' so each (x, y0)-(x, y1) pair is a separate
+        segment. The item is persistent (keyed) and updated in place —
+        vastly cheaper than one InfiniteLine per boundary.
+        """
+        item = self._batched_lines.get(key)
+        if item is None:
+            item = pg.PlotDataItem(pen=pen, connect='pairs')
+            plot.addItem(item)
+            self._batched_lines[key] = item
+        n = len(times)
+        if n == 0:
+            item.setData([], [])
+            return
+        x = np.repeat(np.asarray(times, dtype=float), 2)
+        y = np.tile(np.array([y0, y1], dtype=float), n)
+        item.setData(x, y)
+
     def _draw_textgrid(self):
-        """Render TextGrid tiers into their plots."""
+        """Render TextGrid tiers into their plots.
+
+        All render items (batched boundary lines, point scatters, label
+        TextItems) persist across renders and are updated in place.
+        """
         tg = self.textgrid_data
         if tg is None or len(self._tier_plots) == 0:
             return
@@ -1940,116 +1993,117 @@ class SpectrogramCanvas(QWidget):
             tier_idx = self._tier_plot_indices[plot_i]
             tier = tg.tiers[tier_idx]
             is_active = (tier_idx == self._active_tier)
-            tier_plot.getViewBox().setBackgroundColor('#fff8c4' if is_active else '#ffffff')
+
+            # Restyle the tier header/background only when the name or
+            # active state changed — these trigger full axis repaints.
+            style_key = (tier.name, is_active)
+            if self._tier_style_cache.get(tier_plot) != style_key:
+                self._tier_style_cache[tier_plot] = style_key
+                tier_plot.getViewBox().setBackgroundColor(
+                    '#fff8c4' if is_active else '#ffffff')
+                left_ax = tier_plot.getAxis('left')
+                left_ax.setTicks([[(0.5, tier.name)]])
+                label_color = '#cc2200' if is_active else '#5577aa'
+                font = QFont("Segoe UI", 10)
+                if is_active:
+                    font.setBold(True)
+                left_ax.setTickFont(font)
+                left_ax.setTextPen(pg.mkPen(label_color))
             tier_plot.setYRange(0, 1, padding=0)
 
-            # Tier name as centered tick label on left axis
-            left_ax = tier_plot.getAxis('left')
-            left_ax.setTicks([[(0.5, tier.name)]])
-            label_color = '#cc2200' if is_active else '#5577aa'
-            font = QFont("Segoe UI", 10)
-            if is_active:
-                font.setBold(True)
-            left_ax.setTickFont(font)
-            left_ax.setTextPen(pg.mkPen(label_color))
+            labels = []  # (text, x, anchor) to show via the pool below
 
             if tier.tier_class == "IntervalTier":
                 vis = [iv for iv in tier.intervals
                        if iv.xmax > view_start and iv.xmin < view_end]
 
-                if vis:
-                    boundaries = set()
-                    for iv in vis:
-                        boundaries.add(iv.xmin)
-                        boundaries.add(iv.xmax)
-                        spec_interval_boundaries.add(iv.xmin)
-                        spec_interval_boundaries.add(iv.xmax)
+                boundaries = set()
+                for iv in vis:
+                    boundaries.add(iv.xmin)
+                    boundaries.add(iv.xmax)
+                spec_interval_boundaries.update(boundaries)
 
-                    # Boundary lines on tier
-                    for bt in sorted(boundaries):
-                        line = pg.InfiniteLine(
-                            pos=bt, angle=90,
-                            pen=pg.mkPen('#4444aa', width=0.8),
-                        )
-                        self._add_transient(line, tier_plot)
+                # Boundary lines on tier (batched)
+                self._set_batched_lines(
+                    tier_plot, tier_plot, self._tier_boundary_pen,
+                    sorted(boundaries), 0.0, 1.0)
 
-                    # Labels
-                    for iv in vis:
-                        if iv.text:
-                            if ax_width_px > 0 and view_width > 0:
-                                px_w = (iv.xmax - iv.xmin) / view_width * ax_width_px
-                                if px_w < 20:
-                                    continue
-                            mid_t = (iv.xmin + iv.xmax) / 2.0
-                            if view_start <= mid_t <= view_end:
-                                t = pg.TextItem(iv.text, color='#000000', anchor=(0.5, 0.5))
-                                t.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-                                t.setPos(mid_t, 0.5)
-                                self._add_transient(t, tier_plot)
+                # Labels
+                for iv in vis:
+                    if iv.text:
+                        if ax_width_px > 0 and view_width > 0:
+                            px_w = (iv.xmax - iv.xmin) / view_width * ax_width_px
+                            if px_w < 20:
+                                continue
+                        mid_t = (iv.xmin + iv.xmax) / 2.0
+                        if view_start <= mid_t <= view_end:
+                            labels.append((iv.text, mid_t, (0.5, 0.5)))
 
             elif tier.tier_class == "TextTier":
                 vis = [pt for pt in tier.points
                        if view_start <= pt.time <= view_end]
+                times = [pt.time for pt in vis]
+                spec_point_times.extend(times)
 
-                if vis:
-                    times = [pt.time for pt in vis]
-                    spec_point_times.extend(times)
+                # Point lines on tier (batched)
+                self._set_batched_lines(
+                    tier_plot, tier_plot, self._tier_point_pen,
+                    times, 0.0, 1.0)
 
-                    for pt_time in times:
-                        line = pg.InfiniteLine(
-                            pos=pt_time, angle=90,
-                            pen=pg.mkPen('#cc4400', width=1.0),
-                        )
-                        self._add_transient(line, tier_plot)
-
-                    # Diamond markers
+                # Diamond markers (persistent scatter)
+                sc = self._tier_point_scatters.get(tier_plot)
+                if sc is None:
                     sc = pg.ScatterPlotItem(
-                        x=times, y=[0.5] * len(vis),
                         symbol='d', size=10,
                         pen=pg.mkPen('#cc4400'), brush=pg.mkBrush('#cc4400'),
                     )
-                    self._add_transient(sc, tier_plot)
+                    tier_plot.addItem(sc)
+                    self._tier_point_scatters[tier_plot] = sc
+                sc.setData(x=times, y=[0.5] * len(times))
 
-                    # Labels
-                    for pt in vis:
-                        if pt.mark:
-                            t = pg.TextItem("  " + pt.mark, color='#000000', anchor=(0.0, 0.5))
-                            t.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-                            t.setPos(pt.time, 0.5)
-                            self._add_transient(t, tier_plot)
+                # Labels
+                for pt in vis:
+                    if pt.mark:
+                        labels.append(("  " + pt.mark, pt.time, (0.0, 0.5)))
 
-        # Boundary lines on spectrogram + waveform
-        bdry_pen = pg.mkPen('#4488ff', width=1.5, style=Qt.PenStyle.DashLine)
-        for bt in sorted(spec_interval_boundaries):
-            line = pg.InfiniteLine(pos=bt, angle=90, pen=bdry_pen)
-            self._add_transient(line, self._spec_plot)
-            if self._wave_plot is not None:
-                line2 = pg.InfiniteLine(pos=bt, angle=90, pen=bdry_pen)
-                self._add_transient(line2, self._wave_plot)
+            # Show labels through a pool of reusable TextItems
+            pool = self._tier_text_pools.setdefault(tier_plot, [])
+            for i, (text, x, anchor) in enumerate(labels):
+                if i < len(pool):
+                    t = pool[i]
+                    t.setText(text)
+                else:
+                    t = pg.TextItem(text, color='#000000', anchor=anchor)
+                    t.setFont(self._tier_label_font)
+                    tier_plot.addItem(t)
+                    pool.append(t)
+                t.setPos(x, 0.5)
+                t.setVisible(True)
+            for t in pool[len(labels):]:
+                t.setVisible(False)
 
-        # Point markers on spectrogram + waveform
-        pt_pen = pg.mkPen('#ff6622', width=0.7, style=Qt.PenStyle.DashLine)
-        for pt_time in spec_point_times:
-            line = pg.InfiniteLine(pos=pt_time, angle=90, pen=pt_pen)
-            self._add_transient(line, self._spec_plot)
-            if self._wave_plot is not None:
-                line2 = pg.InfiniteLine(pos=pt_time, angle=90, pen=pt_pen)
-                self._add_transient(line2, self._wave_plot)
+        # Boundary/point marker lines on spectrogram + waveform (batched)
+        b_sorted = sorted(spec_interval_boundaries)
+        self._set_batched_lines('spec_iv', self._spec_plot,
+                                self._marker_iv_pen, b_sorted,
+                                0.0, self.max_freq)
+        self._set_batched_lines('spec_pt', self._spec_plot,
+                                self._marker_pt_pen, spec_point_times,
+                                0.0, self.max_freq)
+        if self._wave_plot is not None:
+            wy0, wy1 = self._wave_plot.viewRange()[1]
+            self._set_batched_lines('wave_iv', self._wave_plot,
+                                    self._marker_iv_pen, b_sorted, wy0, wy1)
+            self._set_batched_lines('wave_pt', self._wave_plot,
+                                    self._marker_pt_pen, spec_point_times,
+                                    wy0, wy1)
 
     # -------------------------------------------------------------------
     # Title
     # -------------------------------------------------------------------
 
     def _update_title(self):
-        """Update title text on the topmost plot."""
-        if self._title_item is not None:
-            target = self._wave_plot if self._wave_plot is not None else self._spec_plot
-            try:
-                target.removeItem(self._title_item)
-            except Exception:
-                pass
-            self._title_item = None
-
+        """Update title text on the topmost plot (persistent TextItem)."""
         title = os.path.basename(self._filepath) if hasattr(self, "_filepath") else ""
         if self.edit_mode:
             fn = self.active_formant + 1
@@ -2059,12 +2113,14 @@ class SpectrogramCanvas(QWidget):
             color = "#eeeeee"
 
         target = self._wave_plot if self._wave_plot is not None else self._spec_plot
-        self._title_item = pg.TextItem(title, color=color, anchor=(0.5, 1.0))
+        if self._title_item is None:
+            self._title_item = pg.TextItem(anchor=(0.5, 1.0))
+            target.addItem(self._title_item)
+        self._title_item.setText(title, color=color)
         font = QFont("Segoe UI", 11)
         if self.edit_mode:
             font.setBold(True)
         self._title_item.setFont(font)
-        target.addItem(self._title_item)
         # Position at top-center of view
         vr = target.viewRange()
         mid_x = (vr[0][0] + vr[0][1]) / 2
@@ -2355,6 +2411,7 @@ class SpectrogramCanvas(QWidget):
                     if self._label_edit is not None:
                         self._label_edit.setEnabled(True)
                         self._label_edit.setText(iv.text)
+                    self._push_selection_status()
                     return True
         elif tier.tier_class == "TextTier":
             threshold = self._time_threshold_for_pixels(10)
@@ -2374,6 +2431,7 @@ class SpectrogramCanvas(QWidget):
                 if self._label_edit is not None:
                     self._label_edit.setEnabled(True)
                     self._label_edit.setText(pt.mark)
+                self._push_selection_status()
                 return True
         return False
 
@@ -2386,6 +2444,42 @@ class SpectrogramCanvas(QWidget):
         if self._label_edit is not None:
             self._label_edit.setEnabled(False)
             self._label_edit.clear()
+
+    def _selection_time_text(self):
+        """Time portion of the status readout for the current selection.
+
+        Returns None when nothing is selected (caller falls back to the
+        cursor position).
+        """
+        if self._selected_interval is not None and self.textgrid_data is not None:
+            tier_idx, item_idx = self._selected_interval
+            if 0 <= tier_idx < len(self.textgrid_data.tiers):
+                tier = self.textgrid_data.tiers[tier_idx]
+                if (tier.tier_class == "TextTier"
+                        and 0 <= item_idx < len(tier.points)):
+                    pt = tier.points[item_idx]
+                    return f"Point: {pt.time:.4f} s"
+                if (tier.tier_class == "IntervalTier"
+                        and 0 <= item_idx < len(tier.intervals)):
+                    iv = tier.intervals[item_idx]
+                    return (f"Start: {iv.xmin:.4f} s  |  "
+                            f"End: {iv.xmax:.4f} s  |  "
+                            f"Duration: {iv.xmax - iv.xmin:.4f} s")
+        if (self._selection_start is not None
+                and self._selection_end is not None
+                and self._selection_end > self._selection_start):
+            return (f"Start: {self._selection_start:.4f} s  |  "
+                    f"End: {self._selection_end:.4f} s  |  "
+                    f"Duration: {self._selection_end - self._selection_start:.4f} s")
+        return None
+
+    def _push_selection_status(self):
+        """Show the current selection's time info in the status bar."""
+        if self._status_callback is None:
+            return
+        text = self._selection_time_text()
+        if text is not None:
+            self._status_callback(text)
 
     # -------------------------------------------------------------------
     # Mouse event coordinate mapping
@@ -2766,6 +2860,7 @@ class SpectrogramCanvas(QWidget):
                     self._selection_end = None
             self._spec_drag_start = None
             self._draw_selection_overlay()
+            self._push_selection_status()
             return
 
         # --- End formant edit stroke ---
@@ -2848,16 +2943,20 @@ class SpectrogramCanvas(QWidget):
             self._hover_time = time
             self._update_crosshair(time, y, on_spectrogram=True)
             if self._status_callback and not self.is_drawing:
+                time_part = (self._selection_time_text()
+                             or f"Time: {time:.4f} s")
                 self._status_callback(
-                    f"Time: {time:.4f} s  |  Frequency: {y:.1f} Hz")
+                    f"{time_part}  |  Frequency: {y:.1f} Hz")
         elif name == 'wave' and time is not None:
             self._hover_time = time
             self._update_crosshair(time, y, on_spectrogram=False)
             if self._status_callback and not self.is_drawing:
                 rms = self._get_rms_at_time(time)
                 rms_db = 20 * np.log10(rms + 1e-20)
+                time_part = (self._selection_time_text()
+                             or f"Time: {time:.4f} s")
                 self._status_callback(
-                    f"Time: {time:.4f} s  |  RMS: {rms:.4f} ({rms_db:.1f} dB)")
+                    f"{time_part}  |  RMS: {rms:.4f} ({rms_db:.1f} dB)")
         elif self._crosshair_visible:
             self._hide_crosshair()
 
@@ -5471,6 +5570,16 @@ class MainWindow(QMainWindow):
         self._formants_path = None
         self._formants_dirty = False
         self._textgrid_dirty = False
+        # Discard any TextGrid from the previously opened file — it does not
+        # match the new audio.  If the user later skips the TextGrid prompt,
+        # no stale tier panes must remain.
+        self.canvas.textgrid_data = None
+        self.canvas.hidden_tiers = set()
+        self.canvas._active_tier = None
+        self.canvas._clear_selection()
+        self.canvas._click_time = None
+        self.canvas._hover_time = None
+        self._setup_tier_checkboxes()
         self.status.showMessage(f"Loading {os.path.basename(filepath)}...")
         QApplication.processEvents()
 
