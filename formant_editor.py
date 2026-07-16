@@ -32,9 +32,15 @@ from PyQt6.QtWidgets import (
     QWizard, QWizardPage, QProgressDialog, QListWidget, QListWidgetItem,
     QRadioButton, QButtonGroup, QTabWidget, QScrollArea, QInputDialog
 )
-from PyQt6.QtCore import Qt, QTimer, QEvent, QObject, pyqtSignal, QByteArray, QBuffer, QIODevice
+from PyQt6.QtCore import (
+    Qt, QTimer, QEvent, QObject, pyqtSignal, QByteArray, QBuffer, QIODevice,
+    QPointF,
+)
 from PyQt6.QtMultimedia import QAudioSink, QAudioFormat
-from PyQt6.QtGui import QAction, QKeySequence, QColor, QFont, QTransform
+from PyQt6.QtGui import (
+    QAction, QKeySequence, QColor, QFont, QTransform, QPainter, QPen,
+    QPixmap, QPolygonF,
+)
 
 import pyqtgraph as pg
 
@@ -79,6 +85,43 @@ _IPA_CHART_PATH = os.path.join(
     getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
     "Docs", "ipa_symbol_chart.csv"
 )
+
+# Checkmark image for checked checkbox indicators.  Qt stylesheets cannot
+# embed image data inline, so a small PNG is rendered once at runtime and
+# referenced by file path in url().
+_CHECKMARK_PNG_PATH = None
+
+
+def _checkmark_png_path():
+    """Return a forward-slash path to a white tick PNG for QSS url()."""
+    global _CHECKMARK_PNG_PATH
+    if _CHECKMARK_PNG_PATH is None:
+        import tempfile
+        path = os.path.join(tempfile.gettempdir(), "formantstudio_check.png")
+        try:
+            pm = QPixmap(24, 24)
+            pm.fill(Qt.GlobalColor.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            pen = QPen(QColor("#ffffff"))
+            pen.setWidthF(3.4)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            p.drawPolyline(QPolygonF(
+                [QPointF(4.5, 12.5), QPointF(10.0, 18.0), QPointF(19.5, 6.0)]))
+            p.end()
+            pm.save(path, "PNG")
+            _CHECKMARK_PNG_PATH = path.replace("\\", "/")
+        except Exception:
+            _CHECKMARK_PNG_PATH = ""  # QSS ignores url("") — no tick, no crash
+    return _CHECKMARK_PNG_PATH
+
+
+def _checked_tick_qss():
+    """QSS rule drawing the tick inside checked checkbox indicators."""
+    return (f'\nQCheckBox::indicator:checked {{ '
+            f'image: url("{_checkmark_png_path()}"); }}\n')
 
 # Diacritic suffixes for SAMPA / X-SAMPA notation (longest first)
 _DIACRITIC_SUFFIXES = [
@@ -3299,7 +3342,7 @@ class ControlPanel(QWidget):
                 background-color: #334455; border: 1px solid #556677;
                 border-radius: 3px; padding: 3px; color: #cccccc;
             }
-        """)
+        """ + _checked_tick_qss())
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -3599,7 +3642,7 @@ class CreateTextGridDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Create TextGrid")
         self.setMinimumWidth(400)
-        self.setStyleSheet(_DIALOG_FIELD_STYLE)
+        self.setStyleSheet(_DIALOG_FIELD_STYLE + _checked_tick_qss())
         self._duration = duration
         self._tier_rows = []
 
@@ -3692,7 +3735,7 @@ class AddTierDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Add Tier")
         self.setMinimumWidth(350)
-        self.setStyleSheet(_DIALOG_FIELD_STYLE)
+        self.setStyleSheet(_DIALOG_FIELD_STYLE + _checked_tick_qss())
         self._tg = textgrid
 
         layout = QFormLayout(self)
@@ -3811,7 +3854,7 @@ class _PathsPage(QWizardPage):
 
         self._fmt_separate_cb.toggled.connect(self._toggle_fmt)
 
-        self.setStyleSheet(_DIALOG_FIELD_STYLE)
+        self.setStyleSheet(_DIALOG_FIELD_STYLE + _checked_tick_qss())
 
     # --- Browsing ---
     def _browse_audio(self):
@@ -4073,7 +4116,7 @@ class _DataOptionsPage(QWizardPage):
         self._dur_cb.toggled.connect(self._dur_group.setVisible)
 
         layout.addStretch()
-        self.setStyleSheet(_DIALOG_FIELD_STYLE)
+        self.setStyleSheet(_DIALOG_FIELD_STYLE + _checked_tick_qss())
 
     def initializePage(self):
         wiz = self.wizard()
@@ -4281,7 +4324,7 @@ class _DiphthongReviewDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Review Diphthongs")
         self.setMinimumSize(420, 380)
-        self.setStyleSheet(_DIALOG_FIELD_STYLE)
+        self.setStyleSheet(_DIALOG_FIELD_STYLE + _checked_tick_qss())
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
@@ -4345,7 +4388,7 @@ class _CheckablePopup(QWidget):
                 border: 2px solid #666; border-radius: 3px;
                 background-color: transparent;
             }
-        """)
+        """ + _checked_tick_qss())
         self._layout.addWidget(cb)
         self._checkboxes.append(cb)
         return cb
@@ -4947,7 +4990,7 @@ class BuildCSVWizard(QWizard):
         self.addPage(_DataOptionsPage())
         self.addPage(_CategorisationPage())
 
-        self.setStyleSheet(_DIALOG_FIELD_STYLE)
+        self.setStyleSheet(_DIALOG_FIELD_STYLE + _checked_tick_qss())
 
 
 class MainWindow(QMainWindow):

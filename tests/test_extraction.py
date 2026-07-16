@@ -128,13 +128,17 @@ class TestPraatEquivalence:
                     assert result_val == pytest.approx(praat_val, rel=1e-6), \
                         f"F{f_idx+1} frame {t_idx}: expected {praat_val}, got {result_val}"
 
-    def test_extraction_default_3_formants(self, vowel_sound):
+    def test_extraction_ignores_n_formants(self, vowel_sound):
+        # n_formants is accepted for backwards compatibility but ignored:
+        # all 5 tracks are always extracted so the display dropdown can
+        # switch without re-analysis (display_n_formants controls rendering)
         result = extract_formants_from_praat(vowel_sound, n_formants=3)
-        # F4 and F5 should be all NaN
-        assert np.all(np.isnan(result.values[3]))
-        assert np.all(np.isnan(result.values[4]))
+        assert result.n_formants == 5
+        assert result.values.shape[0] == 5
         # F1 should have some non-NaN values
         assert np.any(~np.isnan(result.values[0]))
+        # Higher tracks are still extracted, not blanked
+        assert np.any(~np.isnan(result.values[3]))
 
     def test_extraction_5_formants(self, vowel_sound):
         result = extract_formants_from_praat(vowel_sound, n_formants=5)
