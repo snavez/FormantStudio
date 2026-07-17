@@ -280,6 +280,45 @@ class TestSpectralTierSelection:
         cogs = [r[headers.index("COG_50%")] for r in rows]
         assert cogs[0] == cogs[1] and cogs[0] != ""
 
+    def test_unlabelled_container_blanks_rather_than_measuring_gap(
+            self, tmp_path):
+        """A row inside an UNLABELLED stretch of the chosen tier must blank.
+
+        Regression: a sub-phone tier ('allophone') has long empty intervals
+        between its labels. Resolving a row to one of those and sampling its
+        midpoint reported COG measured from arbitrary unrelated audio.
+        """
+        audio_dir = tmp_path / "audio"
+        tg_dir = tmp_path / "tg"
+        audio_dir.mkdir()
+        tg_dir.mkdir()
+        sr, dur = 44100, 1.0
+        rng = np.random.default_rng(3)
+        parselmouth.Sound(rng.standard_normal(int(sr * dur)) * 0.2,
+                          sampling_frequency=sr).save(
+            str(audio_dir / "test.wav"), parselmouth.SoundFileFormat.WAV)
+        # phones drive rows; 'allophone' labels only the LAST phone's span
+        phones = Tier("phones", "IntervalTier", 0.0, dur, intervals=[
+            Interval(0.0, 0.4, "a"),      # sits in the empty allophone gap
+            Interval(0.4, 0.8, "t"),      # inside the labelled allophone
+        ])
+        allo = Tier("allophone", "IntervalTier", 0.0, dur, intervals=[
+            Interval(0.0, 0.4, ""),       # long unlabelled gap
+            Interval(0.4, 0.8, "tH"),     # the only labelled span
+            Interval(0.8, dur, ""),
+        ])
+        TextGrid(0.0, dur, [phones, allo]).save(str(tg_dir / "test.TextGrid"))
+        tiers = TextGrid.from_file(str(tg_dir / "test.TextGrid")).tiers
+
+        headers, rows = _build_csv_data(**_spectral_kwargs(
+            audio_dir=str(audio_dir), textgrid_dir=str(tg_dir),
+            selected_tiers=[tiers[0]],           # phones drives rows
+            spectral_tier_name="allophone", spectral_markers=[50]))
+        assert len(rows) == 2
+        cog_i = headers.index("COG_50%")
+        assert rows[0][cog_i] == ""      # 'a' -> unlabelled gap -> blank
+        assert rows[1][cog_i] != ""      # 't' -> inside 'tH' -> measured
+
     def test_missing_tier_blanks_spectral_cells(self, tmp_path):
         audio, tg = _write_two_tier_corpus(tmp_path)
         tiers = TextGrid.from_file(os.path.join(tg, "test.TextGrid")).tiers

@@ -1100,7 +1100,14 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
 
             Mirrors duration-tier resolution: the token's own interval when
             *tier_name* is the row tier (or unset), else the containing
-            interval on that tier, or None when there is none.
+            interval on that tier.
+
+            Returns None when there is no containing interval or when it is
+            unlabelled.  An unlabelled container means the row's token is not
+            inside a segment of interest on that tier — e.g. a tier of
+            sub-phone allophones has long empty stretches between its labels,
+            and sampling inside one of those would report numbers measured
+            from an arbitrary, unrelated stretch of audio.
             """
             if not tier_name or tier_name == lowest_tier.name:
                 return iv
@@ -1111,6 +1118,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             if civ is None:
                 civ = _find_containing_interval_for_point(
                     t, (iv.xmin + iv.xmax) / 2)
+            if civ is None or not civ.text.strip():
+                return None
             return civ
 
         def _segment_formant_cols(iv):
@@ -4265,16 +4274,30 @@ class _TierSelectionPage(QWizardPage):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setTitle("Select & Order Tiers")
-        self.setSubTitle(
-            "Tiers are listed in TextGrid file order. The last checked "
-            "interval tier drives the CSV rows; each point tier belongs to "
-            "the nearest interval tier above it. Use Up/Down to adjust. "
-            "Uncheck tiers you don't need."
-        )
+        self.setSubTitle("Choose which tiers to include and their order.")
         layout = QVBoxLayout(self)
+
+        # Full explanation lives in the page body — wizard subtitles get
+        # truncated and this rule is the one users must see.
+        info = QLabel(
+            "Tiers are listed in TextGrid file order; use Up/Down to "
+            "adjust, and uncheck tiers you don't need.\n\n"
+            "The LAST CHECKED INTERVAL TIER drives the CSV: one row per "
+            "labelled segment on that tier. Other interval tiers add "
+            "label/duration columns; each point tier belongs to the "
+            "nearest interval tier above it in this list.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
 
         self._list = QListWidget()
         layout.addWidget(self._list)
+
+        # Live indicator of the row-driving tier — updates on check/reorder
+        self._rows_label = QLabel()
+        self._rows_label.setWordWrap(True)
+        self._rows_label.setStyleSheet(
+            "font-weight: bold; color: #2a6fb0;")
+        layout.addWidget(self._rows_label)
 
         btn_row = QHBoxLayout()
         up_btn = QPushButton("Move Up")
@@ -4289,6 +4312,8 @@ class _TierSelectionPage(QWizardPage):
         self._example_label = QLabel()
         self._example_label.setWordWrap(True)
         layout.addWidget(self._example_label)
+
+        self._list.itemChanged.connect(lambda _item: self._update_rows_label())
 
     def initializePage(self):
         self._list.clear()
@@ -4331,6 +4356,24 @@ class _TierSelectionPage(QWizardPage):
             item.setData(Qt.ItemDataRole.UserRole + 1, tier.tier_class)
             self._list.addItem(item)
 
+        self._update_rows_label()
+
+    def _update_rows_label(self):
+        """Show which tier will drive the CSV rows given current choices."""
+        driver = None
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if (item.checkState() == Qt.CheckState.Checked
+                    and item.data(Qt.ItemDataRole.UserRole + 1)
+                    == "IntervalTier"):
+                driver = item.data(Qt.ItemDataRole.UserRole)
+        if driver is None:
+            self._rows_label.setText(
+                "⚠ No interval tier checked — no rows can be extracted.")
+        else:
+            self._rows_label.setText(
+                f"CSV rows: one per labelled '{driver}' segment.")
+
     def _move_up(self):
         row = self._list.currentRow()
         if row <= 0:
@@ -4338,6 +4381,7 @@ class _TierSelectionPage(QWizardPage):
         item = self._list.takeItem(row)
         self._list.insertItem(row - 1, item)
         self._list.setCurrentRow(row - 1)
+        self._update_rows_label()
 
     def _move_down(self):
         row = self._list.currentRow()
@@ -4346,6 +4390,7 @@ class _TierSelectionPage(QWizardPage):
         item = self._list.takeItem(row)
         self._list.insertItem(row + 1, item)
         self._list.setCurrentRow(row + 1)
+        self._update_rows_label()
 
     def validatePage(self):
         selected = self._get_selected_tiers()
@@ -4516,12 +4561,14 @@ class _DataOptionsPage(QWizardPage):
         self._spectral_hp_cb.setToolTip(
             "Removes low-frequency voicing energy that pulls the centre of "
             "gravity down. Recommended (~300 Hz) for voiced or noisy fricatives.")
+        # On by default — high-passing before spectral moments is standard
+        # practice; unfiltered voicing makes COG unreliable.
+        self._spectral_hp_cb.setChecked(True)
         hp_row.addWidget(self._spectral_hp_cb)
         self._spectral_hp_spin = QDoubleSpinBox()
         self._spectral_hp_spin.setRange(50.0, 2000.0)
         self._spectral_hp_spin.setSingleStep(50.0)
         self._spectral_hp_spin.setValue(300.0)
-        self._spectral_hp_spin.setEnabled(False)
         hp_row.addWidget(self._spectral_hp_spin)
         hp_row.addStretch()
         spec_layout.addLayout(hp_row)
