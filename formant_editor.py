@@ -4124,7 +4124,18 @@ class _DataOptionsPage(QWizardPage):
         super().__init__(parent)
         self.setTitle("Data Extraction Options")
         self.setSubTitle("Choose what data to extract for each segment.")
-        layout = QVBoxLayout(self)
+
+        # Content lives in a scroll area so that groups keep their natural
+        # height instead of being compressed when many tiers are shown.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; }")
+        outer.addWidget(scroll)
+        container = QWidget()
+        scroll.setWidget(container)
+        layout = QVBoxLayout(container)
 
         # --- Formants ---
         self._fmt_cb = QCheckBox("Extract formant values (F1–F3)")
