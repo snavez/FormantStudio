@@ -686,25 +686,6 @@ def _get_formant_at_time(fd, time_s):
     return tuple(result)
 
 
-def _detect_tier_hierarchy(tiers):
-    """Sort interval tiers by non-empty segment count (fewest = highest).
-
-    *tiers* is a list of Tier objects.  Returns a new list sorted so that
-    tiers with fewer non-empty intervals come first (e.g. words before
-    phones).  Point tiers are appended at the end.
-    """
-    interval_tiers = []
-    point_tiers = []
-    for t in tiers:
-        if t.tier_class == "IntervalTier":
-            n = sum(1 for iv in t.intervals if iv.text.strip())
-            interval_tiers.append((n, t))
-        else:
-            point_tiers.append(t)
-    interval_tiers.sort(key=lambda x: x[0])
-    return [t for _, t in interval_tiers] + point_tiers
-
-
 def _find_containing_interval(tier, xmin, xmax):
     """Return the Interval in *tier* that contains [xmin, xmax], or None."""
     eps = 1e-6
@@ -830,7 +811,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     cat_notation="ipa", cat_tier_names=None,
                     cat_vowel_props=None, cat_consonant_props=None,
                     auto_diphthong_candidates=None,
-                    unmatched_labels=None):
+                    unmatched_labels=None,
+                    skipped_files=None):
     """Build CSV header and rows for batch formant/duration export.
 
     *formant_mode* can be ``"at_points"``, ``"for_segments"``, or ``"both"``.
@@ -840,7 +822,9 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     (ms from onset) instead of percentage markers.
     When *categorise* is True, classification columns are appended.
     *auto_diphthong_candidates* and *unmatched_labels* are mutable sets
-    that collect data for post-processing.
+    that collect data for post-processing. *skipped_files* is a mutable
+    list collecting (filename, reason) for audio files that produced no
+    rows (no matching TextGrid, or an unreadable one).
     Returns (headers: list[str], rows: list[list[str|float]]).
     """
     if point_tier_parents is None:
@@ -985,15 +969,19 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 break
 
         if tg_path is None:
-            row = [audio_file] + [""] * (len(headers) - 1)
-            rows.append(row)
+            if skipped_files is not None:
+                skipped_files.append((
+                    audio_file,
+                    f"no TextGrid named {basename}.TextGrid found"))
             continue
 
         try:
             tg = TextGrid.from_file(tg_path)
-        except Exception:
-            row = [audio_file] + [""] * (len(headers) - 1)
-            rows.append(row)
+        except Exception as e:
+            if skipped_files is not None:
+                skipped_files.append((
+                    audio_file,
+                    f"could not read {os.path.basename(tg_path)}: {e}"))
             continue
 
         # Map tier names → Tier objects for this file
@@ -4278,8 +4266,10 @@ class _TierSelectionPage(QWizardPage):
         super().__init__(parent)
         self.setTitle("Select & Order Tiers")
         self.setSubTitle(
-            "Tiers are auto-sorted by hierarchy (widest segments first). "
-            "Use Up/Down to adjust. Uncheck tiers you don't need."
+            "Tiers are listed in TextGrid file order. The last checked "
+            "interval tier drives the CSV rows; each point tier belongs to "
+            "the nearest interval tier above it. Use Up/Down to adjust. "
+            "Uncheck tiers you don't need."
         )
         layout = QVBoxLayout(self)
 
@@ -4326,10 +4316,9 @@ class _TierSelectionPage(QWizardPage):
             f"Example TextGrid: {os.path.basename(tg_file)} "
             f"({len(tg.tiers)} tiers)")
 
-        # Auto-detect hierarchy
-        ordered = _detect_tier_hierarchy(tg.tiers)
-
-        for tier in ordered:
+        # Present tiers in TextGrid file order — it reflects how the user
+        # built the annotation; Up/Down still allows manual adjustment.
+        for tier in tg.tiers:
             kind = "Interval" if tier.tier_class == "IntervalTier" else "Point"
             n = (len([iv for iv in tier.intervals if iv.text.strip()])
                  if tier.tier_class == "IntervalTier"
@@ -6328,6 +6317,7 @@ class MainWindow(QMainWindow):
 
         auto_diphthong_candidates = {} if wizard.categorise else None
         unmatched_labels = set() if wizard.categorise else None
+        skipped_files = []
 
         try:
             headers, rows = _build_csv_data(
@@ -6360,6 +6350,7 @@ class MainWindow(QMainWindow):
                 cat_consonant_props=wizard.cat_consonant_props,
                 auto_diphthong_candidates=auto_diphthong_candidates,
                 unmatched_labels=unmatched_labels,
+                skipped_files=skipped_files,
             )
         except Exception as e:
             progress.close()
@@ -6371,6 +6362,24 @@ class MainWindow(QMainWindow):
         if cancelled:
             self.status.showMessage("CSV export cancelled")
             return
+
+        # Report files that produced no rows — a silent empty CSV cost the
+        # user real debugging time when a TextGrid name didn't match.
+        if skipped_files:
+            msg = (f"{len(skipped_files)} audio file"
+                   f"{'s' if len(skipped_files) != 1 else ''} skipped "
+                   f"(no rows extracted):\n\n")
+            for fname, reason in skipped_files[:20]:
+                msg += f"  {fname} — {reason}\n"
+            if len(skipped_files) > 20:
+                msg += f"\n  ... and {len(skipped_files) - 20} more."
+            msg += ("\nTextGrids must share the audio file's exact base "
+                    "name (e.g. sound.wav ↔ sound.TextGrid).")
+            QMessageBox.warning(self, "Files Skipped", msg)
+            if not rows:
+                self.status.showMessage(
+                    "CSV export produced no rows — all files skipped")
+                return
 
         # Diphthong review dialog
         if auto_diphthong_candidates:

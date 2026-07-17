@@ -291,6 +291,48 @@ class TestSpectralTierSelection:
             assert r[headers.index("winms_50%")] == ""
 
 
+class TestSkippedFiles:
+    """Audio files with no usable TextGrid are reported, not silently blank."""
+
+    def test_missing_textgrid_is_skipped_and_reported(self, tmp_path):
+        audio, tg = _write_corpus(tmp_path, [(0.1, 0.4, "s")])
+        tiers = TextGrid.from_file(os.path.join(tg, "test.TextGrid")).tiers
+        # Rename the TextGrid so nothing matches the audio's base name
+        os.rename(os.path.join(tg, "test.TextGrid"),
+                  os.path.join(tg, "testTS.TextGrid"))
+        skipped = []
+        _, rows = _build_csv_data(**_spectral_kwargs(
+            audio_dir=audio, textgrid_dir=tg, selected_tiers=tiers,
+            skipped_files=skipped))
+        assert rows == []                       # no silent blank row
+        assert len(skipped) == 1
+        assert skipped[0][0] == "test.wav"
+        assert "test.TextGrid" in skipped[0][1]
+
+    def test_unreadable_textgrid_is_skipped_and_reported(self, tmp_path):
+        audio, tg = _write_corpus(tmp_path, [(0.1, 0.4, "s")])
+        tiers = TextGrid.from_file(os.path.join(tg, "test.TextGrid")).tiers
+        with open(os.path.join(tg, "test.TextGrid"), "w") as f:
+            f.write("this is not a TextGrid")
+        skipped = []
+        _, rows = _build_csv_data(**_spectral_kwargs(
+            audio_dir=audio, textgrid_dir=tg, selected_tiers=tiers,
+            skipped_files=skipped))
+        assert rows == []
+        assert len(skipped) == 1
+        assert "could not read" in skipped[0][1]
+
+    def test_matched_files_unaffected_by_collector(self, tmp_path):
+        audio, tg = _write_corpus(tmp_path, [(0.1, 0.4, "s")])
+        tiers = TextGrid.from_file(os.path.join(tg, "test.TextGrid")).tiers
+        skipped = []
+        _, rows = _build_csv_data(**_spectral_kwargs(
+            audio_dir=audio, textgrid_dir=tg, selected_tiers=tiers,
+            skipped_files=skipped))
+        assert len(rows) == 1
+        assert skipped == []
+
+
 class TestFormantSegmentTierResolution:
     """The formant segment tier now genuinely controls sampling positions."""
 
