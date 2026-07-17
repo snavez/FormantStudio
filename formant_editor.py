@@ -64,6 +64,13 @@ DEFAULT_WINDOW_LENGTH = 0.025  # 25 ms — Praat default
 DEFAULT_TIME_STEP = 0.0       # 0 = auto (Praat default: 25% of window length)
 DEFAULT_PRE_EMPHASIS = 50.0    # Hz — Praat default
 
+# Spectral-moment analysis (consonant / fricative / burst spectra)
+DEFAULT_SPECTRAL_WINDOW_MS = 25.0   # analysis window length (ms)
+MIN_SPECTRAL_WINDOW_MS = 5.0        # hard floor — shorter is unreliable
+MAX_SPECTRAL_WINDOW_MS = 50.0       # ceiling — wider blurs short segments
+DEFAULT_SPECTRAL_HIGHPASS_HZ = 0.0  # 0 = off; ~300 Hz removes voicing bleed
+SPECTRAL_MOMENT_POWER = 2.0         # Praat default power for all moments
+
 # Spectrogram display defaults
 DEFAULT_DYNAMIC_RANGE = 70.0   # dB
 DEFAULT_SPEC_MAX_FREQ = 8000.0
@@ -547,6 +554,80 @@ def extract_formants_from_praat(sound, n_formants=5, max_formant=5500.0,
 
 
 # ---------------------------------------------------------------------------
+# Spectral-moment analysis
+# ---------------------------------------------------------------------------
+
+# Window shape names shown in the UI → parselmouth WindowShape.  Only tapers
+# suitable for spectral moments are offered (rectangular leaks badly).
+SPECTRAL_WINDOW_SHAPES = {
+    "Hamming": "HAMMING",
+    "Hann": "HANNING",
+}
+
+
+def _spectral_window_shape(name):
+    """Resolve a UI window-shape name to a parselmouth WindowShape."""
+    attr = SPECTRAL_WINDOW_SHAPES.get(name, "HAMMING")
+    return getattr(parselmouth.WindowShape, attr)
+
+
+def clip_window_to_segment(t_center, window_s, seg_xmin, seg_xmax):
+    """Return (t0, t1) for a window of *window_s* centred on *t_center*,
+    clipped so it never crosses the [seg_xmin, seg_xmax] bounds.
+
+    The window stays centred on *t_center*; only the part that would spill
+    past a segment edge is trimmed, so edge windows become shorter and
+    asymmetric rather than reading neighbouring-segment audio.  Returns
+    (t0, t1) with t1 >= t0 (an empty window if the centre is out of range).
+    """
+    half = window_s / 2.0
+    t0 = max(seg_xmin, t_center - half)
+    t1 = min(seg_xmax, t_center + half)
+    if t1 < t0:
+        t1 = t0
+    return t0, t1
+
+
+def highpass_sound(sound, cutoff_hz, smoothing_hz=100.0):
+    """Return *sound* high-pass filtered above *cutoff_hz* (Hann band).
+
+    Removes low-frequency (e.g. voicing) energy that otherwise drags a
+    fricative's centre of gravity down.  A cutoff <= 0 returns the sound
+    unchanged.
+    """
+    if not cutoff_hz or cutoff_hz <= 0:
+        return sound
+    # Praat "Filter (pass Hann band)...": to-frequency 0 means Nyquist.
+    return praat.call(sound, "Filter (pass Hann band)...",
+                      float(cutoff_hz), 0.0, float(smoothing_hz))
+
+
+def compute_spectral_moments(sound, t0, t1, window_shape, power=SPECTRAL_MOMENT_POWER):
+    """Compute the four spectral moments over [*t0*, *t1*] of *sound*.
+
+    Applies *window_shape* as an analysis taper, converts to a power
+    spectrum, and returns ``(cog, sd, skewness, kurtosis)`` in Hz-based
+    units (skewness/kurtosis dimensionless).  Any high-pass filtering
+    should already be applied to *sound*.  Returns four NaNs if the region
+    is empty or Praat fails.
+    """
+    nan4 = (np.nan, np.nan, np.nan, np.nan)
+    if t1 <= t0:
+        return nan4
+    try:
+        part = sound.extract_part(t0, t1, window_shape, 1.0, False)
+        spectrum = part.to_spectrum()
+        return (
+            spectrum.get_centre_of_gravity(power),
+            spectrum.get_standard_deviation(power),
+            spectrum.get_skewness(power),
+            spectrum.get_kurtosis(power),
+        )
+    except Exception:
+        return nan4
+
+
+# ---------------------------------------------------------------------------
 # CSV Export Helpers
 # ---------------------------------------------------------------------------
 
@@ -734,6 +815,11 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     progress_callback=None,
                     include_point_times=False,
                     time_step_ms=None,
+                    extract_spectral=False, spectral_markers=None,
+                    spectral_window_ms=DEFAULT_SPECTRAL_WINDOW_MS,
+                    spectral_window_type="Hamming",
+                    spectral_highpass_hz=DEFAULT_SPECTRAL_HIGHPASS_HZ,
+                    spectral_min_window_ms=MIN_SPECTRAL_WINDOW_MS,
                     categorise=False, cat_chart=None,
                     cat_notation="ipa", cat_tier_names=None,
                     cat_vowel_props=None, cat_consonant_props=None,
@@ -762,6 +848,10 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     do_at_points = formant_mode in ("at_points", "both") if extract_formants else False
     do_for_segments = formant_mode in ("for_segments", "both") if extract_formants else False
     time_mode = time_step_ms is not None and do_for_segments
+
+    if spectral_markers is None:
+        spectral_markers = []
+    spectral_shape = _spectral_window_shape(spectral_window_type)
 
     # Discover audio files
     audio_exts = {".wav", ".aiff", ".mp3"}
@@ -843,6 +933,14 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         for tn in duration_tier_names:
             headers.append(f"dur_{tn}")
 
+    # Spectral-moment columns (COG/SD/skew/kurt + actual window per marker)
+    if extract_spectral:
+        for pct in spectral_markers:
+            pct_s = f"{pct:g}"
+            headers.extend([f"COG_{pct_s}%", f"SD_{pct_s}%",
+                            f"skew_{pct_s}%", f"kurt_{pct_s}%",
+                            f"winms_{pct_s}%"])
+
     # Categorisation columns
     cat_col_start = len(headers)
     cat_col_info = []  # [(header_name, tier_name, col_type, prop_name), ...]
@@ -917,6 +1015,18 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     fd = extract_formants_from_praat(snd)
                 except Exception:
                     fd = None
+
+        # Load the raw sound for spectral analysis (high-pass filtered once
+        # per file if requested — cheaper and avoids per-window edge effects)
+        spectral_sound = None
+        if extract_spectral:
+            audio_path = os.path.join(audio_dir, audio_file)
+            try:
+                spectral_sound = parselmouth.Sound(audio_path)
+                spectral_sound = highpass_sound(
+                    spectral_sound, spectral_highpass_hz)
+            except Exception:
+                spectral_sound = None
 
         # Determine the lowest-level interval tier to drive rows
         lowest_tier = None
@@ -1015,6 +1125,41 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                             f"{v:.1f}" if not np.isnan(v) else "")
             return cols
 
+        def _segment_spectral_cols(iv):
+            """Spectral-moment cells for one interval.
+
+            Windows are centred at each percentage marker and clipped to the
+            interval, so they never read neighbouring-segment audio.  A window
+            clipped below the reliability floor blanks its moments but still
+            reports the actual window length (ms) for transparency.
+            """
+            cols = []
+            seg_min, seg_max = iv.xmin, iv.xmax
+            dur = seg_max - seg_min
+            window_s = spectral_window_ms / 1000.0
+            min_s = spectral_min_window_ms / 1000.0
+            for pct in spectral_markers:
+                if spectral_sound is None:
+                    cols.extend(["", "", "", "", ""])
+                    continue
+                t_center = seg_min + dur * pct / 100.0
+                t0, t1 = clip_window_to_segment(
+                    t_center, window_s, seg_min, seg_max)
+                actual_ms = (t1 - t0) * 1000.0
+                if (t1 - t0) < min_s:
+                    cols.extend(["", "", "", "", f"{actual_ms:.1f}"])
+                    continue
+                cog, sd, sk, ku = compute_spectral_moments(
+                    spectral_sound, t0, t1, spectral_shape)
+                cols.extend([
+                    f"{cog:.1f}" if not np.isnan(cog) else "",
+                    f"{sd:.1f}" if not np.isnan(sd) else "",
+                    f"{sk:.4f}" if not np.isnan(sk) else "",
+                    f"{ku:.4f}" if not np.isnan(ku) else "",
+                    f"{actual_ms:.1f}",
+                ])
+            return cols
+
         # Helper: categorisation columns for a row (given label_cols already built)
         def _cat_cols(label_cols_list):
             """Return list of categorisation cell values."""
@@ -1108,6 +1253,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                         row.extend(_segment_formant_cols(iv))
                         if extract_durations:
                             row.extend(_dur_cols(iv))
+                        if extract_spectral:
+                            row.extend(_segment_spectral_cols(iv))
                         row.extend(_cat_cols(lc_np))
                         rows.append(row)
                     continue
@@ -1168,6 +1315,9 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     if extract_durations:
                         row.extend(_dur_cols(iv))
 
+                    if extract_spectral:
+                        row.extend(_segment_spectral_cols(iv))
+
                     # Categorisation: label cols are row[1 : 1+n_labels]
                     n_labels = len(interval_tier_names) + len(point_tier_names)
                     row.extend(_cat_cols(row[1:1 + n_labels]))
@@ -1187,6 +1337,9 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
 
                 if extract_durations:
                     row.extend(_dur_cols(iv))
+
+                if extract_spectral:
+                    row.extend(_segment_spectral_cols(iv))
 
                 row.extend(_cat_cols(lc))
 
@@ -4207,6 +4360,63 @@ class _DataOptionsPage(QWizardPage):
         self._dur_group.setVisible(False)
         self._dur_cb.toggled.connect(self._dur_group.setVisible)
 
+        # --- Spectral moments (consonant / fricative spectra) ---
+        self._spectral_cb = QCheckBox(
+            "Extract spectral moments (COG, SD, skewness, kurtosis)")
+        layout.addWidget(self._spectral_cb)
+
+        self._spectral_group = QGroupBox()
+        spec_layout = QVBoxLayout(self._spectral_group)
+
+        spec_note = QLabel(
+            "Sampled on the lowest selected interval tier. Windows are "
+            "centred at each marker and clipped to the segment edges.")
+        spec_note.setWordWrap(True)
+        spec_note.setStyleSheet("color: #888888; font-size: 11px;")
+        spec_layout.addWidget(spec_note)
+
+        smk_row = QHBoxLayout()
+        smk_row.addWidget(QLabel("Percentage markers:"))
+        self._spectral_markers_edit = QLineEdit("20, 50, 80")
+        smk_row.addWidget(self._spectral_markers_edit, 1)
+        spec_layout.addLayout(smk_row)
+
+        win_row = QHBoxLayout()
+        win_row.addWidget(QLabel("Window length (ms):"))
+        self._spectral_window_spin = QDoubleSpinBox()
+        self._spectral_window_spin.setRange(
+            MIN_SPECTRAL_WINDOW_MS, MAX_SPECTRAL_WINDOW_MS)
+        self._spectral_window_spin.setSingleStep(5.0)
+        self._spectral_window_spin.setValue(DEFAULT_SPECTRAL_WINDOW_MS)
+        win_row.addWidget(self._spectral_window_spin)
+        win_row.addSpacing(12)
+        win_row.addWidget(QLabel("Window type:"))
+        self._spectral_window_combo = QComboBox()
+        self._spectral_window_combo.addItems(list(SPECTRAL_WINDOW_SHAPES))
+        win_row.addWidget(self._spectral_window_combo)
+        win_row.addStretch()
+        spec_layout.addLayout(win_row)
+
+        hp_row = QHBoxLayout()
+        self._spectral_hp_cb = QCheckBox("High-pass filter (Hz):")
+        self._spectral_hp_cb.setToolTip(
+            "Removes low-frequency voicing energy that pulls the centre of "
+            "gravity down. Recommended (~300 Hz) for voiced or noisy fricatives.")
+        hp_row.addWidget(self._spectral_hp_cb)
+        self._spectral_hp_spin = QDoubleSpinBox()
+        self._spectral_hp_spin.setRange(50.0, 2000.0)
+        self._spectral_hp_spin.setSingleStep(50.0)
+        self._spectral_hp_spin.setValue(300.0)
+        self._spectral_hp_spin.setEnabled(False)
+        hp_row.addWidget(self._spectral_hp_spin)
+        hp_row.addStretch()
+        spec_layout.addLayout(hp_row)
+        self._spectral_hp_cb.toggled.connect(self._spectral_hp_spin.setEnabled)
+
+        layout.addWidget(self._spectral_group)
+        self._spectral_group.setVisible(False)
+        self._spectral_cb.toggled.connect(self._spectral_group.setVisible)
+
         layout.addStretch()
         self.setStyleSheet(_DIALOG_FIELD_STYLE + _checked_tick_qss())
 
@@ -4272,12 +4482,14 @@ class _DataOptionsPage(QWizardPage):
 
         wiz.extract_formants = self._fmt_cb.isChecked()
         wiz.extract_durations = self._dur_cb.isChecked()
+        wiz.extract_spectral = self._spectral_cb.isChecked()
 
-        if not wiz.extract_formants and not wiz.extract_durations:
+        if not (wiz.extract_formants or wiz.extract_durations
+                or wiz.extract_spectral):
             QMessageBox.warning(
                 self, "Error",
                 "Select at least one extraction type "
-                "(formant values or durations).")
+                "(formant values, durations, or spectral moments).")
             return False
 
         if wiz.extract_formants:
@@ -4404,6 +4616,34 @@ class _DataOptionsPage(QWizardPage):
             wiz.duration_tier_names = dur_names
         else:
             wiz.duration_tier_names = []
+
+        if wiz.extract_spectral:
+            raw = self._spectral_markers_edit.text().strip()
+            try:
+                marks = [float(x.strip())
+                         for x in raw.split(",") if x.strip()]
+                if not marks:
+                    raise ValueError("empty")
+                for m in marks:
+                    if m < 0 or m > 100:
+                        raise ValueError(f"{m} out of range")
+                wiz.spectral_markers = marks
+            except ValueError as e:
+                QMessageBox.warning(
+                    self, "Error",
+                    f"Invalid spectral markers: {e}\n"
+                    "Enter comma-separated percentages 0–100.")
+                return False
+            wiz.spectral_window_ms = self._spectral_window_spin.value()
+            wiz.spectral_window_type = self._spectral_window_combo.currentText()
+            wiz.spectral_highpass_hz = (
+                self._spectral_hp_spin.value()
+                if self._spectral_hp_cb.isChecked() else 0.0)
+        else:
+            wiz.spectral_markers = []
+            wiz.spectral_window_ms = DEFAULT_SPECTRAL_WINDOW_MS
+            wiz.spectral_window_type = "Hamming"
+            wiz.spectral_highpass_hz = 0.0
 
         return True
 
@@ -5069,6 +5309,13 @@ class BuildCSVWizard(QWizard):
         self.time_step_ms = None
         self.extract_durations = False
         self.duration_tier_names = []
+
+        # Spectral-moment state (Page 3)
+        self.extract_spectral = False
+        self.spectral_markers = []
+        self.spectral_window_ms = DEFAULT_SPECTRAL_WINDOW_MS
+        self.spectral_window_type = "Hamming"
+        self.spectral_highpass_hz = 0.0
 
         # Categorisation state (Page 4)
         self.categorise = False
@@ -5952,6 +6199,11 @@ class MainWindow(QMainWindow):
                 progress_callback=on_progress,
                 include_point_times=wizard.include_point_times,
                 time_step_ms=wizard.time_step_ms,
+                extract_spectral=wizard.extract_spectral,
+                spectral_markers=wizard.spectral_markers,
+                spectral_window_ms=wizard.spectral_window_ms,
+                spectral_window_type=wizard.spectral_window_type,
+                spectral_highpass_hz=wizard.spectral_highpass_hz,
                 categorise=wizard.categorise,
                 cat_chart=cat_chart,
                 cat_notation=wizard.cat_notation,

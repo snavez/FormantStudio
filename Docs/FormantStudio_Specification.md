@@ -191,11 +191,20 @@ The Build CSV wizard (Tools > Build CSV) provides batch extraction of formant va
 
 1. **File Selection:** Add individual WAV files or scan directories. Files must have corresponding `.formants` and `.TextGrid` files.
 2. **Tier Selection:** Choose which IntervalTier(s) to extract formant data from. Optionally select TextTier point tiers and associate them with parent interval tiers.
-3. **Data Options:** Configure extraction mode:
-   - **Percentage-based:** Extract formant values at specified percentages through each interval (e.g., 25%, 50%, 75%)
-   - **Absolute time:** Extract at fixed time offsets from interval start
-   - Choose which formants (F1–F5) to include
-   - Duration column is always included
+3. **Data Options:** Configure extraction. At least one of formant values, durations, or
+   spectral moments must be selected.
+   - **Formant values** — percentage-based (values at specified percentages through each
+     interval, e.g. 25%, 50%, 75%) or absolute-time (fixed offsets from interval start);
+     also available at point-tier points.
+   - **Durations** — for one or more selected interval tiers.
+   - **Spectral moments** — centre of gravity, standard deviation, skewness and kurtosis of
+     the power spectrum, for consonant analysis (fricatives, stop releases, aspiration).
+     Sampled at percentage markers on the lowest selected interval tier. Configurable
+     analysis window length (5–50 ms, guardrailed) and type (Hamming/Hann), with an optional
+     high-pass filter to remove low-frequency voicing energy that biases the centre of
+     gravity. Each window is centred on its marker and **clipped to the segment edges** so it
+     never reads neighbouring-segment audio; a window clipped below the reliability floor
+     blanks its moments but still reports the actual window length (`winms_<pct>%` column).
 4. **Phonetic Categorisation (optional):** Classify interval labels by phonetic features using an IPA/SAMPA chart:
    - Manner of articulation
    - Place of articulation
@@ -205,7 +214,7 @@ The Build CSV wizard (Tools > Build CSV) provides batch extraction of formant va
 
 #### 2.7.2 Output Format
 
-The CSV output includes columns for filename, tier name, interval label, start/end times, duration, formant values at each extraction point, point tier labels (if selected), and categorisation columns (if enabled).
+The CSV output includes columns for filename, tier name, interval label, start/end times, duration, formant values at each extraction point, point tier labels (if selected), and categorisation columns (if enabled). Spectral columns, when enabled, follow the same wide layout as the formant columns: `COG_<pct>%`, `SD_<pct>%`, `skew_<pct>%`, `kurt_<pct>%` and `winms_<pct>%` per percentage marker.
 
 ### 2.8 IPA/SAMPA Reference Chart
 
