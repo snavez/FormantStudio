@@ -232,3 +232,107 @@ class TestSpectralCSV:
         cog_raw = float(r0[0][h0.index("COG_50%")])
         cog_hp = float(r1[0][h1.index("COG_50%")])
         assert cog_hp > cog_raw
+
+
+def _write_two_tier_corpus(tmp_path, duration_s=0.6, sr=44100):
+    """Word tier 0.1-0.5 'ta' containing phones 't' (0.1-0.2), 'a' (0.2-0.5)."""
+    audio_dir = tmp_path / "audio"
+    tg_dir = tmp_path / "tg"
+    audio_dir.mkdir()
+    tg_dir.mkdir()
+    rng = np.random.default_rng(2)
+    sig = rng.standard_normal(int(sr * duration_s)) * 0.2
+    snd = parselmouth.Sound(sig, sampling_frequency=sr)
+    snd.save(str(audio_dir / "test.wav"), parselmouth.SoundFileFormat.WAV)
+    words = Tier("words", "IntervalTier", 0.0, duration_s,
+                 intervals=[Interval(0.1, 0.5, "ta")])
+    phones = Tier("phones", "IntervalTier", 0.0, duration_s,
+                  intervals=[Interval(0.1, 0.2, "t"),
+                             Interval(0.2, 0.5, "a")])
+    TextGrid(0.0, duration_s, [words, phones]).save(
+        str(tg_dir / "test.TextGrid"))
+    return str(audio_dir), str(tg_dir)
+
+
+class TestSpectralTierSelection:
+    """Spectral sampling follows the chosen tier, not the row tier."""
+
+    def test_row_tier_sampling_differs_per_phone(self, tmp_path):
+        audio, tg = _write_two_tier_corpus(tmp_path)
+        tiers = TextGrid.from_file(os.path.join(tg, "test.TextGrid")).tiers
+        headers, rows = _build_csv_data(**_spectral_kwargs(
+            audio_dir=audio, textgrid_dir=tg, selected_tiers=tiers,
+            spectral_tier_name="phones", spectral_markers=[50]))
+        assert len(rows) == 2  # rows driven by phones (lowest tier)
+        wins = [float(r[headers.index("winms_50%")]) for r in rows]
+        assert all(w == pytest.approx(25.0, abs=0.5) for w in wins)
+        cogs = [r[headers.index("COG_50%")] for r in rows]
+        assert cogs[0] != cogs[1]  # different windows → different spectra
+
+    def test_parent_tier_sampling_repeats_across_rows(self, tmp_path):
+        audio, tg = _write_two_tier_corpus(tmp_path)
+        tiers = TextGrid.from_file(os.path.join(tg, "test.TextGrid")).tiers
+        headers, rows = _build_csv_data(**_spectral_kwargs(
+            audio_dir=audio, textgrid_dir=tg, selected_tiers=tiers,
+            spectral_tier_name="words", spectral_markers=[50]))
+        assert len(rows) == 2
+        # Both phone rows sample the containing WORD's midpoint window
+        cogs = [r[headers.index("COG_50%")] for r in rows]
+        assert cogs[0] == cogs[1] and cogs[0] != ""
+
+    def test_missing_tier_blanks_spectral_cells(self, tmp_path):
+        audio, tg = _write_two_tier_corpus(tmp_path)
+        tiers = TextGrid.from_file(os.path.join(tg, "test.TextGrid")).tiers
+        headers, rows = _build_csv_data(**_spectral_kwargs(
+            audio_dir=audio, textgrid_dir=tg, selected_tiers=tiers,
+            spectral_tier_name="nonexistent", spectral_markers=[50]))
+        for r in rows:
+            assert r[headers.index("COG_50%")] == ""
+            assert r[headers.index("winms_50%")] == ""
+
+
+class TestFormantSegmentTierResolution:
+    """The formant segment tier now genuinely controls sampling positions."""
+
+    def test_word_tier_sampling_repeats_across_phone_rows(self, tmp_path):
+        from formant_editor import FormantData
+        audio, tg = _write_two_tier_corpus(tmp_path)
+        tiers = TextGrid.from_file(os.path.join(tg, "test.TextGrid")).tiers
+        # Linear F1 ramp so the sampled time is recoverable from the value
+        fmt_dir = tmp_path / "fmt"
+        fmt_dir.mkdir()
+        n = 121
+        times = np.linspace(0.0, 0.6, n)
+        values = np.full((5, n), np.nan)
+        values[0] = np.linspace(0.0, 600.0, n)   # F1 = time_ms
+        values[1] = np.linspace(1000.0, 1000.0, n)
+        values[2] = np.linspace(2500.0, 2500.0, n)
+        FormantData(times=times, values=values, n_formants=5,
+                    time_step=times[1] - times[0]).save(
+            str(fmt_dir / "test.formants"))
+
+        headers, rows = _build_csv_data(
+            audio_dir=audio, textgrid_dir=tg, formants_dir=str(fmt_dir),
+            selected_tiers=tiers,
+            extract_formants=True, formant_mode="for_segments",
+            point_tier_name=None, segment_tier_name="words",
+            percentage_markers=[50], extract_durations=False,
+            duration_tier_names=[],
+        )
+        f1s = [float(r[headers.index("F1_50%")]) for r in rows]
+        # Word midpoint = 0.3 s → F1 ≈ 300 for BOTH phone rows
+        assert f1s[0] == pytest.approx(300.0, abs=6.0)
+        assert f1s[1] == pytest.approx(300.0, abs=6.0)
+
+        headers, rows = _build_csv_data(
+            audio_dir=audio, textgrid_dir=tg, formants_dir=str(fmt_dir),
+            selected_tiers=tiers,
+            extract_formants=True, formant_mode="for_segments",
+            point_tier_name=None, segment_tier_name="phones",
+            percentage_markers=[50], extract_durations=False,
+            duration_tier_names=[],
+        )
+        f1s = [float(r[headers.index("F1_50%")]) for r in rows]
+        # Phone midpoints: 't' → 0.15 s, 'a' → 0.35 s
+        assert f1s[0] == pytest.approx(150.0, abs=6.0)
+        assert f1s[1] == pytest.approx(350.0, abs=6.0)

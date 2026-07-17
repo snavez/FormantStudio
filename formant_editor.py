@@ -81,6 +81,11 @@ MAX_SPECTROGRAM_VIEW = 10.0    # seconds — hide spectrogram beyond this
 MIN_VIEW_WIDTH = 0.1           # seconds — maximum zoom
 ZOOM_FACTOR = 1.3              # per scroll wheel notch
 
+# Boundary/point dragging: pixels the mouse must travel before a press on a
+# marker becomes a move. A plain click only selects — it never shifts the
+# marker.
+DRAG_START_PX = 5.0
+
 # Undo system
 from collections import namedtuple
 UndoEntry = namedtuple('UndoEntry', ['description', 'changes'])
@@ -816,6 +821,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     include_point_times=False,
                     time_step_ms=None,
                     extract_spectral=False, spectral_markers=None,
+                    spectral_tier_name=None,
                     spectral_window_ms=DEFAULT_SPECTRAL_WINDOW_MS,
                     spectral_window_type="Hamming",
                     spectral_highpass_hz=DEFAULT_SPECTRAL_HIGHPASS_HZ,
@@ -1101,15 +1107,42 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     cols.append(f"{civ.xmax - civ.xmin:.4f}" if civ else "")
             return cols
 
+        def _resolve_sampling_interval(iv, tier_name):
+            """Return the interval on *tier_name* containing row token *iv*.
+
+            Mirrors duration-tier resolution: the token's own interval when
+            *tier_name* is the row tier (or unset), else the containing
+            interval on that tier, or None when there is none.
+            """
+            if not tier_name or tier_name == lowest_tier.name:
+                return iv
+            t = tier_map.get(tier_name)
+            if t is None or t.tier_class != "IntervalTier":
+                return None
+            civ = _find_containing_interval(t, iv.xmin, iv.xmax)
+            if civ is None:
+                civ = _find_containing_interval_for_point(
+                    t, (iv.xmin + iv.xmax) / 2)
+            return civ
+
         def _segment_formant_cols(iv):
-            """Return formant value cells for one interval's segment sampling."""
+            """Return formant value cells for one interval's segment sampling.
+
+            Sampling positions are computed on the interval of the selected
+            segment tier that contains the row token (the token itself when
+            that tier drives the rows).
+            """
             cols = []
-            dur = iv.xmax - iv.xmin
+            seg = _resolve_sampling_interval(iv, segment_tier_name)
+            if seg is None:
+                n = len(time_offsets_ms) if time_mode else len(percentage_markers)
+                return [""] * (3 * n)
+            dur = seg.xmax - seg.xmin
             if time_mode:
                 for ms in time_offsets_ms:
                     offset_s = ms / 1000.0
                     if offset_s <= dur + 1e-9:
-                        t = iv.xmin + offset_s
+                        t = seg.xmin + offset_s
                         f1, f2, f3 = _get_formant_at_time(fd, t)
                         for v in (f1, f2, f3):
                             cols.append(
@@ -1118,7 +1151,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                         cols.extend(["", "", ""])
             else:
                 for pct in percentage_markers:
-                    t = iv.xmin + dur * pct / 100.0
+                    t = seg.xmin + dur * pct / 100.0
                     f1, f2, f3 = _get_formant_at_time(fd, t)
                     for v in (f1, f2, f3):
                         cols.append(
@@ -1134,7 +1167,10 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             reports the actual window length (ms) for transparency.
             """
             cols = []
-            seg_min, seg_max = iv.xmin, iv.xmax
+            seg = _resolve_sampling_interval(iv, spectral_tier_name)
+            if seg is None:
+                return [""] * (5 * len(spectral_markers))
+            seg_min, seg_max = seg.xmin, seg.xmax
             dur = seg_max - seg_min
             window_s = spectral_window_ms / 1000.0
             min_s = spectral_min_window_ms / 1000.0
@@ -1572,6 +1608,8 @@ class SpectrogramCanvas(QWidget):
         # TextGrid editing state
         self._selected_boundary = None
         self._dragging_boundary = False
+        self._drag_active = False     # True once mouse moved past DRAG_START_PX
+        self._drag_press_pos = None   # (x, y) widget coords at press
         self._drag_tier_index = None
         self._drag_original_time = None
         self._drag_min_time = 0.0
@@ -1608,6 +1646,7 @@ class SpectrogramCanvas(QWidget):
         self._status_callback = None
         self._on_formant_edited = None
         self._on_textgrid_edited = None
+        self._on_tiers_changed = None   # tier names/list changed
         self._on_view_changed_callback = None
 
         # Snap-to-boundary settings (set by MainWindow)
@@ -2497,6 +2536,35 @@ class SpectrogramCanvas(QWidget):
     # TextGrid editing helpers
     # -------------------------------------------------------------------
 
+    def rename_tier(self, tier_idx, new_name):
+        """Rename a tier and refresh dependent UI. Returns True if renamed."""
+        tg = self.textgrid_data
+        if tg is None or not (0 <= tier_idx < len(tg.tiers)):
+            return False
+        new_name = new_name.strip()
+        if not new_name or new_name == tg.tiers[tier_idx].name:
+            return False
+        tg.tiers[tier_idx].name = new_name
+        if self._on_textgrid_edited is not None:
+            self._on_textgrid_edited()
+        if self._on_tiers_changed is not None:
+            self._on_tiers_changed()
+        # Rebuild axes so the left-axis width fits the new name
+        self._setup_axes()
+        self.render()
+        return True
+
+    def _prompt_rename_tier(self, tier_idx):
+        """Ask for a new tier name (invoked by clicking the tier's name)."""
+        tg = self.textgrid_data
+        if tg is None or not (0 <= tier_idx < len(tg.tiers)):
+            return
+        name, ok = QInputDialog.getText(
+            self, "Rename Tier", "Tier name:",
+            text=tg.tiers[tier_idx].name)
+        if ok:
+            self.rename_tier(tier_idx, name)
+
     def _tier_index_for_plot(self, plot):
         """Return the actual tier index for a given PlotItem, or None."""
         for i, tp in enumerate(self._tier_plots):
@@ -2862,6 +2930,17 @@ class SpectrogramCanvas(QWidget):
         elif not is_left:
             return
 
+        # --- Click on a tier's name (left axis) → rename ---
+        if is_left and self.textgrid_data is not None and self._tier_plots:
+            pos = (event.position() if hasattr(event, 'position')
+                   else event.pos())
+            scene_pos = self._glw.mapToScene(pos.toPoint())
+            for i, tp in enumerate(self._tier_plots):
+                ax = tp.getAxis('left')
+                if ax.sceneBoundingRect().contains(scene_pos):
+                    self._prompt_rename_tier(self._tier_plot_indices[i])
+                    return
+
         name, plot, time, y, tier_idx = self._map_event_to_data(event)
 
         # --- TextGrid tier click (left-click only) ---
@@ -3021,8 +3100,16 @@ class SpectrogramCanvas(QWidget):
         return best_t
 
     def _start_boundary_drag(self, tier_idx, bt, event):
-        """Start a boundary drag operation."""
+        """Arm a boundary drag operation.
+
+        The marker does not move yet: dragging only becomes active once the
+        mouse travels DRAG_START_PX from the press position, so a plain
+        click selects without shifting the marker.
+        """
         self._dragging_boundary = True
+        self._drag_active = False
+        pos = event.position() if hasattr(event, 'position') else event.pos()
+        self._drag_press_pos = (pos.x(), pos.y())
         self._drag_tier_index = tier_idx
         self._drag_original_time = bt
 
@@ -3062,6 +3149,29 @@ class SpectrogramCanvas(QWidget):
     def _on_mouse_release(self, event):
         # --- End boundary drag ---
         if self._dragging_boundary:
+            # Plain click (never crossed the drag threshold): select the
+            # marker but do NOT move it or touch the TextGrid.
+            if not self._drag_active:
+                tier = self.textgrid_data.tiers[self._drag_tier_index]
+                if tier.tier_class != "TextTier":
+                    # Points were already selected on press; for interval
+                    # boundaries, select so aligned-boundary circles appear.
+                    self._selected_boundary = (self._drag_tier_index,
+                                               self._drag_original_time)
+                for p, line in self._drag_lines:
+                    try:
+                        p.removeItem(line)
+                    except Exception:
+                        pass
+                self._drag_lines = []
+                self._drag_aligned = []
+                self._dragging_boundary = False
+                self._drag_active = False
+                self._drag_tier_index = None
+                self._drag_original_time = None
+                self.render()
+                return
+
             _, _, time, _, _ = self._map_event_to_data(event)
             final_time = self._drag_original_time
             if time is not None:
@@ -3109,6 +3219,7 @@ class SpectrogramCanvas(QWidget):
             self._drag_lines = []
             self._drag_aligned = []
             self._dragging_boundary = False
+            self._drag_active = False
             self._drag_tier_index = None
             self._drag_original_time = None
             self.render()
@@ -3177,6 +3288,14 @@ class SpectrogramCanvas(QWidget):
     def _on_mouse_move(self, event):
         # --- Boundary drag ---
         if self._dragging_boundary:
+            if not self._drag_active:
+                pos = (event.position() if hasattr(event, 'position')
+                       else event.pos())
+                dx = pos.x() - self._drag_press_pos[0]
+                dy = pos.y() - self._drag_press_pos[1]
+                if dx * dx + dy * dy < DRAG_START_PX * DRAG_START_PX:
+                    return  # still a click — don't move the marker
+                self._drag_active = True
             _, _, time, _, _ = self._map_event_to_data(event)
             if time is not None:
                 new_time = max(self._drag_min_time,
@@ -4369,11 +4488,17 @@ class _DataOptionsPage(QWizardPage):
         spec_layout = QVBoxLayout(self._spectral_group)
 
         spec_note = QLabel(
-            "Sampled on the lowest selected interval tier. Windows are "
-            "centred at each marker and clipped to the segment edges.")
+            "Windows are centred at each marker and clipped to the "
+            "segment edges of the chosen tier.")
         spec_note.setWordWrap(True)
         spec_note.setStyleSheet("color: #888888; font-size: 11px;")
         spec_layout.addWidget(spec_note)
+
+        stier_row = QHBoxLayout()
+        stier_row.addWidget(QLabel("Segment tier:"))
+        self._spectral_tier_combo = QComboBox()
+        stier_row.addWidget(self._spectral_tier_combo, 1)
+        spec_layout.addLayout(stier_row)
 
         smk_row = QHBoxLayout()
         smk_row.addWidget(QLabel("Percentage markers:"))
@@ -4433,15 +4558,27 @@ class _DataOptionsPage(QWizardPage):
             cb.deleteLater()
         self._dur_checks = []
 
+        self._spectral_tier_combo.clear()
         for name, tc in selected:
             if tc == "TextTier":
                 self._point_tier_combo.addItem(name)
             else:
                 self._seg_tier_combo.addItem(name)
+                self._spectral_tier_combo.addItem(name)
                 cb = QCheckBox(name)
                 cb.setChecked(True)
                 self._dur_layout.addWidget(cb)
                 self._dur_checks.append((cb, name))
+
+        # Default both segment-tier combos to the LOWEST interval tier —
+        # the tier that drives the rows — so sampling matches the row
+        # tokens unless the user explicitly chooses a higher tier.
+        if self._seg_tier_combo.count() > 0:
+            self._seg_tier_combo.setCurrentIndex(
+                self._seg_tier_combo.count() - 1)
+        if self._spectral_tier_combo.count() > 0:
+            self._spectral_tier_combo.setCurrentIndex(
+                self._spectral_tier_combo.count() - 1)
 
         self._update_fmt_ui()
 
@@ -4634,6 +4771,12 @@ class _DataOptionsPage(QWizardPage):
                     f"Invalid spectral markers: {e}\n"
                     "Enter comma-separated percentages 0–100.")
                 return False
+            wiz.spectral_tier_name = self._spectral_tier_combo.currentText()
+            if not wiz.spectral_tier_name:
+                QMessageBox.warning(
+                    self, "Error",
+                    "No interval tier available for spectral analysis.")
+                return False
             wiz.spectral_window_ms = self._spectral_window_spin.value()
             wiz.spectral_window_type = self._spectral_window_combo.currentText()
             wiz.spectral_highpass_hz = (
@@ -4641,6 +4784,7 @@ class _DataOptionsPage(QWizardPage):
                 if self._spectral_hp_cb.isChecked() else 0.0)
         else:
             wiz.spectral_markers = []
+            wiz.spectral_tier_name = None
             wiz.spectral_window_ms = DEFAULT_SPECTRAL_WINDOW_MS
             wiz.spectral_window_type = "Hamming"
             wiz.spectral_highpass_hz = 0.0
@@ -5313,6 +5457,7 @@ class BuildCSVWizard(QWizard):
         # Spectral-moment state (Page 3)
         self.extract_spectral = False
         self.spectral_markers = []
+        self.spectral_tier_name = None
         self.spectral_window_ms = DEFAULT_SPECTRAL_WINDOW_MS
         self.spectral_window_type = "Hamming"
         self.spectral_highpass_hz = 0.0
@@ -5389,6 +5534,8 @@ class MainWindow(QMainWindow):
         self.canvas._status_callback = lambda msg: self.status.showMessage(msg)
         self.canvas._on_formant_edited = self._on_formant_edited
         self.canvas._on_textgrid_edited = self._on_textgrid_edited
+        self.canvas._on_tiers_changed = (
+            lambda: self._setup_tier_checkboxes(preserve_hidden=True))
 
         # Inline label editor
         self.label_edit = LabelEdit()
@@ -6201,6 +6348,7 @@ class MainWindow(QMainWindow):
                 time_step_ms=wizard.time_step_ms,
                 extract_spectral=wizard.extract_spectral,
                 spectral_markers=wizard.spectral_markers,
+                spectral_tier_name=wizard.spectral_tier_name,
                 spectral_window_ms=wizard.spectral_window_ms,
                 spectral_window_type=wizard.spectral_window_type,
                 spectral_highpass_hz=wizard.spectral_highpass_hz,
@@ -6320,14 +6468,19 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to write CSV:\n{e}")
 
-    def _setup_tier_checkboxes(self):
-        """Populate tier visibility checkboxes for the current TextGrid."""
+    def _setup_tier_checkboxes(self, preserve_hidden=False):
+        """Populate tier visibility checkboxes for the current TextGrid.
+
+        *preserve_hidden* keeps the current hidden-tier set (e.g. after a
+        rename); otherwise it resets, as when loading a new TextGrid.
+        """
         tg = self.canvas.textgrid_data
         if tg is None:
             self.controls.populate_tier_checkboxes([], set())
             return
         names = [t.name for t in tg.tiers]
-        self.canvas.hidden_tiers = set()  # reset when loading new TextGrid
+        if not preserve_hidden:
+            self.canvas.hidden_tiers = set()
         self.controls.populate_tier_checkboxes(names, self.canvas.hidden_tiers)
         # Connect signals
         for i, cb in enumerate(self.controls._tier_checkboxes):

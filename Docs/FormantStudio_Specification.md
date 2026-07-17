@@ -199,7 +199,10 @@ The Build CSV wizard (Tools > Build CSV) provides batch extraction of formant va
    - **Durations** — for one or more selected interval tiers.
    - **Spectral moments** — centre of gravity, standard deviation, skewness and kurtosis of
      the power spectrum, for consonant analysis (fricatives, stop releases, aspiration).
-     Sampled at percentage markers on the lowest selected interval tier. Configurable
+     Sampled at percentage markers on a user-selected interval tier (rows are still driven
+     by the lowest selected tier; when the spectral tier sits higher, each row reports the
+     values of its containing segment, as duration columns do). The formant segment tier
+     behaves the same way. Configurable
      analysis window length (5–50 ms, guardrailed) and type (Hamming/Hann), with an optional
      high-pass filter to remove low-frequency voicing energy that biases the centre of
      gravity. Each window is centred on its marker and **clipped to the segment edges** so it

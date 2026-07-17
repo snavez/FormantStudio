@@ -366,6 +366,132 @@ class TestPlayback:
 
 
 # ---------------------------------------------------------------------------
+# Click-vs-drag threshold on boundary/point markers
+# ---------------------------------------------------------------------------
+
+class _FakeMouseEvent:
+    """Minimal stand-in for QMouseEvent (position/modifiers/button)."""
+
+    def __init__(self, x, y):
+        from PyQt6.QtCore import QPointF
+        self._pos = QPointF(x, y)
+
+    def position(self):
+        return self._pos
+
+    def modifiers(self):
+        from PyQt6.QtCore import Qt
+        return Qt.KeyboardModifier.NoModifier
+
+    def button(self):
+        from PyQt6.QtCore import Qt
+        return Qt.MouseButton.LeftButton
+
+
+class TestClickVsDrag:
+    def test_plain_click_selects_without_moving(
+            self, canvas_with_sound, simple_textgrid):
+        c = canvas_with_sound
+        c.textgrid_data = simple_textgrid
+        c._setup_axes()
+        c.render()
+        edits = []
+        c._on_textgrid_edited = lambda: edits.append(1)
+
+        c._start_boundary_drag(0, 0.5, _FakeMouseEvent(100, 50))
+        assert c._dragging_boundary and not c._drag_active
+        # Jitter below the threshold must not activate the drag
+        c._on_mouse_move(_FakeMouseEvent(102, 51))
+        assert not c._drag_active
+        c._on_mouse_release(_FakeMouseEvent(102, 51))
+
+        assert not c._dragging_boundary
+        assert c._selected_boundary == (0, 0.5)          # selected...
+        assert c.textgrid_data.tiers[0].intervals[0].xmax == 0.5  # ...unmoved
+        assert edits == []                               # not marked dirty
+
+    def test_move_past_threshold_activates_drag(
+            self, canvas_with_sound, simple_textgrid):
+        c = canvas_with_sound
+        c.textgrid_data = simple_textgrid
+        c._setup_axes()
+        c.render()
+        edits = []
+        c._on_textgrid_edited = lambda: edits.append(1)
+
+        c._start_boundary_drag(0, 0.5, _FakeMouseEvent(100, 50))
+        c._on_mouse_move(_FakeMouseEvent(110, 50))  # 10 px > threshold
+        assert c._drag_active
+        c._on_mouse_release(_FakeMouseEvent(110, 50))
+        assert not c._dragging_boundary and not c._drag_active
+        assert edits == [1]  # a real move commits and marks dirty
+
+    def test_plain_click_on_point_keeps_time(
+            self, canvas_with_sound, point_textgrid):
+        c = canvas_with_sound
+        c.textgrid_data = point_textgrid
+        c._setup_axes()
+        c.render()
+        edits = []
+        c._on_textgrid_edited = lambda: edits.append(1)
+
+        c._start_boundary_drag(1, 0.25, _FakeMouseEvent(200, 80))
+        c._on_mouse_release(_FakeMouseEvent(200, 80))
+        assert c.textgrid_data.tiers[1].points[0].time == 0.25
+        assert edits == []
+
+
+# ---------------------------------------------------------------------------
+# Tier rename
+# ---------------------------------------------------------------------------
+
+class TestRenameTier:
+    def test_rename_updates_name_and_fires_callbacks(
+            self, canvas_with_sound, simple_textgrid):
+        c = canvas_with_sound
+        c.textgrid_data = simple_textgrid
+        c._setup_axes()
+        c.render()
+        edits, changes = [], []
+        c._on_textgrid_edited = lambda: edits.append(1)
+        c._on_tiers_changed = lambda: changes.append(1)
+
+        assert c.rename_tier(0, "  lexical ") is True
+        assert c.textgrid_data.tiers[0].name == "lexical"
+        assert edits == [1] and changes == [1]
+
+    def test_rename_rejects_empty_same_or_bad_index(
+            self, canvas_with_sound, simple_textgrid):
+        c = canvas_with_sound
+        c.textgrid_data = simple_textgrid
+        c._setup_axes()
+        edits = []
+        c._on_textgrid_edited = lambda: edits.append(1)
+
+        assert c.rename_tier(0, "words") is False   # unchanged name
+        assert c.rename_tier(0, "   ") is False     # empty
+        assert c.rename_tier(99, "x") is False      # bad index
+        assert edits == []
+        assert c.textgrid_data.tiers[0].name == "words"
+
+    def test_rename_without_textgrid_is_safe(self, canvas):
+        assert canvas.rename_tier(0, "x") is False
+
+    def test_rename_preserves_hidden_tiers_via_mainwindow(
+            self, qapp, wav_path, simple_textgrid):
+        mw = MainWindow()
+        mw.canvas.load_sound(wav_path)
+        mw.canvas.textgrid_data = simple_textgrid
+        mw._setup_tier_checkboxes()
+        mw.canvas.hidden_tiers = {1}
+        mw.canvas._setup_axes()
+        mw.canvas.render()
+        assert mw.canvas.rename_tier(0, "renamed") is True
+        assert mw.canvas.hidden_tiers == {1}  # hidden state survives rename
+        assert mw.canvas.textgrid_data.tiers[0].name == "renamed"
+
+
+# ---------------------------------------------------------------------------
 # Undo/redo (via canvas, not FakeCanvas)
 # ---------------------------------------------------------------------------
 
