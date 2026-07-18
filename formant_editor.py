@@ -4514,7 +4514,10 @@ class _DataOptionsPage(QWizardPage):
 
         self._dur_group = QGroupBox("Duration tiers")
         self._dur_layout = QGridLayout(self._dur_group)
-        self._dur_layout.setColumnStretch(0, 1)
+        # Keep the two checkbox columns adjacent; stretch lives in a third
+        # empty column so "+ start/end times" sits next to the tier name.
+        self._dur_layout.setHorizontalSpacing(24)
+        self._dur_layout.setColumnStretch(2, 1)
         self._dur_checks = []  # list of (dur_cb, bounds_cb, tier_name)
         layout.addWidget(self._dur_group)
         self._dur_group.setVisible(False)
@@ -4621,15 +4624,15 @@ class _DataOptionsPage(QWizardPage):
                 self._dur_checks.append((dur_cb, bounds_cb, name))
                 grid_row += 1
 
-        # Default both segment-tier combos to the LOWEST interval tier —
-        # the tier that drives the rows — so sampling matches the row
-        # tokens unless the user explicitly chooses a higher tier.
-        if self._seg_tier_combo.count() > 0:
-            self._seg_tier_combo.setCurrentIndex(
-                self._seg_tier_combo.count() - 1)
-        if self._spectral_tier_combo.count() > 0:
-            self._spectral_tier_combo.setCurrentIndex(
-                self._spectral_tier_combo.count() - 1)
+        # Default both segment-tier combos to the PRIMARY tier — sampling
+        # then matches the rows the user asked for. Falls back to the last
+        # interval tier when the primary is a point tier.
+        primary = getattr(wiz, "primary_tier_name", None)
+        for combo in (self._seg_tier_combo, self._spectral_tier_combo):
+            if combo.count() == 0:
+                continue
+            idx = combo.findText(primary) if primary else -1
+            combo.setCurrentIndex(idx if idx >= 0 else combo.count() - 1)
 
         self._update_fmt_ui()
 
