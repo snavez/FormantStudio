@@ -321,6 +321,20 @@ class Tier:
         self.intervals = intervals or []
         self.points = points or []
 
+    def copy(self, name=None):
+        """Return a deep copy of this tier, optionally renamed.
+
+        Intervals and points are duplicated so the copy can be edited
+        without touching the source tier.
+        """
+        return Tier(
+            name if name is not None else self.name,
+            self.tier_class, self.xmin, self.xmax,
+            intervals=[Interval(iv.xmin, iv.xmax, iv.text)
+                       for iv in self.intervals],
+            points=[Point(p.time, p.mark) for p in self.points],
+        )
+
     def __eq__(self, other):
         if not isinstance(other, Tier):
             return NotImplemented
@@ -5639,6 +5653,10 @@ class MainWindow(QMainWindow):
         add_tier_action.triggered.connect(self._add_tier_to_textgrid)
         file_menu.addAction(add_tier_action)
 
+        dup_tier_action = QAction("D&uplicate Tier...", self)
+        dup_tier_action.triggered.connect(self._duplicate_tier_in_textgrid)
+        file_menu.addAction(dup_tier_action)
+
         delete_tier_action = QAction("&Delete Tier...", self)
         delete_tier_action.triggered.connect(self._delete_tier_from_textgrid)
         file_menu.addAction(delete_tier_action)
@@ -6564,6 +6582,20 @@ class MainWindow(QMainWindow):
             return dlg.get_textgrid()
         return None
 
+    def _insert_tier(self, new_tier, pos):
+        """Insert *new_tier* at *pos*, fixing active/hidden indices and UI."""
+        tg = self.canvas.textgrid_data
+        tg.tiers.insert(pos, new_tier)
+        if (self.canvas._active_tier is not None
+                and pos <= self.canvas._active_tier):
+            self.canvas._active_tier += 1
+        self.canvas.hidden_tiers = {
+            h + 1 if h >= pos else h for h in self.canvas.hidden_tiers}
+        self._textgrid_dirty = True
+        self._setup_tier_checkboxes(preserve_hidden=True)
+        self.canvas._setup_axes()
+        self.canvas.render()
+
     def _add_tier_to_textgrid(self):
         """Show AddTierDialog and insert a new tier into the current TextGrid."""
         tg = self.canvas.textgrid_data
@@ -6573,21 +6605,38 @@ class MainWindow(QMainWindow):
         dlg = AddTierDialog(tg, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             new_tier = dlg.get_tier()
-            pos = dlg.get_position()
-            tg.tiers.insert(pos, new_tier)
-            # Adjust active tier and hidden tiers if they shifted
-            if (self.canvas._active_tier is not None
-                    and pos <= self.canvas._active_tier):
-                self.canvas._active_tier += 1
-            # Shift hidden tier indices
-            new_hidden = set()
-            for h in self.canvas.hidden_tiers:
-                new_hidden.add(h + 1 if h >= pos else h)
-            self.canvas.hidden_tiers = new_hidden
-            self._setup_tier_checkboxes()
-            self.canvas._setup_axes()
-            self.canvas.render()
+            self._insert_tier(new_tier, dlg.get_position())
             self.status.showMessage(f"Added tier \"{new_tier.name}\"")
+
+    def _duplicate_tier_in_textgrid(self):
+        """Copy an existing tier's contents into a new, renamed tier.
+
+        Useful for building a tier that mostly mirrors another (e.g. an
+        allophone tier seeded from the phoneme tier) — duplicate, rename,
+        then edit only what differs instead of annotating from scratch.
+        """
+        tg = self.canvas.textgrid_data
+        if tg is None or not tg.tiers:
+            self.status.showMessage("No TextGrid loaded")
+            return
+        names = [f"{i + 1}. {t.name}" for i, t in enumerate(tg.tiers)]
+        choice, ok = QInputDialog.getItem(
+            self, "Duplicate Tier", "Tier to duplicate:", names, 0, False)
+        if not ok:
+            return
+        src_idx = names.index(choice)
+        src = tg.tiers[src_idx]
+        new_name, ok = QInputDialog.getText(
+            self, "Duplicate Tier", "New tier name:",
+            text=f"{src.name}_copy")
+        if not ok:
+            return
+        new_name = new_name.strip() or f"{src.name}_copy"
+        self._insert_tier(src.copy(name=new_name), src_idx + 1)
+        n = (len(src.intervals) if src.tier_class == "IntervalTier"
+             else len(src.points))
+        self.status.showMessage(
+            f"Duplicated \"{src.name}\" → \"{new_name}\" ({n} items)")
 
     def _delete_tier_from_textgrid(self):
         """Show a tier selection dialog and delete the chosen tier."""

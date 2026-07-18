@@ -477,6 +477,31 @@ class TestRenameTier:
     def test_rename_without_textgrid_is_safe(self, canvas):
         assert canvas.rename_tier(0, "x") is False
 
+
+class TestDuplicateTier:
+    def test_insert_tier_places_copy_and_shifts_hidden(
+            self, qapp, wav_path, simple_textgrid):
+        mw = MainWindow()
+        mw.canvas.load_sound(wav_path)
+        mw.canvas.textgrid_data = simple_textgrid
+        mw._setup_tier_checkboxes()
+        mw.canvas.hidden_tiers = {1}      # 'phones' hidden
+        mw.canvas._setup_axes()
+        mw.canvas.render()
+
+        src = mw.canvas.textgrid_data.tiers[0]   # 'words'
+        dup = src.copy(name="words_copy")
+        mw._insert_tier(dup, 1)                   # insert between the two
+
+        tiers = mw.canvas.textgrid_data.tiers
+        assert [t.name for t in tiers] == ["words", "words_copy", "phones"]
+        # 'phones' was index 1, now index 2 — its hidden flag must follow
+        assert mw.canvas.hidden_tiers == {2}
+        assert mw._textgrid_dirty is True
+        # Deep copy: editing the duplicate leaves the source intact
+        dup.intervals[0].text = "ZZZ"
+        assert tiers[0].intervals[0].text == "hello"
+
     def test_rename_preserves_hidden_tiers_via_mainwindow(
             self, qapp, wav_path, simple_textgrid):
         mw = MainWindow()

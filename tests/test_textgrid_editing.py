@@ -385,3 +385,33 @@ class TestBoundaryDragOnRelease:
         tier = _make_text_tier()
         _move_boundary(tier, 1.5, 1.8)
         assert tier.points[1] == Point(1.8, "beep")
+
+
+class TestTierCopy:
+    def test_interval_tier_copy_equal_but_independent(self):
+        src = _make_interval_tier()
+        dup = src.copy(name="allophone")
+        assert dup.name == "allophone"
+        assert dup.tier_class == src.tier_class
+        assert (dup.xmin, dup.xmax) == (src.xmin, src.xmax)
+        # Same contents...
+        assert dup.intervals == src.intervals
+        # ...but deep-copied: editing the copy must not touch the source
+        dup.intervals[0].text = "CHANGED"
+        dup.intervals[0].xmax = 0.42
+        assert src.intervals[0].text == "the"
+        assert src.intervals[0].xmax == 0.5
+
+    def test_point_tier_copy_independent(self):
+        src = _make_text_tier()
+        dup = src.copy()
+        assert dup.name == src.name           # default keeps the name
+        assert dup.points == src.points
+        dup.points[0].mark = "X"
+        dup.points.append(Point(1.9, "extra"))
+        assert src.points[0].mark == "click"
+        assert len(src.points) == 2
+
+    def test_copy_default_name_is_source_name(self):
+        src = _make_interval_tier()
+        assert src.copy().name == "words"
