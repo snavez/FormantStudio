@@ -816,7 +816,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     selected_tiers, extract_formants, formant_mode,
                     point_tier_name, segment_tier_name,
                     percentage_markers, extract_durations,
-                    duration_tier_names,
+                    duration_tier_names, bounds_tier_names=None,
                     primary_tier_name=None,
                     progress_callback=None,
                     include_point_times=False,
@@ -841,9 +841,13 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     column is matched to the row unit purely by time: other interval tiers
     contribute the label of the interval encapsulating the unit, or the
     "; "-joined labels of the intervals subdividing it; point tiers
-    contribute the marks falling inside it.  ``row_start``/``row_end``
-    columns carry the unit's own bounds (equal for a point) so downstream
-    tools can deduplicate tokens.
+    contribute the marks falling inside it.  A point primary contributes a
+    single ``<tier>_time`` column (a point has no width).
+
+    Duration extraction is per tier: every name in *duration_tier_names*
+    yields a ``<tier>_dur`` column; names also in *bounds_tier_names* gain
+    ``<tier>_start``/``<tier>_end`` columns before it, carrying the bounds
+    of the interval the row unit resolved to on that tier.
 
     *formant_mode* can be ``"at_points"``, ``"for_segments"``, or ``"both"``.
     At-points formants are WIDE: numbered column sets (``F1_<tier>1`` …
@@ -880,6 +884,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         if os.path.splitext(f)[1].lower() in audio_exts
     )
 
+    bounds_set = set(bounds_tier_names or [])
+
     # The PRIMARY tier drives the rows. Default to the last selected
     # interval tier (preserves prior behaviour when unset).
     if primary_tier_name is None:
@@ -887,6 +893,9 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             if t.tier_class == "IntervalTier":
                 primary_tier_name = t.name
                 break
+    primary_is_point = any(
+        t.name == primary_tier_name and t.tier_class == "TextTier"
+        for t in selected_tiers)
 
     def _units_for(primary_tier):
         """Row units for a primary tier: labelled intervals, or all points."""
@@ -959,9 +968,11 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                         if t.tier_class == "TextTier"]
     headers.extend(point_tier_names)
 
-    # Row token bounds — explicit anchors so downstream tools can
-    # deduplicate tokens and compute overlaps
-    headers.extend(["row_start", "row_end"])
+    # A point primary contributes its own time column (a point has no
+    # width, so a single time replaces start/end bounds). Interval-primary
+    # bounds are available per tier via the durations option below.
+    if primary_is_point:
+        headers.append(f"{primary_tier_name}_time")
 
     # Formant columns — at-points, wide: one numbered set per target point
     # (F1_Target1 … F1_TargetN, sized by the corpus maximum per row segment)
@@ -986,10 +997,13 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 headers.extend([f"F1_{pct_s}%", f"F2_{pct_s}%",
                                 f"F3_{pct_s}%"])
 
-    # Duration columns
+    # Duration columns — per tier: <tier>_dur, preceded by the resolved
+    # interval's bounds when the tier was also ticked for start/end times
     if extract_durations:
         for tn in duration_tier_names:
-            headers.append(f"dur_{tn}")
+            if tn in bounds_set:
+                headers.extend([f"{tn}_start", f"{tn}_end"])
+            headers.append(f"{tn}_dur")
 
     # Spectral-moment columns (COG/SD/skew/kurt + actual window per marker)
     if extract_spectral:
@@ -1147,21 +1161,27 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 cols.append("; ".join(marks) if marks else "")
             return cols
 
-        # Helper: duration columns for an interval
+        # Helper: duration (and optional start/end) columns per ticked tier
         def _dur_cols(iv):
             cols = []
             for tn in duration_tier_names:
                 t = tier_map.get(tn)
                 if t is None or t.tier_class != "IntervalTier":
-                    cols.append("")
-                elif tn == primary_tier_name:
-                    cols.append(f"{iv.xmax - iv.xmin:.4f}")
+                    span = None
+                elif tn == primary_tier_name and not iv.is_point:
+                    span = (iv.xmin, iv.xmax)
                 else:
                     civ = _find_containing_interval(t, iv.xmin, iv.xmax)
                     if civ is None:
                         civ = _find_containing_interval_for_point(
                             t, (iv.xmin + iv.xmax) / 2)
-                    cols.append(f"{civ.xmax - civ.xmin:.4f}" if civ else "")
+                    span = (civ.xmin, civ.xmax) if civ else None
+                if span is None:
+                    cols.extend([""] * (3 if tn in bounds_set else 1))
+                else:
+                    if tn in bounds_set:
+                        cols.extend([f"{span[0]:.4f}", f"{span[1]:.4f}"])
+                    cols.append(f"{span[1] - span[0]:.4f}")
             return cols
 
         def _resolve_sampling_interval(iv, tier_name):
@@ -1336,7 +1356,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         for unit in units:
             lc = _label_cols(unit)
             row = [audio_file] + lc
-            row.extend([f"{unit.xmin:.4f}", f"{unit.xmax:.4f}"])
+            if primary_is_point:
+                row.append(f"{unit.xmin:.4f}")
 
             if do_at_points:
                 pts = []
@@ -4492,8 +4513,9 @@ class _DataOptionsPage(QWizardPage):
         layout.addWidget(self._dur_cb)
 
         self._dur_group = QGroupBox("Duration tiers")
-        self._dur_layout = QVBoxLayout(self._dur_group)
-        self._dur_checks = []  # list of (QCheckBox, tier_name)
+        self._dur_layout = QGridLayout(self._dur_group)
+        self._dur_layout.setColumnStretch(0, 1)
+        self._dur_checks = []  # list of (dur_cb, bounds_cb, tier_name)
         layout.addWidget(self._dur_group)
         self._dur_group.setVisible(False)
         self._dur_cb.toggled.connect(self._dur_group.setVisible)
@@ -4574,22 +4596,30 @@ class _DataOptionsPage(QWizardPage):
         self._point_tier_combo.clear()
         self._seg_tier_combo.clear()
         # Clear duration checkboxes
-        for cb, _ in self._dur_checks:
-            self._dur_layout.removeWidget(cb)
-            cb.deleteLater()
+        for dur_cb, bounds_cb, _ in self._dur_checks:
+            self._dur_layout.removeWidget(dur_cb)
+            self._dur_layout.removeWidget(bounds_cb)
+            dur_cb.deleteLater()
+            bounds_cb.deleteLater()
         self._dur_checks = []
 
         self._spectral_tier_combo.clear()
+        grid_row = 0
         for name, tc in selected:
             if tc == "TextTier":
                 self._point_tier_combo.addItem(name)
             else:
                 self._seg_tier_combo.addItem(name)
                 self._spectral_tier_combo.addItem(name)
-                cb = QCheckBox(name)
-                cb.setChecked(True)
-                self._dur_layout.addWidget(cb)
-                self._dur_checks.append((cb, name))
+                dur_cb = QCheckBox(name)
+                dur_cb.setChecked(True)
+                bounds_cb = QCheckBox("+ start/end times")
+                bounds_cb.setChecked(False)
+                dur_cb.toggled.connect(bounds_cb.setEnabled)
+                self._dur_layout.addWidget(dur_cb, grid_row, 0)
+                self._dur_layout.addWidget(bounds_cb, grid_row, 1)
+                self._dur_checks.append((dur_cb, bounds_cb, name))
+                grid_row += 1
 
         # Default both segment-tier combos to the LOWEST interval tier —
         # the tier that drives the rows — so sampling matches the row
@@ -4764,16 +4794,20 @@ class _DataOptionsPage(QWizardPage):
             wiz.time_step_ms = None
 
         if wiz.extract_durations:
-            dur_names = [name for cb, name in self._dur_checks
-                         if cb.isChecked()]
+            dur_names = [name for dur_cb, _, name in self._dur_checks
+                         if dur_cb.isChecked()]
             if not dur_names:
                 QMessageBox.warning(
                     self, "Error",
                     "Select at least one tier for duration extraction.")
                 return False
             wiz.duration_tier_names = dur_names
+            wiz.bounds_tier_names = [
+                name for dur_cb, bounds_cb, name in self._dur_checks
+                if dur_cb.isChecked() and bounds_cb.isChecked()]
         else:
             wiz.duration_tier_names = []
+            wiz.bounds_tier_names = []
 
         if wiz.extract_spectral:
             raw = self._spectral_markers_edit.text().strip()
@@ -5474,6 +5508,7 @@ class BuildCSVWizard(QWizard):
         self.time_step_ms = None
         self.extract_durations = False
         self.duration_tier_names = []
+        self.bounds_tier_names = []
 
         # Spectral-moment state (Page 3)
         self.extract_spectral = False
@@ -6369,6 +6404,7 @@ class MainWindow(QMainWindow):
                 percentage_markers=wizard.percentage_markers,
                 extract_durations=wizard.extract_durations,
                 duration_tier_names=wizard.duration_tier_names,
+                bounds_tier_names=wizard.bounds_tier_names,
                 progress_callback=on_progress,
                 include_point_times=wizard.include_point_times,
                 time_step_ms=wizard.time_step_ms,

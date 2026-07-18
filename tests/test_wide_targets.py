@@ -1,8 +1,8 @@
 """
-Tests for the row-anchor CSV model: one row per row-tier token, wide
-numbered target columns, row_start/row_end anchors, and time-based label
-matching in both directions (encapsulating parent, contained children,
-points within the token).
+Tests for the row-anchor CSV model: one row per primary-tier unit, wide
+numbered target columns, per-tier duration/start/end columns, and
+time-based label matching in both directions (encapsulating parent,
+contained children, points within the token).
 """
 
 import os
@@ -115,12 +115,49 @@ class TestWideTargetColumns:
         assert float(r_a[f1_2]) == pytest.approx(700.0, abs=6)
         assert float(r_a[headers.index("Target1_time")]) == pytest.approx(0.25)
 
-    def test_row_bounds_columns(self, corpus):
-        headers, rows = _run(corpus, ["words", "phones", "Target"])
-        s = headers.index("row_start")
-        e = headers.index("row_end")
-        assert [float(rows[0][s]), float(rows[0][e])] == [0.05, 0.2]
-        assert [float(rows[1][s]), float(rows[1][e])] == [0.2, 0.45]
+    def test_no_unconditional_bounds_columns(self, corpus):
+        headers, _ = _run(corpus, ["words", "phones", "Target"])
+        assert "row_start" not in headers
+        assert "row_end" not in headers
+
+
+class TestDurationAndBounds:
+    def test_duration_only_emits_single_dur_column(self, corpus):
+        headers, rows = _run(
+            corpus, ["words", "phones", "Target"],
+            extract_durations=True, duration_tier_names=["phones"])
+        assert "phones_dur" in headers
+        assert "phones_start" not in headers and "phones_end" not in headers
+        assert "dur_phones" not in headers          # old name gone
+        d = headers.index("phones_dur")
+        assert float(rows[0][d]) == pytest.approx(0.15)   # 't' 0.05-0.2
+
+    def test_bounds_ticked_emits_start_end_dur_trio(self, corpus):
+        headers, rows = _run(
+            corpus, ["words", "phones", "Target"],
+            extract_durations=True,
+            duration_tier_names=["words", "phones"],
+            bounds_tier_names=["phones"])
+        # words: dur only; phones: full trio in start,end,dur order
+        assert "words_dur" in headers and "words_start" not in headers
+        i = headers.index("phones_start")
+        assert headers[i:i + 3] == ["phones_start", "phones_end",
+                                    "phones_dur"]
+        r_t = rows[0]
+        s, e, d = (float(r_t[i]), float(r_t[i + 1]), float(r_t[i + 2]))
+        assert (s, e) == (0.05, 0.2)
+        assert d == pytest.approx(e - s)            # dur is end - start
+
+    def test_bounds_of_containing_parent_tier(self, corpus):
+        # phones drives rows; words bounds resolve to the containing word
+        headers, rows = _run(
+            corpus, ["words", "phones", "Target"],
+            extract_durations=True,
+            duration_tier_names=["words"], bounds_tier_names=["words"])
+        s = headers.index("words_start")
+        for r in rows:   # both phones sit inside the same word
+            assert float(r[s]) == pytest.approx(0.05)
+            assert float(r[headers.index("words_end")]) == pytest.approx(0.45)
 
 
 class TestTimeBasedLabelMatching:
@@ -166,18 +203,30 @@ class TestPointTierPrimary:
             formant_mode="at_points", point_tier_name="Target")
         assert len(rows) == 3          # rel, T1, T2 — one row each
 
-    def test_point_row_bounds_equal(self, corpus):
-        _, rows = _run(
+    def test_point_primary_gets_single_time_column(self, corpus):
+        headers, rows = _run(
             corpus, ["words", "phones", "Target"],
             primary_tier_name="Target",
             formant_mode="at_points", point_tier_name="Target")
-        headers, _ = _run(
+        # a point has no width: one <tier>_time column, no start/end pair
+        t = headers.index("Target_time")
+        assert "row_start" not in headers and "row_end" not in headers
+        times = sorted(float(r[t]) for r in rows)
+        assert times == pytest.approx([0.10, 0.25, 0.40])
+
+    def test_point_primary_containing_durations_still_resolve(self, corpus):
+        # duration of the phone containing each Target point
+        headers, rows = _run(
             corpus, ["words", "phones", "Target"],
             primary_tier_name="Target",
-            formant_mode="at_points", point_tier_name="Target")
-        s, e = headers.index("row_start"), headers.index("row_end")
-        for r in rows:
-            assert r[s] == r[e]        # zero-width unit
+            formant_mode="at_points", point_tier_name="Target",
+            extract_durations=True, duration_tier_names=["phones"],
+            bounds_tier_names=["phones"])
+        tcol = headers.index("Target")
+        d = headers.index("phones_dur")
+        by = {r[tcol]: float(r[d]) for r in rows}
+        assert by["rel"] == pytest.approx(0.15)    # inside 't'
+        assert by["T1"] == pytest.approx(0.25)     # inside 'a' 0.2-0.45
 
     def test_point_primary_pulls_containing_interval_labels(self, corpus):
         headers, rows = _run(
