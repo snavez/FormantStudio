@@ -797,7 +797,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     selected_tiers, extract_formants, formant_mode,
                     point_tier_name, segment_tier_name,
                     percentage_markers, extract_durations,
-                    duration_tier_names, point_tier_parents=None,
+                    duration_tier_names,
                     progress_callback=None,
                     include_point_times=False,
                     time_step_ms=None,
@@ -815,20 +815,28 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     skipped_files=None):
     """Build CSV header and rows for batch formant/duration export.
 
+    One row per labelled segment on the ROW TIER — the last selected
+    interval tier.  Every other column is matched to the row token purely
+    by time: other interval tiers contribute the label of the interval
+    encapsulating the token, or the "; "-joined labels of the intervals
+    subdividing it; point tiers contribute the marks falling inside it.
+    ``row_start``/``row_end`` columns carry the token's own bounds so
+    downstream tools can deduplicate tokens.
+
     *formant_mode* can be ``"at_points"``, ``"for_segments"``, or ``"both"``.
-    *point_tier_parents* maps point tier names to their parent interval tier
-    name (determined by hierarchy order — the nearest interval tier above).
+    At-points formants are WIDE: numbered column sets (``F1_<tier>1`` …
+    ``F1_<tier>N``), sized by the corpus-wide maximum of points in one row
+    token, filled in time order.
     When *time_step_ms* is set, segment formant columns use fixed time offsets
     (ms from onset) instead of percentage markers.
     When *categorise* is True, classification columns are appended.
     *auto_diphthong_candidates* and *unmatched_labels* are mutable sets
     that collect data for post-processing. *skipped_files* is a mutable
     list collecting (filename, reason) for audio files that produced no
-    rows (no matching TextGrid, or an unreadable one).
+    rows (no matching TextGrid, an unreadable one, or one lacking the
+    row tier).
     Returns (headers: list[str], rows: list[list[str|float]]).
     """
-    if point_tier_parents is None:
-        point_tier_parents = {}
     if cat_tier_names is None:
         cat_tier_names = []
     if cat_vowel_props is None:
@@ -850,10 +858,20 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         if os.path.splitext(f)[1].lower() in audio_exts
     )
 
-    # Pre-scan for max segment duration when using time-based sampling.
-    # This determines how many time-offset columns the CSV needs.
+    # The row tier ("row anchor"): last selected interval tier. One CSV row
+    # per labelled segment on this tier.
+    row_tier_name = None
+    for t in reversed(selected_tiers):
+        if t.tier_class == "IntervalTier":
+            row_tier_name = t.name
+            break
+
+    # Pre-scan TextGrids for corpus-dependent column counts: the longest
+    # segment (time-step sampling columns) and the most target points in any
+    # one row segment (wide FN_<tier>N at-point columns).
     time_offsets_ms = []
-    if time_mode:
+    max_targets = 0
+    if time_mode or do_at_points:
         max_dur_s = 0.0
         for af in audio_files:
             bn = os.path.splitext(af)[0]
@@ -869,21 +887,36 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 tg = TextGrid.from_file(tg_path)
             except Exception:
                 continue
-            for tier in tg.tiers:
-                if tier.name == segment_tier_name \
-                        and tier.tier_class == "IntervalTier":
+            tmap = {t.name: t for t in tg.tiers}
+            if time_mode:
+                tier = tmap.get(segment_tier_name)
+                if tier is not None and tier.tier_class == "IntervalTier":
                     for iv in tier.intervals:
                         if iv.text.strip():
                             d = iv.xmax - iv.xmin
                             if d > max_dur_s:
                                 max_dur_s = d
-                    break
+            if do_at_points:
+                rt = tmap.get(row_tier_name)
+                ptt = tmap.get(point_tier_name)
+                if (rt is not None and ptt is not None
+                        and ptt.tier_class == "TextTier"):
+                    for iv in rt.intervals:
+                        if not iv.text.strip():
+                            continue
+                        n = sum(1 for p in ptt.points
+                                if iv.xmin - 1e-6 <= p.time <= iv.xmax + 1e-6)
+                        if n > max_targets:
+                            max_targets = n
 
-        step_s = time_step_ms / 1000.0
-        t = 0.0
-        while t <= max_dur_s + 1e-9:
-            time_offsets_ms.append(round(t * 1000.0, 4))
-            t += step_s
+        if time_mode:
+            step_s = time_step_ms / 1000.0
+            t = 0.0
+            while t <= max_dur_s + 1e-9:
+                time_offsets_ms.append(round(t * 1000.0, 4))
+                t += step_s
+    if do_at_points:
+        max_targets = max(1, max_targets)
 
     # --- Build header ---
     headers = ["filename"]
@@ -898,12 +931,19 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                         if t.tier_class == "TextTier"]
     headers.extend(point_tier_names)
 
-    # Formant columns — at-points (F1, F2, F3 named after point tier)
+    # Row token bounds — explicit anchors so downstream tools can
+    # deduplicate tokens and compute overlaps
+    headers.extend(["row_start", "row_end"])
+
+    # Formant columns — at-points, wide: one numbered set per target point
+    # (F1_Target1 … F1_TargetN, sized by the corpus maximum per row segment)
     if do_at_points:
         pt_suffix = point_tier_name or "pt"
-        if include_point_times:
-            headers.append(f"{pt_suffix}_time")
-        headers.extend([f"F1_{pt_suffix}", f"F2_{pt_suffix}", f"F3_{pt_suffix}"])
+        for i in range(1, max_targets + 1):
+            if include_point_times:
+                headers.append(f"{pt_suffix}{i}_time")
+            headers.extend([f"F1_{pt_suffix}{i}", f"F2_{pt_suffix}{i}",
+                            f"F3_{pt_suffix}{i}"])
 
     # Formant columns — for-segments
     if do_for_segments:
@@ -1030,8 +1070,10 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 break
 
         if lowest_tier is None:
-            row = [audio_file] + [""] * (len(headers) - 1)
-            rows.append(row)
+            if skipped_files is not None:
+                skipped_files.append((
+                    audio_file,
+                    "TextGrid has no selected interval tier to drive rows"))
             continue
 
         # Resolve point tier for at-points formant extraction
@@ -1041,40 +1083,39 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             if at_pt_tier and at_pt_tier.tier_class != "TextTier":
                 at_pt_tier = None
 
-        # Helper: build the common prefix columns for a lowest-tier interval
+        # Helper: build the common prefix columns for a row-tier interval.
+        # Matching is purely time-based, in either direction: a tier's cell
+        # holds the label of the interval that encapsulates the row token
+        # (same span or wider), or the "; "-joined labels of the intervals
+        # the token subdivides into (e.g. allophone "t0; tH" under a /t/
+        # row), or the marks of the points falling inside the token.
         def _label_cols(iv):
+            eps = 1e-6
             cols = []
-            # Interval tier labels — also cache for point tier parent lookups
-            interval_cache = {}  # tier_name -> containing Interval
             for t_name in interval_tier_names:
                 t = tier_map.get(t_name)
                 if t is None:
                     cols.append("")
                 elif t.name == lowest_tier.name:
                     cols.append(iv.text)
-                    interval_cache[t_name] = iv
                 else:
                     civ = _find_containing_interval(t, iv.xmin, iv.xmax)
-                    cols.append(civ.text if civ else "")
-                    if civ:
-                        interval_cache[t_name] = civ
-            # Point tier labels — look up within the PARENT interval tier
+                    if civ is not None and civ.text.strip():
+                        cols.append(civ.text)
+                    else:
+                        kids = [k.text for k in t.intervals
+                                if k.text.strip()
+                                and k.xmin >= iv.xmin - eps
+                                and k.xmax <= iv.xmax + eps]
+                        cols.append("; ".join(kids))
+            # Point tier labels — marks inside the row token's bounds
             for pt_name in point_tier_names:
                 pt_tier = tier_map.get(pt_name)
                 if pt_tier is None or pt_tier.tier_class != "TextTier":
                     cols.append("")
                     continue
-                # Determine the search bounds from parent interval tier
-                parent_name = point_tier_parents.get(pt_name)
-                parent_iv = interval_cache.get(parent_name) if parent_name else None
-                if parent_iv is not None:
-                    search_xmin, search_xmax = parent_iv.xmin, parent_iv.xmax
-                else:
-                    # Fallback: use the lowest-tier interval bounds
-                    search_xmin, search_xmax = iv.xmin, iv.xmax
-                eps = 1e-6
                 marks = [p.mark for p in pt_tier.points
-                         if search_xmin - eps <= p.time <= search_xmax + eps]
+                         if iv.xmin - eps <= p.time <= iv.xmax + eps]
                 cols.append("; ".join(marks) if marks else "")
             return cols
 
@@ -1262,121 +1303,48 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
 
             return cols
 
-        # --- Row generation ---
-        if do_at_points and at_pt_tier:
-            # When extracting at points, one row per point in each segment
-            for iv in lowest_tier.intervals:
-                if not iv.text.strip():
-                    continue
+        # --- Row generation: exactly one row per labelled row-tier token ---
+        eps = 1e-6
+        for iv in lowest_tier.intervals:
+            if not iv.text.strip():
+                continue
 
-                eps = 1e-6
-                points_in_iv = [
-                    p for p in at_pt_tier.points
-                    if iv.xmin - eps <= p.time <= iv.xmax + eps
-                ]
+            lc = _label_cols(iv)
+            row = [audio_file] + lc
+            row.extend([f"{iv.xmin:.4f}", f"{iv.xmax:.4f}"])
 
-                if not points_in_iv:
-                    # No target points — still emit a row if doing segments too
-                    if do_for_segments:
-                        lc_np = _label_cols(iv)
-                        row = [audio_file] + lc_np
+            if do_at_points:
+                pts = []
+                if at_pt_tier is not None:
+                    pts = sorted(
+                        (p for p in at_pt_tier.points
+                         if iv.xmin - eps <= p.time <= iv.xmax + eps),
+                        key=lambda p: p.time)
+                for i in range(max_targets):
+                    if i < len(pts):
+                        pt = pts[i]
                         if include_point_times:
-                            row.append("")  # empty time
-                        row.extend(["", "", ""])  # empty at-point F1/F2/F3
-                        row.extend(_segment_formant_cols(iv))
-                        if extract_durations:
-                            row.extend(_dur_cols(iv))
-                        if extract_spectral:
-                            row.extend(_segment_spectral_cols(iv))
-                        row.extend(_cat_cols(lc_np))
-                        rows.append(row)
-                    continue
-
-                for pt in points_in_iv:
-                    row = [audio_file]
-                    # Interval tier labels
-                    for t_name in interval_tier_names:
-                        t = tier_map.get(t_name)
-                        if t is None:
+                            row.append(f"{pt.time:.4f}")
+                        f1, f2, f3 = _get_formant_at_time(fd, pt.time)
+                        for v in (f1, f2, f3):
+                            row.append(f"{v:.1f}" if not np.isnan(v) else "")
+                    else:
+                        if include_point_times:
                             row.append("")
-                        elif t.name == lowest_tier.name:
-                            row.append(iv.text)
-                        else:
-                            civ = _find_containing_interval(t, iv.xmin, iv.xmax)
-                            row.append(civ.text if civ else "")
-                    # Point tier labels — use parent interval tier bounds
-                    # Build interval cache for parent lookups
-                    _iv_cache = {}
-                    for t_name in interval_tier_names:
-                        t = tier_map.get(t_name)
-                        if t is None:
-                            continue
-                        if t.name == lowest_tier.name:
-                            _iv_cache[t_name] = iv
-                        else:
-                            civ = _find_containing_interval(t, iv.xmin, iv.xmax)
-                            if civ:
-                                _iv_cache[t_name] = civ
-                    for pt_name in point_tier_names:
-                        if pt_name == point_tier_name:
-                            row.append(pt.mark)
-                        else:
-                            pt_tier = tier_map.get(pt_name)
-                            if pt_tier is None or pt_tier.tier_class != "TextTier":
-                                row.append("")
-                                continue
-                            parent_name = point_tier_parents.get(pt_name)
-                            parent_iv = _iv_cache.get(parent_name) if parent_name else None
-                            if parent_iv is not None:
-                                smin, smax = parent_iv.xmin, parent_iv.xmax
-                            else:
-                                smin, smax = iv.xmin, iv.xmax
-                            marks = [p.mark for p in pt_tier.points
-                                     if smin - eps <= p.time <= smax + eps]
-                            row.append("; ".join(marks) if marks else "")
+                        row.extend(["", "", ""])
 
-                    # At-point time and formant values
-                    if include_point_times:
-                        row.append(f"{pt.time:.4f}")
-                    f1, f2, f3 = _get_formant_at_time(fd, pt.time)
-                    for v in (f1, f2, f3):
-                        row.append(f"{v:.1f}" if not np.isnan(v) else "")
+            if do_for_segments:
+                row.extend(_segment_formant_cols(iv))
 
-                    if do_for_segments:
-                        row.extend(_segment_formant_cols(iv))
+            if extract_durations:
+                row.extend(_dur_cols(iv))
 
-                    if extract_durations:
-                        row.extend(_dur_cols(iv))
+            if extract_spectral:
+                row.extend(_segment_spectral_cols(iv))
 
-                    if extract_spectral:
-                        row.extend(_segment_spectral_cols(iv))
+            row.extend(_cat_cols(lc))
 
-                    # Categorisation: label cols are row[1 : 1+n_labels]
-                    n_labels = len(interval_tier_names) + len(point_tier_names)
-                    row.extend(_cat_cols(row[1:1 + n_labels]))
-
-                    rows.append(row)
-        else:
-            # Row per lowest-tier segment (no at-points expansion)
-            for iv in lowest_tier.intervals:
-                if not iv.text.strip():
-                    continue
-
-                lc = _label_cols(iv)
-                row = [audio_file] + lc
-
-                if do_for_segments:
-                    row.extend(_segment_formant_cols(iv))
-
-                if extract_durations:
-                    row.extend(_dur_cols(iv))
-
-                if extract_spectral:
-                    row.extend(_segment_spectral_cols(iv))
-
-                row.extend(_cat_cols(lc))
-
-                rows.append(row)
+            rows.append(row)
 
     return headers, rows
 
@@ -4283,9 +4251,10 @@ class _TierSelectionPage(QWizardPage):
             "Tiers are listed in TextGrid file order; use Up/Down to "
             "adjust, and uncheck tiers you don't need.\n\n"
             "The LAST CHECKED INTERVAL TIER drives the CSV: one row per "
-            "labelled segment on that tier. Other interval tiers add "
-            "label/duration columns; each point tier belongs to the "
-            "nearest interval tier above it in this list.")
+            "labelled segment on that tier. Every other tier adds a label "
+            "column matched by time — the segment containing the row "
+            "token, the sub-segments inside it (joined with ';'), or the "
+            "points falling within it.")
         info.setWordWrap(True)
         layout.addWidget(info)
 
@@ -4399,17 +4368,6 @@ class _TierSelectionPage(QWizardPage):
             return False
         wiz = self.wizard()
         wiz.selected_tier_info = selected  # list of (name, tier_class)
-
-        # Compute point-tier-to-parent-interval-tier mapping based on order.
-        # Each point tier belongs to the nearest interval tier above it.
-        wiz.point_tier_parents = {}  # point_tier_name -> interval_tier_name
-        last_interval = None
-        for name, tc in selected:
-            if tc == "IntervalTier":
-                last_interval = name
-            elif tc == "TextTier" and last_interval is not None:
-                wiz.point_tier_parents[name] = last_interval
-
         return True
 
     def _get_selected_tiers(self):
@@ -5478,7 +5436,6 @@ class BuildCSVWizard(QWizard):
         self.formants_dir = ""
         self.example_textgrid = None
         self.selected_tier_info = []  # [(name, tier_class), ...]
-        self.point_tier_parents = {}  # point_name -> parent_interval_name
         self.extract_formants = False
         self.formant_mode = None
         self.point_tier_name = None
@@ -6379,7 +6336,6 @@ class MainWindow(QMainWindow):
                 percentage_markers=wizard.percentage_markers,
                 extract_durations=wizard.extract_durations,
                 duration_tier_names=wizard.duration_tier_names,
-                point_tier_parents=wizard.point_tier_parents,
                 progress_callback=on_progress,
                 include_point_times=wizard.include_point_times,
                 time_step_ms=wizard.time_step_ms,
