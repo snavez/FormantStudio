@@ -650,6 +650,11 @@ def compute_spectral_moments(sound, t0, t1, window_shape, power=SPECTRAL_MOMENT_
 # CSV Export Helpers
 # ---------------------------------------------------------------------------
 
+# One CSV row's anchoring unit. Shares xmin/xmax/text with Interval so the
+# measure/label helpers treat interval spans and points uniformly; a point
+# is a zero-width unit (xmin == xmax == time, text == mark).
+_RowUnit = namedtuple("_RowUnit", ["xmin", "xmax", "text", "is_point"])
+
 
 def _get_formant_at_time(fd, time_s):
     """Return (F1, F2, F3) at *time_s*, interpolating between nearest frames.
@@ -812,6 +817,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     point_tier_name, segment_tier_name,
                     percentage_markers, extract_durations,
                     duration_tier_names,
+                    primary_tier_name=None,
                     progress_callback=None,
                     include_point_times=False,
                     time_step_ms=None,
@@ -829,13 +835,15 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     skipped_files=None):
     """Build CSV header and rows for batch formant/duration export.
 
-    One row per labelled segment on the ROW TIER — the last selected
-    interval tier.  Every other column is matched to the row token purely
-    by time: other interval tiers contribute the label of the interval
-    encapsulating the token, or the "; "-joined labels of the intervals
-    subdividing it; point tiers contribute the marks falling inside it.
-    ``row_start``/``row_end`` columns carry the token's own bounds so
-    downstream tools can deduplicate tokens.
+    One row per unit of the PRIMARY tier (*primary_tier_name*): each
+    labelled interval, or each point when the primary is a point tier.
+    Defaults to the last selected interval tier when unset.  Every other
+    column is matched to the row unit purely by time: other interval tiers
+    contribute the label of the interval encapsulating the unit, or the
+    "; "-joined labels of the intervals subdividing it; point tiers
+    contribute the marks falling inside it.  ``row_start``/``row_end``
+    columns carry the unit's own bounds (equal for a point) so downstream
+    tools can deduplicate tokens.
 
     *formant_mode* can be ``"at_points"``, ``"for_segments"``, or ``"both"``.
     At-points formants are WIDE: numbered column sets (``F1_<tier>1`` …
@@ -872,17 +880,25 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         if os.path.splitext(f)[1].lower() in audio_exts
     )
 
-    # The row tier ("row anchor"): last selected interval tier. One CSV row
-    # per labelled segment on this tier.
-    row_tier_name = None
-    for t in reversed(selected_tiers):
-        if t.tier_class == "IntervalTier":
-            row_tier_name = t.name
-            break
+    # The PRIMARY tier drives the rows. Default to the last selected
+    # interval tier (preserves prior behaviour when unset).
+    if primary_tier_name is None:
+        for t in reversed(selected_tiers):
+            if t.tier_class == "IntervalTier":
+                primary_tier_name = t.name
+                break
+
+    def _units_for(primary_tier):
+        """Row units for a primary tier: labelled intervals, or all points."""
+        if primary_tier.tier_class == "IntervalTier":
+            return [_RowUnit(iv.xmin, iv.xmax, iv.text, False)
+                    for iv in primary_tier.intervals if iv.text.strip()]
+        return [_RowUnit(p.time, p.time, p.mark, True)
+                for p in primary_tier.points]
 
     # Pre-scan TextGrids for corpus-dependent column counts: the longest
     # segment (time-step sampling columns) and the most target points in any
-    # one row segment (wide FN_<tier>N at-point columns).
+    # one row unit (wide FN_<tier>N at-point columns).
     time_offsets_ms = []
     max_targets = 0
     if time_mode or do_at_points:
@@ -911,15 +927,13 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                             if d > max_dur_s:
                                 max_dur_s = d
             if do_at_points:
-                rt = tmap.get(row_tier_name)
+                pri = tmap.get(primary_tier_name)
                 ptt = tmap.get(point_tier_name)
-                if (rt is not None and ptt is not None
+                if (pri is not None and ptt is not None
                         and ptt.tier_class == "TextTier"):
-                    for iv in rt.intervals:
-                        if not iv.text.strip():
-                            continue
+                    for u in _units_for(pri):
                         n = sum(1 for p in ptt.points
-                                if iv.xmin - 1e-6 <= p.time <= iv.xmax + 1e-6)
+                                if u.xmin - 1e-6 <= p.time <= u.xmax + 1e-6)
                         if n > max_targets:
                             max_targets = n
 
@@ -1076,19 +1090,15 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             except Exception:
                 spectral_sound = None
 
-        # Determine the lowest-level interval tier to drive rows
-        lowest_tier = None
-        for t_name in reversed(interval_tier_names):
-            if t_name in tier_map:
-                lowest_tier = tier_map[t_name]
-                break
-
-        if lowest_tier is None:
+        # The primary tier drives the rows.
+        primary = tier_map.get(primary_tier_name)
+        if primary is None:
             if skipped_files is not None:
                 skipped_files.append((
                     audio_file,
-                    "TextGrid has no selected interval tier to drive rows"))
+                    f"primary tier '{primary_tier_name}' not in this TextGrid"))
             continue
+        units = _units_for(primary)
 
         # Resolve point tier for at-points formant extraction
         at_pt_tier = None
@@ -1110,7 +1120,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 t = tier_map.get(t_name)
                 if t is None:
                     cols.append("")
-                elif t.name == lowest_tier.name:
+                elif t_name == primary_tier_name:
                     cols.append(iv.text)
                 else:
                     civ = _find_containing_interval(t, iv.xmin, iv.xmax)
@@ -1122,8 +1132,12 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                                 and k.xmin >= iv.xmin - eps
                                 and k.xmax <= iv.xmax + eps]
                         cols.append("; ".join(kids))
-            # Point tier labels — marks inside the row token's bounds
+            # Point tier labels — the unit's own mark when this is the
+            # primary point tier, else the marks inside the unit's bounds
             for pt_name in point_tier_names:
+                if pt_name == primary_tier_name:
+                    cols.append(iv.text)
+                    continue
                 pt_tier = tier_map.get(pt_name)
                 if pt_tier is None or pt_tier.tier_class != "TextTier":
                     cols.append("")
@@ -1140,7 +1154,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 t = tier_map.get(tn)
                 if t is None or t.tier_class != "IntervalTier":
                     cols.append("")
-                elif tn == lowest_tier.name:
+                elif tn == primary_tier_name:
                     cols.append(f"{iv.xmax - iv.xmin:.4f}")
                 else:
                     civ = _find_containing_interval(t, iv.xmin, iv.xmax)
@@ -1151,20 +1165,20 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             return cols
 
         def _resolve_sampling_interval(iv, tier_name):
-            """Return the interval on *tier_name* containing row token *iv*.
+            """Return the interval on *tier_name* containing row unit *iv*.
 
-            Mirrors duration-tier resolution: the token's own interval when
-            *tier_name* is the row tier (or unset), else the containing
+            Mirrors duration-tier resolution: the unit itself when
+            *tier_name* is the primary tier (or unset), else the containing
             interval on that tier.
 
             Returns None when there is no containing interval or when it is
-            unlabelled.  An unlabelled container means the row's token is not
+            unlabelled.  An unlabelled container means the row's unit is not
             inside a segment of interest on that tier — e.g. a tier of
             sub-phone allophones has long empty stretches between its labels,
             and sampling inside one of those would report numbers measured
             from an arbitrary, unrelated stretch of audio.
             """
-            if not tier_name or tier_name == lowest_tier.name:
+            if not tier_name or tier_name == primary_tier_name:
                 return iv
             t = tier_map.get(tier_name)
             if t is None or t.tier_class != "IntervalTier":
@@ -1317,22 +1331,19 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
 
             return cols
 
-        # --- Row generation: exactly one row per labelled row-tier token ---
+        # --- Row generation: exactly one row per primary-tier unit ---
         eps = 1e-6
-        for iv in lowest_tier.intervals:
-            if not iv.text.strip():
-                continue
-
-            lc = _label_cols(iv)
+        for unit in units:
+            lc = _label_cols(unit)
             row = [audio_file] + lc
-            row.extend([f"{iv.xmin:.4f}", f"{iv.xmax:.4f}"])
+            row.extend([f"{unit.xmin:.4f}", f"{unit.xmax:.4f}"])
 
             if do_at_points:
                 pts = []
                 if at_pt_tier is not None:
                     pts = sorted(
                         (p for p in at_pt_tier.points
-                         if iv.xmin - eps <= p.time <= iv.xmax + eps),
+                         if unit.xmin - eps <= p.time <= unit.xmax + eps),
                         key=lambda p: p.time)
                 for i in range(max_targets):
                     if i < len(pts):
@@ -1348,13 +1359,13 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                         row.extend(["", "", ""])
 
             if do_for_segments:
-                row.extend(_segment_formant_cols(iv))
+                row.extend(_segment_formant_cols(unit))
 
             if extract_durations:
-                row.extend(_dur_cols(iv))
+                row.extend(_dur_cols(unit))
 
             if extract_spectral:
-                row.extend(_segment_spectral_cols(iv))
+                row.extend(_segment_spectral_cols(unit))
 
             row.extend(_cat_cols(lc))
 
@@ -4251,72 +4262,69 @@ class _PathsPage(QWizardPage):
 
 
 class _TierSelectionPage(QWizardPage):
-    """Page 2: Select and order TextGrid tiers."""
+    """Page 2: Choose the primary tier and which tiers to include."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setTitle("Select & Order Tiers")
-        self.setSubTitle("Choose which tiers to include and their order.")
+        self.setTitle("Primary Tier & Columns")
+        self.setSubTitle("Pick the tier that defines a CSV row, then "
+                         "include the tiers you want as columns.")
         layout = QVBoxLayout(self)
 
-        # Full explanation lives in the page body — wizard subtitles get
-        # truncated and this rule is the one users must see.
-        info = QLabel(
-            "Tiers are listed in TextGrid file order; use Up/Down to "
-            "adjust, and uncheck tiers you don't need.\n\n"
-            "The LAST CHECKED INTERVAL TIER drives the CSV: one row per "
-            "labelled segment on that tier. Every other tier adds a label "
-            "column matched by time — the segment containing the row "
-            "token, the sub-segments inside it (joined with ';'), or the "
-            "points falling within it.")
-        info.setWordWrap(True)
-        layout.addWidget(info)
+        prim_row = QHBoxLayout()
+        prim_row.addWidget(QLabel("Primary tier:"))
+        self._primary_combo = QComboBox()
+        prim_row.addWidget(self._primary_combo, 1)
+        layout.addLayout(prim_row)
 
+        hint = QLabel(
+            "The primary tier defines the rows — one row per labelled "
+            "segment (interval tier) or per point (point tier). Typically "
+            "this is your phoneme/phonetic segment tier or a target-point "
+            "tier. Every included tier below adds a column matched to each "
+            "row by time: the segment containing it, the sub-segments "
+            "inside it (joined with ';'), or the points within it.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888888; font-size: 11px;")
+        layout.addWidget(hint)
+
+        layout.addWidget(QLabel("Include tiers (uncheck to exclude):"))
         self._list = QListWidget()
         layout.addWidget(self._list)
 
-        # Live indicator of the row-driving tier — updates on check/reorder
         self._rows_label = QLabel()
         self._rows_label.setWordWrap(True)
-        self._rows_label.setStyleSheet(
-            "font-weight: bold; color: #2a6fb0;")
+        self._rows_label.setStyleSheet("font-weight: bold; color: #2a6fb0;")
         layout.addWidget(self._rows_label)
-
-        btn_row = QHBoxLayout()
-        up_btn = QPushButton("Move Up")
-        down_btn = QPushButton("Move Down")
-        up_btn.clicked.connect(self._move_up)
-        down_btn.clicked.connect(self._move_down)
-        btn_row.addWidget(up_btn)
-        btn_row.addWidget(down_btn)
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
 
         self._example_label = QLabel()
         self._example_label.setWordWrap(True)
         layout.addWidget(self._example_label)
 
-        self._list.itemChanged.connect(lambda _item: self._update_rows_label())
+        self._primary_combo.currentIndexChanged.connect(
+            self._on_primary_changed)
+        self._list.itemChanged.connect(lambda _i: self._update_rows_label())
 
     def initializePage(self):
         self._list.clear()
+        self._primary_combo.blockSignals(True)
+        self._primary_combo.clear()
         wiz = self.wizard()
         tg_dir = wiz.textgrid_dir
 
-        # Find first TextGrid
         tg_file = None
         for f in sorted(os.listdir(tg_dir)):
             if f.lower().endswith(".textgrid"):
                 tg_file = os.path.join(tg_dir, f)
                 break
-
         if tg_file is None:
+            self._primary_combo.blockSignals(False)
             return
-
         try:
             tg = TextGrid.from_file(tg_file)
         except Exception as e:
             self._example_label.setText(f"Error reading TextGrid: {e}")
+            self._primary_combo.blockSignals(False)
             return
 
         wiz.example_textgrid = tg
@@ -4324,64 +4332,69 @@ class _TierSelectionPage(QWizardPage):
             f"Example TextGrid: {os.path.basename(tg_file)} "
             f"({len(tg.tiers)} tiers)")
 
-        # Present tiers in TextGrid file order — it reflects how the user
-        # built the annotation; Up/Down still allows manual adjustment.
-        for tier in tg.tiers:
+        # Tiers in TextGrid file order — reflects how the annotation was built
+        default_primary = 0
+        for idx, tier in enumerate(tg.tiers):
             kind = "Interval" if tier.tier_class == "IntervalTier" else "Point"
             n = (len([iv for iv in tier.intervals if iv.text.strip()])
                  if tier.tier_class == "IntervalTier"
                  else len(tier.points))
-            label = f"{tier.name}  [{kind}, {n} items]"
-            item = QListWidgetItem(label)
+            self._primary_combo.addItem(
+                f"{tier.name}  [{kind}]", tier.name)
+            item = QListWidgetItem(f"{tier.name}  [{kind}, {n} items]")
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked)
             item.setData(Qt.ItemDataRole.UserRole, tier.name)
             item.setData(Qt.ItemDataRole.UserRole + 1, tier.tier_class)
             self._list.addItem(item)
+            # Default primary: the last interval tier (matches prior default)
+            if tier.tier_class == "IntervalTier":
+                default_primary = idx
 
+        self._primary_combo.setCurrentIndex(default_primary)
+        self._primary_combo.blockSignals(False)
+        self._update_rows_label()
+
+    def _on_primary_changed(self, _idx):
+        # The primary tier must be included — re-check it if excluded
+        name = self._primary_combo.currentData()
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == name:
+                if item.checkState() != Qt.CheckState.Checked:
+                    item.setCheckState(Qt.CheckState.Checked)
+                break
         self._update_rows_label()
 
     def _update_rows_label(self):
-        """Show which tier will drive the CSV rows given current choices."""
-        driver = None
+        name = self._primary_combo.currentData()
+        tc = None
         for i in range(self._list.count()):
             item = self._list.item(i)
-            if (item.checkState() == Qt.CheckState.Checked
-                    and item.data(Qt.ItemDataRole.UserRole + 1)
-                    == "IntervalTier"):
-                driver = item.data(Qt.ItemDataRole.UserRole)
-        if driver is None:
-            self._rows_label.setText(
-                "⚠ No interval tier checked — no rows can be extracted.")
+            if item.data(Qt.ItemDataRole.UserRole) == name:
+                tc = item.data(Qt.ItemDataRole.UserRole + 1)
+                break
+        if name is None:
+            self._rows_label.setText("")
+        elif tc == "TextTier":
+            self._rows_label.setText(f"CSV rows: one per '{name}' point.")
         else:
             self._rows_label.setText(
-                f"CSV rows: one per labelled '{driver}' segment.")
-
-    def _move_up(self):
-        row = self._list.currentRow()
-        if row <= 0:
-            return
-        item = self._list.takeItem(row)
-        self._list.insertItem(row - 1, item)
-        self._list.setCurrentRow(row - 1)
-        self._update_rows_label()
-
-    def _move_down(self):
-        row = self._list.currentRow()
-        if row < 0 or row >= self._list.count() - 1:
-            return
-        item = self._list.takeItem(row)
-        self._list.insertItem(row + 1, item)
-        self._list.setCurrentRow(row + 1)
-        self._update_rows_label()
+                f"CSV rows: one per labelled '{name}' segment.")
 
     def validatePage(self):
         selected = self._get_selected_tiers()
         if not selected:
-            QMessageBox.warning(self, "Error", "Select at least one tier.")
+            QMessageBox.warning(self, "Error", "Include at least one tier.")
             return False
         wiz = self.wizard()
+        wiz.primary_tier_name = self._primary_combo.currentData()
         wiz.selected_tier_info = selected  # list of (name, tier_class)
+        # The primary must be among the included tiers
+        if wiz.primary_tier_name not in [n for n, _ in selected]:
+            QMessageBox.warning(
+                self, "Error", "The primary tier must be included.")
+            return False
         return True
 
     def _get_selected_tiers(self):
@@ -5450,6 +5463,7 @@ class BuildCSVWizard(QWizard):
         self.formants_dir = ""
         self.example_textgrid = None
         self.selected_tier_info = []  # [(name, tier_class), ...]
+        self.primary_tier_name = None  # tier that defines one row each
         self.extract_formants = False
         self.formant_mode = None
         self.point_tier_name = None
@@ -6347,6 +6361,7 @@ class MainWindow(QMainWindow):
                 textgrid_dir=wizard.textgrid_dir,
                 formants_dir=wizard.formants_dir,
                 selected_tiers=selected_tiers,
+                primary_tier_name=wizard.primary_tier_name,
                 extract_formants=wizard.extract_formants,
                 formant_mode=wizard.formant_mode,
                 point_tier_name=wizard.point_tier_name,

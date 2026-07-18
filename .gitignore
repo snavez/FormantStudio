@@ -16,3 +16,4 @@ FormantStudio.exe
 nul
 .claude/
 formant_editor_SpectroCanvas.py
+tmp/

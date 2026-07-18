@@ -156,6 +156,56 @@ class TestTimeBasedLabelMatching:
         assert rows[0][p] == "t" and rows[1][p] == "t"
 
 
+class TestPointTierPrimary:
+    """Primary can be a point tier: one row per point."""
+
+    def test_one_row_per_point(self, corpus):
+        headers, rows = _run(
+            corpus, ["words", "phones", "Target"],
+            primary_tier_name="Target",
+            formant_mode="at_points", point_tier_name="Target")
+        assert len(rows) == 3          # rel, T1, T2 — one row each
+
+    def test_point_row_bounds_equal(self, corpus):
+        _, rows = _run(
+            corpus, ["words", "phones", "Target"],
+            primary_tier_name="Target",
+            formant_mode="at_points", point_tier_name="Target")
+        headers, _ = _run(
+            corpus, ["words", "phones", "Target"],
+            primary_tier_name="Target",
+            formant_mode="at_points", point_tier_name="Target")
+        s, e = headers.index("row_start"), headers.index("row_end")
+        for r in rows:
+            assert r[s] == r[e]        # zero-width unit
+
+    def test_point_primary_pulls_containing_interval_labels(self, corpus):
+        headers, rows = _run(
+            corpus, ["words", "phones", "Target"],
+            primary_tier_name="Target",
+            formant_mode="at_points", point_tier_name="Target")
+        pcol = headers.index("phones")
+        tcol = headers.index("Target")
+        # rel@0.10 is in phone 't'; T1@0.25 and T2@0.40 are in 'a'
+        by_target = {r[tcol]: r[pcol] for r in rows}
+        assert by_target["rel"] == "t"
+        assert by_target["T1"] == "a"
+        assert by_target["T2"] == "a"
+
+    def test_point_primary_formant_at_the_point(self, corpus):
+        headers, rows = _run(
+            corpus, ["words", "phones", "Target"],
+            primary_tier_name="Target",
+            formant_mode="at_points", point_tier_name="Target")
+        # one target per zero-width unit → single wide set, F1_Target1
+        f1 = headers.index("F1_Target1")
+        tcol = headers.index("Target")
+        vals = {r[tcol]: float(r[f1]) for r in rows}
+        assert vals["rel"] == pytest.approx(400.0, abs=6)   # 300+1000*0.10
+        assert vals["T1"] == pytest.approx(550.0, abs=6)    # 0.25
+        assert vals["T2"] == pytest.approx(700.0, abs=6)    # 0.40
+
+
 class TestRowTierMissing:
     def test_missing_row_tier_reported_not_blank(self, corpus):
         skipped = []
@@ -167,4 +217,4 @@ class TestRowTierMissing:
             extract_formants=False, formant_mode=None)
         assert rows == []
         assert len(skipped) == 1
-        assert "no selected interval tier" in skipped[0][1]
+        assert "primary tier" in skipped[0][1]
