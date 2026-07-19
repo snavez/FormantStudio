@@ -4626,6 +4626,39 @@ class _DataOptionsPage(QWizardPage):
         win_row.addWidget(self._spectral_window_combo)
         win_row.addStretch()
         spec_layout.addLayout(win_row)
+
+        # Window-size clamps (min floor / max ceiling), applied after the
+        # proportional/fixed width is computed.
+        clamp_row = QHBoxLayout()
+        self._spectral_winmin_label = QLabel("Min window (ms):")
+        clamp_row.addWidget(self._spectral_winmin_label)
+        self._spectral_winmin_spin = QDoubleSpinBox()
+        self._spectral_winmin_spin.setRange(1.0, 50.0)
+        self._spectral_winmin_spin.setSingleStep(1.0)
+        self._spectral_winmin_spin.setValue(MIN_SPECTRAL_WINDOW_MS)
+        self._spectral_winmin_spin.setToolTip(
+            "Smallest analysis window allowed. Frequency resolution is about "
+            "1/window, so ~5 ms gives ~200 Hz — fine for COG/SD but marginal "
+            "for skewness/kurtosis. A marker whose window cannot reach this "
+            "floor while staying centred inside the segment is flagged "
+            "too_short and left blank.")
+        clamp_row.addWidget(self._spectral_winmin_spin)
+        clamp_row.addSpacing(12)
+        self._spectral_winmax_label = QLabel("Max window (ms):")
+        clamp_row.addWidget(self._spectral_winmax_label)
+        self._spectral_winmax_spin = QDoubleSpinBox()
+        self._spectral_winmax_spin.setRange(5.0, 200.0)
+        self._spectral_winmax_spin.setSingleStep(5.0)
+        self._spectral_winmax_spin.setValue(PROP_SPECTRAL_WIN_MAX_MS)
+        self._spectral_winmax_spin.setToolTip(
+            "Largest analysis window allowed (proportional mode). Caps the "
+            "window on long segments so each marker stays a local estimate "
+            "rather than averaging a big chunk of the segment; a capped "
+            "window is flagged clamped_max.")
+        clamp_row.addWidget(self._spectral_winmax_spin)
+        clamp_row.addStretch()
+        spec_layout.addLayout(clamp_row)
+
         self._spectral_wmode_combo.currentIndexChanged.connect(
             self._update_spectral_wmode_ui)
         self._update_spectral_wmode_ui()
@@ -4733,12 +4766,18 @@ class _DataOptionsPage(QWizardPage):
             self._sampling_value_edit.setText("5")
 
     def _update_spectral_wmode_ui(self):
-        """Show the proportional-% or the fixed-ms width control."""
+        """Show the proportional-% or the fixed-ms width control.
+
+        The max ceiling only bites in proportional mode (a fixed window is
+        the width the user typed); the min floor applies in both.
+        """
         proportional = self._spectral_wmode_combo.currentIndex() == 0
         self._spectral_wprop_label.setVisible(proportional)
         self._spectral_wprop_spin.setVisible(proportional)
         self._spectral_window_label.setVisible(not proportional)
         self._spectral_window_spin.setVisible(not proportional)
+        self._spectral_winmax_label.setVisible(proportional)
+        self._spectral_winmax_spin.setVisible(proportional)
 
     def validatePage(self):
         wiz = self.wizard()
@@ -4912,6 +4951,13 @@ class _DataOptionsPage(QWizardPage):
                 else "fixed")
             wiz.spectral_w_prop = self._spectral_wprop_spin.value() / 100.0
             wiz.spectral_window_ms = self._spectral_window_spin.value()
+            wiz.spectral_win_min_ms = self._spectral_winmin_spin.value()
+            wiz.spectral_win_max_ms = self._spectral_winmax_spin.value()
+            if wiz.spectral_win_max_ms < wiz.spectral_win_min_ms:
+                QMessageBox.warning(
+                    self, "Error",
+                    "Max window must be at least the min window.")
+                return False
             wiz.spectral_window_type = self._spectral_window_combo.currentText()
             wiz.spectral_highpass_hz = (
                 self._spectral_hp_spin.value()
@@ -4922,6 +4968,8 @@ class _DataOptionsPage(QWizardPage):
             wiz.spectral_window_mode = DEFAULT_SPECTRAL_WINDOW_MODE
             wiz.spectral_w_prop = DEFAULT_SPECTRAL_W_PROP
             wiz.spectral_window_ms = DEFAULT_SPECTRAL_WINDOW_MS
+            wiz.spectral_win_min_ms = MIN_SPECTRAL_WINDOW_MS
+            wiz.spectral_win_max_ms = PROP_SPECTRAL_WIN_MAX_MS
             wiz.spectral_window_type = "Hamming"
             wiz.spectral_highpass_hz = 0.0
 
@@ -5598,6 +5646,8 @@ class BuildCSVWizard(QWizard):
         self.spectral_window_mode = DEFAULT_SPECTRAL_WINDOW_MODE
         self.spectral_w_prop = DEFAULT_SPECTRAL_W_PROP
         self.spectral_window_ms = DEFAULT_SPECTRAL_WINDOW_MS
+        self.spectral_win_min_ms = MIN_SPECTRAL_WINDOW_MS
+        self.spectral_win_max_ms = PROP_SPECTRAL_WIN_MAX_MS
         self.spectral_window_type = "Hamming"
         self.spectral_highpass_hz = 0.0
 
@@ -6497,6 +6547,8 @@ class MainWindow(QMainWindow):
                 spectral_window_mode=wizard.spectral_window_mode,
                 spectral_w_prop=wizard.spectral_w_prop,
                 spectral_window_ms=wizard.spectral_window_ms,
+                spectral_min_window_ms=wizard.spectral_win_min_ms,
+                spectral_win_max_ms=wizard.spectral_win_max_ms,
                 spectral_window_type=wizard.spectral_window_type,
                 spectral_highpass_hz=wizard.spectral_highpass_hz,
                 categorise=wizard.categorise,

@@ -239,6 +239,32 @@ class TestSpectralCSV:
         assert float(row[headers.index("winms_50%")]) == pytest.approx(30.0)
         assert row[headers.index("winsource_50%")] == "clamped_max"
 
+    def test_custom_max_window_clamp(self, tmp_path):
+        # A generous max lets 30% of a 0.2 s segment (60 ms) exceed it,
+        # so a 40 ms ceiling caps the midpoint window at 40 ms.
+        audio, tg = _write_corpus(tmp_path, [(0.1, 0.3, "s")])
+        tier = TextGrid.from_file(os.path.join(tg, "test.TextGrid")).tiers
+        headers, rows = _build_csv_data(**_spectral_kwargs(
+            audio_dir=audio, textgrid_dir=tg, selected_tiers=tier,
+            spectral_window_mode="proportional", spectral_markers=[50],
+            spectral_win_max_ms=40.0))
+        assert float(rows[0][headers.index("winms_50%")]) == pytest.approx(40.0)
+        assert rows[0][headers.index("winsource_50%")] == "clamped_max"
+
+    def test_custom_min_window_floor_raises_too_short_threshold(self, tmp_path):
+        # A 10 ms segment clears the default 5 ms floor but not a 12 ms one.
+        audio, tg = _write_corpus(tmp_path, [(0.20, 0.210, "t")])
+        tier = TextGrid.from_file(os.path.join(tg, "test.TextGrid")).tiers
+        h5, r5 = _build_csv_data(**_spectral_kwargs(
+            audio_dir=audio, textgrid_dir=tg, selected_tiers=tier,
+            spectral_markers=[50], spectral_min_window_ms=5.0))
+        assert r5[0][h5.index("winsource_50%")] != "too_short"
+        h12, r12 = _build_csv_data(**_spectral_kwargs(
+            audio_dir=audio, textgrid_dir=tg, selected_tiers=tier,
+            spectral_markers=[50], spectral_min_window_ms=12.0))
+        assert r12[0][h12.index("winsource_50%")] == "too_short"
+        assert r12[0][h12.index("COG_50%")] == ""
+
     def test_short_segment_flags_too_short(self, tmp_path):
         # 4 ms segment < 5 ms floor even at the midpoint → too_short
         audio, tg = _write_corpus(tmp_path, [(0.20, 0.204, "t")])
