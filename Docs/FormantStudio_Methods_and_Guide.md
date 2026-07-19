@@ -222,7 +222,40 @@ These transparency columns are FRED-friendly: you can **filter or group** on `wi
 (e.g. keep only `proportional`, or drop `clamped_min`/`too_short` before analysing skewness) or
 threshold on `nsamples`, without any of them affecting the moments themselves.
 
-### 5.6 Missing values
+### 5.6 Spectral trajectory (DCT) — capturing dynamics
+
+Three point measurements tell you what the spectrum *is* at three instants; they do not tell
+you how it *moves*. Sibilant and release dynamics are contrastive (Reidy 2016), so the
+trajectory pass measures the whole arc.
+
+**How it works.** A **narrow** window (default 6 ms) slides across the whole segment in small
+hops (default 1 ms) — deliberately separate from the wide point windows of §5.2, because a
+trajectory needs time resolution where a point estimate needs stability. Every frame stays
+fully inside the segment, so the track is inset by half a window at each edge. The four moments
+are computed per frame (multitaper is recommended here — short frames are exactly where it
+helps), then each raw track is resampled to a fixed number of points over normalised time
+τ ∈ [0, 1], so segments of different duration become directly comparable.
+
+**Output is wide** (no companion long-format file), per selected moment:
+
+- `<moment>_k0 … k{n-1}` — **DCT-II coefficients** of the normalised track. `k0` ∝ mean level,
+  `k1` ∝ overall slope, `k2` ∝ curvature, `k3` ∝ finer detail. Compact, and they average
+  cleanly across tokens — the right thing for statistics and grouping.
+  *Sign convention:* with DCT-II, a **rising** track gives a **negative** `k1` and a falling
+  track a positive one.
+- `<moment>_t0 … t{N-1}` — the **time-normalised track** itself, one column per normalised
+  time point. This is what lets a plotting tool draw the actual arc (it cannot invert a DCT)
+  and average trajectories pointwise across tokens. Optional — untick for coefficients only.
+
+**Settings:** which moments (default COG + SD — the reliable pair; skew/kurt available),
+window and hop (ms), number of DCT coefficients, number of track points. The DCT normalisation
+(`ortho`) and the frame inset are recorded in the provenance sidecar.
+
+**Degenerate cases:** a segment too short to host at least three frames yields blank trajectory
+cells (the row is still emitted); a moment whose frames are more than half unmeasurable yields
+blanks for that moment only. Interior gaps are linearly interpolated and the edges clamped.
+
+### 5.7 Missing values
 
 Consistent with formants, an unmeasurable moment is an **empty cell** — never `0`, never a
 guess. FRED ignores spectrally-blank tokens exactly as it ignores formant-blank ones.
@@ -252,6 +285,8 @@ The CSV builder is deliberately generic: it imposes no fixed tier names or hiera
   segment *immediately* preceding a stop release is usually its own closure; recovering the
   sound before the closure is a separate, label-scheme-dependent problem left for later.)
 - **Spectral moments:** §5, sampled on a chosen segment tier (defaults to the primary tier).
+- **Spectral trajectory (optional):** §5.6, wide `<moment>_k*` DCT coefficients and
+  `<moment>_t*` normalised-track columns on the same segment tier.
 - **Categorisation (optional):** IPA/SAMPA property columns (place, manner, height, etc.)
   derived from labels via the built-in chart.
 - **Missing-value convention:** empty cell throughout, for every measure.
@@ -289,13 +324,19 @@ See `FormantStudio_Specification.md` §2.7 for the full column catalogue and ord
 
 Recorded so they are added deliberately, as new columns, rather than invented ad hoc:
 
-- **Trajectory + DCT pass**: a dense sliding-window moment track reduced to a few DCT
-  coefficients per moment, capturing sibilant *dynamics* rather than three static points
-  (Reidy 2016; JASA 2017 moments-vs-DCT comparison), plus the normalized track for smooth-arc
-  plotting.
-- A configurable **`NA` token** — held until confirmed compatible with the downstream grapher.
+- A configurable **`NA` token** — held until confirmed compatible with the downstream grapher;
+  empty cells are working and remain the convention.
+- **Ensemble-average spectra** (full per-frame spectrum export), spectral peak frequency,
+  spectral tilt/slope, band-energy ratio ("sibilance index"), RMS amplitude, and
+  periodicity/HNR voicing measures. If added they become new columns, never inserted
+  mid-block, so existing consumers keep working.
+- **Recovering the segment before a stop closure** — the segment immediately preceding a
+  release is usually its own closure, so the phonetically interesting context sits one step
+  further back. Label-scheme dependent, deliberately deferred.
 
-These are analytical upgrades; the current point-moment CSV is complete and valid without them.
+These are analytical upgrades; the current CSV is complete and valid without them.
+Already delivered: proportional windowing with centred geometry, configurable min/max window
+clamps, multitaper estimation, flanking segment context, and the trajectory/DCT pass (§5.6).
 
 A **provenance sidecar** is already written: every exported CSV gets a companion
 `<name>.provenance.json` recording the resolved run configuration (primary tier, selected tiers,

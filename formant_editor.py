@@ -27,7 +27,7 @@ from parselmouth import praat
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QFileDialog, QLabel, QSlider, QGroupBox, QStatusBar,
-    QPushButton, QSplitter, QComboBox, QDoubleSpinBox, QCheckBox,
+    QPushButton, QSplitter, QComboBox, QDoubleSpinBox, QSpinBox, QCheckBox,
     QMessageBox, QSizePolicy, QScrollBar, QLineEdit, QDialog,
     QDialogButtonBox, QFormLayout, QGridLayout,
     QWizard, QWizardPage, QProgressDialog, QListWidget, QListWidgetItem,
@@ -83,6 +83,19 @@ PROP_SPECTRAL_WIN_MAX_MS = 30.0     # ceiling applied to proportional windows
 DEFAULT_SPECTRAL_ESTIMATOR = "single_taper"   # "single_taper" | "multitaper"
 DEFAULT_SPECTRAL_MT_NW = 4.0        # multitaper time-bandwidth product (NW)
 DEFAULT_SPECTRAL_MT_K = 7           # number of DPSS tapers
+
+# Trajectory pass: a dense track of moments across the whole segment, using
+# its own NARROW sliding windows (separate from the wide point windows), then
+# time-normalised and reduced to DCT coefficients. Captures how the spectrum
+# evolves through a release rather than three static snapshots.
+SPECTRAL_MOMENT_NAMES = ("COG", "SD", "skew", "kurt")
+DEFAULT_TRAJ_WIN_MS = 6.0           # sliding-window width (ms)
+DEFAULT_TRAJ_HOP_MS = 1.0           # sliding-window hop (ms)
+DEFAULT_TRAJ_NORM_POINTS = 11       # samples per time-normalised track
+DEFAULT_TRAJ_DCT_COEFFS = 4         # DCT coefficients retained (k0..k3)
+DEFAULT_TRAJ_MOMENTS = ("COG", "SD")  # moments given trajectory columns
+MIN_TRAJ_FRAMES = 3                 # fewer frames than this -> no trajectory
+TRAJ_DCT_NORM = "ortho"             # DCT-II normalisation (logged in sidecar)
 
 # Spectrogram display defaults
 DEFAULT_DYNAMIC_RANGE = 70.0   # dB
@@ -738,6 +751,83 @@ def compute_spectral_moments_multitaper(sound, t0, t1, nw, k,
         return nan4
 
 
+def compute_spectral_trajectory(sound, seg_xmin, seg_xmax, *,
+                                win_ms=DEFAULT_TRAJ_WIN_MS,
+                                hop_ms=DEFAULT_TRAJ_HOP_MS,
+                                norm_points=DEFAULT_TRAJ_NORM_POINTS,
+                                estimator=DEFAULT_SPECTRAL_ESTIMATOR,
+                                window_shape=None,
+                                mt_nw=DEFAULT_SPECTRAL_MT_NW,
+                                mt_k=DEFAULT_SPECTRAL_MT_K):
+    """Time-normalised moment tracks across [*seg_xmin*, *seg_xmax*].
+
+    Slides a narrow window (*win_ms*) by *hop_ms* across the segment, keeping
+    every frame fully inside it, and computes the four moments per frame.
+    Each raw track is then resampled to *norm_points* equally spaced samples
+    over normalised time tau in [0, 1].
+
+    Returns ``{moment_name: np.ndarray(norm_points)}`` — a moment maps to
+    ``None`` when more than half its frames are unmeasurable.  Returns
+    ``None`` when the segment cannot host at least ``MIN_TRAJ_FRAMES``
+    frames.
+    """
+    win_s = win_ms / 1000.0
+    hop_s = hop_ms / 1000.0
+    if win_s <= 0 or hop_s <= 0:
+        return None
+    first = seg_xmin + win_s / 2.0
+    last = seg_xmax - win_s / 2.0
+    if last < first:
+        return None
+    n_frames = int(math.floor((last - first) / hop_s)) + 1
+    if n_frames < MIN_TRAJ_FRAMES:
+        return None
+
+    centres = first + np.arange(n_frames) * hop_s
+    tracks = {m: np.full(n_frames, np.nan) for m in SPECTRAL_MOMENT_NAMES}
+    for i, centre in enumerate(centres):
+        t0, t1 = centre - win_s / 2.0, centre + win_s / 2.0
+        if estimator == "multitaper":
+            vals = compute_spectral_moments_multitaper(
+                sound, t0, t1, mt_nw, mt_k)
+        else:
+            vals = compute_spectral_moments(sound, t0, t1, window_shape)
+        for name, val in zip(SPECTRAL_MOMENT_NAMES, vals):
+            tracks[name][i] = val
+
+    src_tau = np.linspace(0.0, 1.0, n_frames)
+    tgt_tau = np.linspace(0.0, 1.0, norm_points)
+    out = {}
+    for name, raw in tracks.items():
+        valid = np.isfinite(raw)
+        n_valid = int(valid.sum())
+        # More than half the frames unmeasurable -> the track is unusable
+        if n_valid < 2 or n_valid * 2 < n_frames:
+            out[name] = None
+            continue
+        # np.interp fills interior gaps linearly and clamps at the edges
+        filled = np.interp(src_tau, src_tau[valid], raw[valid])
+        out[name] = np.interp(tgt_tau, src_tau, filled)
+    return out
+
+
+def dct_coefficients(track, n_coeffs, norm=TRAJ_DCT_NORM):
+    """First *n_coeffs* DCT-II coefficients of a normalised track.
+
+    k0 is the mean level, k1 the overall slope (does the moment rise or fall
+    through the segment?), k2 curvature, k3 finer detail.  A fixed
+    normalisation (*norm*) keeps coefficients comparable across segments of
+    different original duration, since every track is resampled to the same
+    length first.
+    """
+    from scipy.fft import dct
+    coeffs = dct(np.asarray(track, dtype=float), type=2, norm=norm)
+    out = np.full(n_coeffs, np.nan)
+    take = min(n_coeffs, coeffs.size)
+    out[:take] = coeffs[:take]
+    return out
+
+
 # ---------------------------------------------------------------------------
 # CSV Export Helpers
 # ---------------------------------------------------------------------------
@@ -925,6 +1015,13 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     spectral_estimator=DEFAULT_SPECTRAL_ESTIMATOR,
                     spectral_mt_nw=DEFAULT_SPECTRAL_MT_NW,
                     spectral_mt_k=DEFAULT_SPECTRAL_MT_K,
+                    extract_trajectory=False,
+                    traj_moments=None,
+                    traj_win_ms=DEFAULT_TRAJ_WIN_MS,
+                    traj_hop_ms=DEFAULT_TRAJ_HOP_MS,
+                    traj_norm_points=DEFAULT_TRAJ_NORM_POINTS,
+                    traj_dct_coeffs=DEFAULT_TRAJ_DCT_COEFFS,
+                    traj_include_track=True,
                     spectral_highpass_hz=DEFAULT_SPECTRAL_HIGHPASS_HZ,
                     spectral_min_window_ms=MIN_SPECTRAL_WINDOW_MS,
                     spectral_win_max_ms=PROP_SPECTRAL_WIN_MAX_MS,
@@ -983,6 +1080,10 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     if spectral_markers is None:
         spectral_markers = []
     spectral_shape = _spectral_window_shape(spectral_window_type)
+    if traj_moments is None:
+        traj_moments = list(DEFAULT_TRAJ_MOMENTS)
+    # Keep a stable, canonical order regardless of how they were supplied
+    traj_moments = [m for m in SPECTRAL_MOMENT_NAMES if m in set(traj_moments)]
 
     # Discover audio files
     audio_exts = {".wav", ".aiff", ".mp3"}
@@ -1145,6 +1246,15 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                             f"skew_{pct_s}%", f"kurt_{pct_s}%",
                             f"winms_{pct_s}%", f"winsource_{pct_s}%",
                             f"nsamples_{pct_s}%"])
+
+    # Trajectory columns — wide: per moment, the DCT coefficients then the
+    # time-normalised track (so a grapher can draw the arc without an
+    # inverse DCT).
+    if extract_trajectory:
+        for m in traj_moments:
+            headers.extend([f"{m}_k{i}" for i in range(traj_dct_coeffs)])
+            if traj_include_track:
+                headers.extend([f"{m}_t{i}" for i in range(traj_norm_points)])
 
     # Categorisation columns
     cat_col_start = len(headers)
@@ -1426,6 +1536,42 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 ])
             return cols
 
+        def _trajectory_cols(iv):
+            """Wide trajectory cells: DCT coefficients then the track.
+
+            Uses its own narrow sliding windows across the whole resolved
+            segment (independent of the point-marker windows).  A segment too
+            short to host the frames, or a moment whose track is mostly
+            unmeasurable, yields blank cells.
+            """
+            per_moment = traj_dct_coeffs + (
+                traj_norm_points if traj_include_track else 0)
+            blank = [""] * (per_moment * len(traj_moments))
+            seg = _resolve_sampling_interval(iv, spectral_tier_name)
+            if seg is None or spectral_sound is None:
+                return blank
+            tracks = compute_spectral_trajectory(
+                spectral_sound, seg.xmin, seg.xmax,
+                win_ms=traj_win_ms, hop_ms=traj_hop_ms,
+                norm_points=traj_norm_points,
+                estimator=spectral_estimator, window_shape=spectral_shape,
+                mt_nw=spectral_mt_nw, mt_k=spectral_mt_k)
+            if tracks is None:
+                return blank
+            cols = []
+            for m in traj_moments:
+                track = tracks.get(m)
+                if track is None:
+                    cols.extend([""] * per_moment)
+                    continue
+                coeffs = dct_coefficients(track, traj_dct_coeffs)
+                cols.extend(f"{c:.4f}" if np.isfinite(c) else ""
+                            for c in coeffs)
+                if traj_include_track:
+                    cols.extend(f"{v:.2f}" if np.isfinite(v) else ""
+                                for v in track)
+            return cols
+
         # Helper: categorisation columns for a row (given label_cols already built)
         def _cat_cols(label_cols_list):
             """Return list of categorisation cell values."""
@@ -1535,6 +1681,9 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
 
             if extract_spectral:
                 row.extend(_segment_spectral_cols(unit))
+
+            if extract_trajectory:
+                row.extend(_trajectory_cols(unit))
 
             row.extend(_cat_cols(lc))
 
@@ -4848,6 +4997,90 @@ class _DataOptionsPage(QWizardPage):
         self._spectral_group.setVisible(False)
         self._spectral_cb.toggled.connect(self._spectral_group.setVisible)
 
+        # --- Spectral trajectory (dynamics across the segment) ---
+        self._traj_cb = QCheckBox(
+            "Extract spectral trajectory (DCT coefficients + track)")
+        self._traj_cb.setToolTip(
+            "Slides a narrow window across the whole segment to capture how "
+            "the spectrum evolves, rather than three static points. Adds, per "
+            "moment, DCT coefficients (k0 = mean level, k1 = overall slope, "
+            "k2 = curvature) and the time-normalised track for plotting.")
+        layout.addWidget(self._traj_cb)
+
+        self._traj_group = QGroupBox()
+        traj_layout = QVBoxLayout(self._traj_group)
+
+        traj_note = QLabel(
+            "Uses its own narrow windows, independent of the percentage "
+            "markers above. Requires the spectral segment tier, so tick "
+            "Extract spectral moments as well.")
+        traj_note.setWordWrap(True)
+        traj_note.setStyleSheet("color: #888888; font-size: 11px;")
+        traj_layout.addWidget(traj_note)
+
+        tm_row = QHBoxLayout()
+        tm_row.addWidget(QLabel("Moments:"))
+        self._traj_moment_cbs = []
+        for name in SPECTRAL_MOMENT_NAMES:
+            cb = QCheckBox(name)
+            cb.setChecked(name in DEFAULT_TRAJ_MOMENTS)
+            tm_row.addWidget(cb)
+            self._traj_moment_cbs.append((cb, name))
+        tm_row.addStretch()
+        traj_layout.addLayout(tm_row)
+
+        tw_row = QHBoxLayout()
+        tw_row.addWidget(QLabel("Window (ms):"))
+        self._traj_win_spin = QDoubleSpinBox()
+        self._traj_win_spin.setRange(2.0, 50.0)
+        self._traj_win_spin.setSingleStep(1.0)
+        self._traj_win_spin.setValue(DEFAULT_TRAJ_WIN_MS)
+        self._traj_win_spin.setToolTip(
+            "Width of each sliding frame. Narrow keeps the track time-local; "
+            "multitaper is recommended at these widths.")
+        tw_row.addWidget(self._traj_win_spin)
+        tw_row.addWidget(QLabel("Hop (ms):"))
+        self._traj_hop_spin = QDoubleSpinBox()
+        self._traj_hop_spin.setRange(0.5, 25.0)
+        self._traj_hop_spin.setSingleStep(0.5)
+        self._traj_hop_spin.setValue(DEFAULT_TRAJ_HOP_MS)
+        self._traj_hop_spin.setToolTip("Step between successive frames.")
+        tw_row.addWidget(self._traj_hop_spin)
+        tw_row.addStretch()
+        traj_layout.addLayout(tw_row)
+
+        tp_row = QHBoxLayout()
+        tp_row.addWidget(QLabel("DCT coefficients:"))
+        self._traj_dct_spin = QSpinBox()
+        self._traj_dct_spin.setRange(1, 10)
+        self._traj_dct_spin.setValue(DEFAULT_TRAJ_DCT_COEFFS)
+        self._traj_dct_spin.setToolTip(
+            "How many DCT coefficients to keep per moment (k0 upward).")
+        tp_row.addWidget(self._traj_dct_spin)
+        tp_row.addWidget(QLabel("Track points:"))
+        self._traj_points_spin = QSpinBox()
+        self._traj_points_spin.setRange(3, 50)
+        self._traj_points_spin.setValue(DEFAULT_TRAJ_NORM_POINTS)
+        self._traj_points_spin.setToolTip(
+            "Samples in the time-normalised track (one column each).")
+        tp_row.addWidget(self._traj_points_spin)
+        tp_row.addStretch()
+        traj_layout.addLayout(tp_row)
+
+        self._traj_track_cb = QCheckBox(
+            "Include time-normalised track columns (for plotting arcs)")
+        self._traj_track_cb.setChecked(True)
+        self._traj_track_cb.setToolTip(
+            "Adds <moment>_t0 … columns. Needed to plot the trajectory "
+            "directly; untick for DCT coefficients only.")
+        traj_layout.addWidget(self._traj_track_cb)
+        self._traj_track_cb.toggled.connect(
+            self._traj_points_spin.setEnabled)
+
+        layout.addWidget(self._traj_group)
+        self._traj_group.setVisible(False)
+        self._traj_cb.toggled.connect(self._traj_group.setVisible)
+
         layout.addStretch()
         self.setStyleSheet(_DIALOG_FIELD_STYLE + _checked_tick_qss())
 
@@ -5154,6 +5387,34 @@ class _DataOptionsPage(QWizardPage):
             wiz.spectral_mt_nw = DEFAULT_SPECTRAL_MT_NW
             wiz.spectral_mt_k = DEFAULT_SPECTRAL_MT_K
             wiz.spectral_highpass_hz = 0.0
+
+        wiz.extract_trajectory = self._traj_cb.isChecked()
+        if wiz.extract_trajectory:
+            wiz.traj_moments = [name for cb, name in self._traj_moment_cbs
+                                if cb.isChecked()]
+            if not wiz.traj_moments:
+                QMessageBox.warning(
+                    self, "Error",
+                    "Select at least one moment for the trajectory.")
+                return False
+            if not wiz.extract_spectral:
+                QMessageBox.warning(
+                    self, "Error",
+                    "Spectral trajectory needs the spectral segment tier — "
+                    "tick 'Extract spectral moments' as well.")
+                return False
+            wiz.traj_win_ms = self._traj_win_spin.value()
+            wiz.traj_hop_ms = self._traj_hop_spin.value()
+            wiz.traj_dct_coeffs = int(self._traj_dct_spin.value())
+            wiz.traj_norm_points = int(self._traj_points_spin.value())
+            wiz.traj_include_track = self._traj_track_cb.isChecked()
+        else:
+            wiz.traj_moments = list(DEFAULT_TRAJ_MOMENTS)
+            wiz.traj_win_ms = DEFAULT_TRAJ_WIN_MS
+            wiz.traj_hop_ms = DEFAULT_TRAJ_HOP_MS
+            wiz.traj_dct_coeffs = DEFAULT_TRAJ_DCT_COEFFS
+            wiz.traj_norm_points = DEFAULT_TRAJ_NORM_POINTS
+            wiz.traj_include_track = True
 
         return True
 
@@ -5837,6 +6098,15 @@ class BuildCSVWizard(QWizard):
         self.spectral_mt_nw = DEFAULT_SPECTRAL_MT_NW
         self.spectral_mt_k = DEFAULT_SPECTRAL_MT_K
         self.spectral_highpass_hz = 0.0
+
+        # Trajectory / DCT state (Page 3)
+        self.extract_trajectory = False
+        self.traj_moments = list(DEFAULT_TRAJ_MOMENTS)
+        self.traj_win_ms = DEFAULT_TRAJ_WIN_MS
+        self.traj_hop_ms = DEFAULT_TRAJ_HOP_MS
+        self.traj_norm_points = DEFAULT_TRAJ_NORM_POINTS
+        self.traj_dct_coeffs = DEFAULT_TRAJ_DCT_COEFFS
+        self.traj_include_track = True
 
         # Categorisation state (Page 4)
         self.categorise = False
@@ -6742,6 +7012,13 @@ class MainWindow(QMainWindow):
                 spectral_estimator=wizard.spectral_estimator,
                 spectral_mt_nw=wizard.spectral_mt_nw,
                 spectral_mt_k=wizard.spectral_mt_k,
+                extract_trajectory=wizard.extract_trajectory,
+                traj_moments=wizard.traj_moments,
+                traj_win_ms=wizard.traj_win_ms,
+                traj_hop_ms=wizard.traj_hop_ms,
+                traj_norm_points=wizard.traj_norm_points,
+                traj_dct_coeffs=wizard.traj_dct_coeffs,
+                traj_include_track=wizard.traj_include_track,
                 spectral_highpass_hz=wizard.spectral_highpass_hz,
                 categorise=wizard.categorise,
                 cat_chart=cat_chart,
@@ -6927,6 +7204,16 @@ class MainWindow(QMainWindow):
                     "moment_power": SPECTRAL_MOMENT_POWER,
                     "kurtosis": "excess (Gaussian = 0)",
                 } if wizard.extract_spectral else None,
+                "trajectory": {
+                    "moments": wizard.traj_moments,
+                    "window_ms": wizard.traj_win_ms,
+                    "hop_ms": wizard.traj_hop_ms,
+                    "norm_points": wizard.traj_norm_points,
+                    "dct_coeffs": wizard.traj_dct_coeffs,
+                    "dct_norm": TRAJ_DCT_NORM,
+                    "include_track": wizard.traj_include_track,
+                    "frame_inset": "window_ms / 2 at each segment edge",
+                } if wizard.extract_trajectory else None,
             }
             side_path = os.path.splitext(csv_path)[0] + ".provenance.json"
             with open(side_path, "w", encoding="utf-8") as fh:
