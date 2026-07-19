@@ -255,6 +255,54 @@ class TestPointTierPrimary:
         assert vals["T2"] == pytest.approx(700.0, abs=6)    # 0.40
 
 
+class TestFlankingSegments:
+    """<primary>_prev / <primary>_next context columns."""
+
+    def test_interval_primary_prev_next(self, corpus):
+        # phones drives rows: 't' [0.05-0.2] then 'a' [0.2-0.45]
+        headers, rows = _run(
+            corpus, ["words", "phones", "Target"],
+            primary_tier_name="phones",
+            include_prev_segment=True, include_next_segment=True)
+        p = headers.index("phones_prev")
+        n = headers.index("phones_next")
+        # 't' is first (no preceding segment), followed by 'a'
+        assert rows[0][p] == "" and rows[0][n] == "a"
+        # 'a' preceded by 't', and is last (no following segment)
+        assert rows[1][p] == "t" and rows[1][n] == ""
+
+    def test_only_prev_requested_emits_one_column(self, corpus):
+        headers, _ = _run(
+            corpus, ["words", "phones"], primary_tier_name="phones",
+            extract_formants=False, formant_mode=None,
+            include_prev_segment=True)
+        assert "phones_prev" in headers
+        assert "phones_next" not in headers
+
+    def test_point_primary_prev_next_by_time(self, corpus):
+        # Target points: rel@0.10, T1@0.25, T2@0.40 (time order)
+        headers, rows = _run(
+            corpus, ["phones", "Target"], primary_tier_name="Target",
+            formant_mode="at_points", point_tier_name="Target",
+            include_prev_segment=True, include_next_segment=True)
+        tcol = headers.index("Target")
+        p = headers.index("Target_prev")
+        n = headers.index("Target_next")
+        by = {r[tcol]: (r[p], r[n]) for r in rows}
+        assert by["rel"] == ("", "T1")      # first point: no prev
+        assert by["T1"] == ("rel", "T2")
+        assert by["T2"] == ("T1", "")       # last point: no next
+
+    def test_context_only_run_is_valid(self, corpus):
+        # No measures, just context — still emits label rows
+        headers, rows = _run(
+            corpus, ["words", "phones"], primary_tier_name="phones",
+            extract_formants=False, formant_mode=None,
+            include_next_segment=True)
+        assert len(rows) == 2
+        assert rows[0][headers.index("phones_next")] == "a"
+
+
 class TestRowTierMissing:
     def test_missing_row_tier_reported_not_blank(self, corpus):
         skipped = []

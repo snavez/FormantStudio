@@ -235,6 +235,12 @@ The CSV builder is deliberately generic: it imposes no fixed tier names or hiera
   percentage steps, or fixed time steps (ms).
 - **Durations:** per interval tier, opt in to `<tier>_dur`, and optionally `<tier>_start` /
   `<tier>_end`. A point primary contributes a single `<tier>_time` column.
+- **Segment context:** optionally add `<primary>_prev` / `<primary>_next` — the label of the
+  immediately adjacent unit on the primary tier (by time). Blank at a recording edge or an
+  unlabelled/pause neighbour. Available to every analysis, not just spectral, so you can group
+  by phonetic environment (e.g. release-by-following-vowel) directly in the CSV. (Note: the
+  segment *immediately* preceding a stop release is usually its own closure; recovering the
+  sound before the closure is a separate, label-scheme-dependent problem left for later.)
 - **Spectral moments:** §5, sampled on a chosen segment tier (defaults to the primary tier).
 - **Categorisation (optional):** IPA/SAMPA property columns (place, manner, height, etc.)
   derived from labels via the built-in chart.

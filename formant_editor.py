@@ -679,8 +679,11 @@ def compute_spectral_moments(sound, t0, t1, window_shape, power=SPECTRAL_MOMENT_
 
 # One CSV row's anchoring unit. Shares xmin/xmax/text with Interval so the
 # measure/label helpers treat interval spans and points uniformly; a point
-# is a zero-width unit (xmin == xmax == time, text == mark).
-_RowUnit = namedtuple("_RowUnit", ["xmin", "xmax", "text", "is_point"])
+# is a zero-width unit (xmin == xmax == time, text == mark). prev/next hold
+# the immediately adjacent unit's label on the primary tier ("" at an edge
+# or an unlabelled neighbour), for optional context columns.
+_RowUnit = namedtuple(
+    "_RowUnit", ["xmin", "xmax", "text", "is_point", "prev", "next"])
 
 
 def _get_formant_at_time(fd, time_s):
@@ -857,6 +860,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     spectral_highpass_hz=DEFAULT_SPECTRAL_HIGHPASS_HZ,
                     spectral_min_window_ms=MIN_SPECTRAL_WINDOW_MS,
                     spectral_win_max_ms=PROP_SPECTRAL_WIN_MAX_MS,
+                    include_prev_segment=False, include_next_segment=False,
                     categorise=False, cat_chart=None,
                     cat_notation="ipa", cat_tier_names=None,
                     cat_vowel_props=None, cat_consonant_props=None,
@@ -873,6 +877,11 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     "; "-joined labels of the intervals subdividing it; point tiers
     contribute the marks falling inside it.  A point primary contributes a
     single ``<tier>_time`` column (a point has no width).
+
+    *include_prev_segment*/*include_next_segment* add ``<primary>_prev`` /
+    ``<primary>_next`` columns holding the label of the immediately adjacent
+    unit on the primary tier ("" at a corpus edge or an unlabelled/pause
+    neighbour).
 
     Duration extraction is per tier: every name in *duration_tier_names*
     yields a ``<tier>_dur`` column; names also in *bounds_tier_names* gain
@@ -928,12 +937,29 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         for t in selected_tiers)
 
     def _units_for(primary_tier):
-        """Row units for a primary tier: labelled intervals, or all points."""
+        """Row units for a primary tier: labelled intervals, or all points.
+
+        Each unit carries the label of its immediately adjacent neighbour on
+        the primary tier (by time) — the previous/next interval (Praat tiers
+        tile, so an empty neighbour is a real pause and reads as "") or the
+        previous/next point.  Edges have "" for the missing side.
+        """
         if primary_tier.tier_class == "IntervalTier":
-            return [_RowUnit(iv.xmin, iv.xmax, iv.text, False)
-                    for iv in primary_tier.intervals if iv.text.strip()]
-        return [_RowUnit(p.time, p.time, p.mark, True)
-                for p in primary_tier.points]
+            ivs = primary_tier.intervals
+            units = []
+            for i, iv in enumerate(ivs):
+                if not iv.text.strip():
+                    continue
+                prev = ivs[i - 1].text if i > 0 else ""
+                nxt = ivs[i + 1].text if i + 1 < len(ivs) else ""
+                units.append(_RowUnit(iv.xmin, iv.xmax, iv.text, False,
+                                      prev, nxt))
+            return units
+        pts = primary_tier.points
+        return [_RowUnit(p.time, p.time, p.mark, True,
+                         pts[i - 1].mark if i > 0 else "",
+                         pts[i + 1].mark if i + 1 < len(pts) else "")
+                for i, p in enumerate(pts)]
 
     # Pre-scan TextGrids for corpus-dependent column counts: the longest
     # segment (time-step sampling columns) and the most target points in any
@@ -997,6 +1023,13 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     point_tier_names = [t.name for t in selected_tiers
                         if t.tier_class == "TextTier"]
     headers.extend(point_tier_names)
+
+    # Flanking-segment context columns (labels of the adjacent units on the
+    # primary tier)
+    if include_prev_segment:
+        headers.append(f"{primary_tier_name}_prev")
+    if include_next_segment:
+        headers.append(f"{primary_tier_name}_next")
 
     # A point primary contributes its own time column (a point has no
     # width, so a single time replaces start/end bounds). Interval-primary
@@ -1395,6 +1428,10 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         for unit in units:
             lc = _label_cols(unit)
             row = [audio_file] + lc
+            if include_prev_segment:
+                row.append(unit.prev)
+            if include_next_segment:
+                row.append(unit.next)
             if primary_is_point:
                 row.append(f"{unit.xmin:.4f}")
 
@@ -4488,6 +4525,23 @@ class _DataOptionsPage(QWizardPage):
         scroll.setWidget(container)
         layout = QVBoxLayout(container)
 
+        # --- Segment context (flanking labels from the primary tier) ---
+        ctx_group = QGroupBox("Segment context (from primary tier)")
+        ctx_layout = QVBoxLayout(ctx_group)
+        self._prev_seg_cb = QCheckBox("Include preceding segment label")
+        self._prev_seg_cb.setToolTip(
+            "Adds a <primary>_prev column: the label of the segment "
+            "immediately before each row on the primary tier (blank at a "
+            "recording edge or a pause).")
+        self._next_seg_cb = QCheckBox("Include following segment label")
+        self._next_seg_cb.setToolTip(
+            "Adds a <primary>_next column: the label of the segment "
+            "immediately after each row on the primary tier (blank at a "
+            "recording edge or a pause).")
+        ctx_layout.addWidget(self._prev_seg_cb)
+        ctx_layout.addWidget(self._next_seg_cb)
+        layout.addWidget(ctx_group)
+
         # --- Formants ---
         self._fmt_cb = QCheckBox("Extract formant values (F1–F3)")
         layout.addWidget(self._fmt_cb)
@@ -4785,13 +4839,17 @@ class _DataOptionsPage(QWizardPage):
         wiz.extract_formants = self._fmt_cb.isChecked()
         wiz.extract_durations = self._dur_cb.isChecked()
         wiz.extract_spectral = self._spectral_cb.isChecked()
+        wiz.include_prev_segment = self._prev_seg_cb.isChecked()
+        wiz.include_next_segment = self._next_seg_cb.isChecked()
 
         if not (wiz.extract_formants or wiz.extract_durations
-                or wiz.extract_spectral):
+                or wiz.extract_spectral or wiz.include_prev_segment
+                or wiz.include_next_segment):
             QMessageBox.warning(
                 self, "Error",
-                "Select at least one extraction type "
-                "(formant values, durations, or spectral moments).")
+                "Select at least one thing to extract "
+                "(formants, durations, spectral moments, or segment "
+                "context).")
             return False
 
         if wiz.extract_formants:
@@ -5638,6 +5696,8 @@ class BuildCSVWizard(QWizard):
         self.extract_durations = False
         self.duration_tier_names = []
         self.bounds_tier_names = []
+        self.include_prev_segment = False
+        self.include_next_segment = False
 
         # Spectral-moment state (Page 3)
         self.extract_spectral = False
@@ -6538,6 +6598,8 @@ class MainWindow(QMainWindow):
                 extract_durations=wizard.extract_durations,
                 duration_tier_names=wizard.duration_tier_names,
                 bounds_tier_names=wizard.bounds_tier_names,
+                include_prev_segment=wizard.include_prev_segment,
+                include_next_segment=wizard.include_next_segment,
                 progress_callback=on_progress,
                 include_point_times=wizard.include_point_times,
                 time_step_ms=wizard.time_step_ms,
