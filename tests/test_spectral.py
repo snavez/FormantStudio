@@ -12,9 +12,16 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from formant_editor import (
-    clip_window_to_segment, highpass_sound, compute_spectral_moments,
+    resolve_spectral_window, highpass_sound, compute_spectral_moments,
     _spectral_window_shape, SPECTRAL_WINDOW_SHAPES,
 )
+
+
+def _win(t_center, seg_min, seg_max, *, mode="proportional", w_prop=0.30,
+         fixed_s=0.025, win_min_s=0.005, win_max_s=0.030):
+    return resolve_spectral_window(
+        t_center, seg_min, seg_max, mode=mode, w_prop=w_prop,
+        fixed_s=fixed_s, win_min_s=win_min_s, win_max_s=win_max_s)
 
 import parselmouth
 
@@ -56,33 +63,48 @@ def hf_noise_sound():
 # clip_window_to_segment
 # ---------------------------------------------------------------------------
 
-class TestClipWindow:
-    def test_centre_window_fits(self):
-        t0, t1 = clip_window_to_segment(0.5, 0.04, 0.0, 1.0)
-        assert t0 == pytest.approx(0.48)
-        assert t1 == pytest.approx(0.52)
+class TestResolveWindow:
+    def test_proportional_window_symmetric_about_centre(self):
+        # 0.2 s segment, midpoint, 30% → 60 ms requested, capped to 30 ms
+        t0, t1, src = _win(0.1, 0.0, 0.2)
+        assert (t0, t1) == pytest.approx((0.085, 0.115))
+        assert src == "clamped_max"     # 60 ms request hit the 30 ms cap
 
-    def test_left_edge_clipped(self):
-        # 10% point of a 0.1 s segment with a 40 ms window spills left
-        t0, t1 = clip_window_to_segment(0.01, 0.04, 0.0, 0.1)
-        assert t0 == pytest.approx(0.0)      # clipped at segment start
-        assert t1 == pytest.approx(0.03)     # centre preserved on the right
-        assert (t1 - t0) < 0.04              # window is shorter than requested
+    def test_proportional_uncapped(self):
+        # 0.06 s segment, midpoint, 30% → 18 ms, under the 30 ms cap
+        t0, t1, src = _win(0.03, 0.0, 0.06)
+        assert (t1 - t0) == pytest.approx(0.018)
+        assert (t0 + t1) / 2 == pytest.approx(0.03)   # centred
+        assert src == "proportional"
 
-    def test_right_edge_clipped(self):
-        t0, t1 = clip_window_to_segment(0.095, 0.04, 0.0, 0.1)
-        assert t0 == pytest.approx(0.075)
-        assert t1 == pytest.approx(0.1)
+    def test_centre_never_moves_and_never_truncates_one_side(self):
+        # marker at 10% of a 40 ms segment → only 4 ms of room on the left,
+        # so a symmetric window can be at most 8 ms; proportional (12 ms)
+        # can't fit centred, and 8 ms > 5 ms floor... floor fits → clamped_min
+        t0, t1, src = _win(0.004, 0.0, 0.04)
+        assert src == "clamped_min"
+        assert (t1 - t0) == pytest.approx(0.005)
+        assert (t0 + t1) / 2 == pytest.approx(0.004)   # still centred
+        assert t0 >= 0.0                                # never crosses edge
 
-    def test_window_wider_than_segment(self):
-        # Requested window exceeds the whole segment → clamps to segment
-        t0, t1 = clip_window_to_segment(0.05, 0.5, 0.0, 0.1)
-        assert t0 == pytest.approx(0.0)
-        assert t1 == pytest.approx(0.1)
+    def test_too_short_when_even_floor_cannot_fit(self):
+        # marker 2 ms from the edge: a 5 ms centred window needs 2.5 ms/side
+        t0, t1, src = _win(0.002, 0.0, 0.5)
+        assert src == "too_short"
+        assert t1 == t0                                 # zero-width sentinel
 
-    def test_centre_out_of_range_returns_empty(self):
-        t0, t1 = clip_window_to_segment(-1.0, 0.04, 0.0, 0.1)
-        assert t1 == t0  # empty window, never negative-length
+    def test_fixed_mode_uses_requested_width_when_it_fits(self):
+        t0, t1, src = _win(0.25, 0.0, 0.5, mode="fixed", fixed_s=0.025)
+        assert src == "fixed"
+        assert (t1 - t0) == pytest.approx(0.025)
+
+    def test_fixed_mode_falls_back_to_floor_then_too_short(self):
+        # 25 ms fixed can't fit 8 ms from the edge → floor (5 ms) fits
+        _, _, src = _win(0.008, 0.0, 0.5, mode="fixed", fixed_s=0.025)
+        assert src == "clamped_min"
+        # 2 ms from the edge → not even the floor fits
+        _, _, src2 = _win(0.002, 0.0, 0.5, mode="fixed", fixed_s=0.025)
+        assert src2 == "too_short"
 
 
 # ---------------------------------------------------------------------------
@@ -165,12 +187,16 @@ def _write_corpus(tmp_path, intervals, duration_s=0.6, sr=44100):
 
 
 def _spectral_kwargs(**over):
+    # Default to FIXED 25 ms so the integration assertions test the legacy
+    # window path directly; proportional geometry is covered by
+    # TestResolveWindow above.
     base = dict(
         audio_dir=None, textgrid_dir=None, formants_dir=None,
         selected_tiers=None, extract_formants=False, formant_mode=None,
         point_tier_name=None, segment_tier_name=None,
         percentage_markers=[], extract_durations=False, duration_tier_names=[],
         extract_spectral=True, spectral_markers=[25, 50, 75],
+        spectral_window_mode="fixed", spectral_w_prop=0.30,
         spectral_window_ms=25.0, spectral_window_type="Hamming",
         spectral_highpass_hz=0.0, spectral_min_window_ms=5.0,
     )
@@ -185,7 +211,8 @@ class TestSpectralCSV:
         headers, _ = _build_csv_data(**_spectral_kwargs(
             audio_dir=audio, textgrid_dir=tg, selected_tiers=tier))
         for pct in (25, 50, 75):
-            for m in ("COG", "SD", "skew", "kurt", "winms"):
+            for m in ("COG", "SD", "skew", "kurt", "winms",
+                      "winsource", "nsamples"):
                 assert f"{m}_{pct}%" in headers
 
     def test_normal_segment_has_moments(self, tmp_path):
@@ -198,17 +225,30 @@ class TestSpectralCSV:
         win = row[headers.index("winms_50%")]
         assert cog != ""              # a numeric COG was produced
         assert float(win) == pytest.approx(25.0, abs=0.5)  # full window
+        assert row[headers.index("winsource_50%")] == "fixed"
+        assert int(row[headers.index("nsamples_50%")]) > 0
 
-    def test_short_segment_blanks_moments_but_reports_window(self, tmp_path):
-        # 4 ms segment < 5 ms floor even at the midpoint → blanked, flagged
+    def test_proportional_window_scales_with_segment(self, tmp_path):
+        # 0.2 s segment, 30% → 60 ms request capped to 30 ms at the midpoint
+        audio, tg = _write_corpus(tmp_path, [(0.1, 0.3, "s")])
+        tier = TextGrid.from_file(os.path.join(tg, "test.TextGrid")).tiers
+        headers, rows = _build_csv_data(**_spectral_kwargs(
+            audio_dir=audio, textgrid_dir=tg, selected_tiers=tier,
+            spectral_window_mode="proportional", spectral_markers=[50]))
+        row = rows[0]
+        assert float(row[headers.index("winms_50%")]) == pytest.approx(30.0)
+        assert row[headers.index("winsource_50%")] == "clamped_max"
+
+    def test_short_segment_flags_too_short(self, tmp_path):
+        # 4 ms segment < 5 ms floor even at the midpoint → too_short
         audio, tg = _write_corpus(tmp_path, [(0.20, 0.204, "t")])
         tier = TextGrid.from_file(os.path.join(tg, "test.TextGrid")).tiers
         headers, rows = _build_csv_data(**_spectral_kwargs(
             audio_dir=audio, textgrid_dir=tg, selected_tiers=tier))
         row = rows[0]
-        assert row[headers.index("COG_50%")] == ""      # unreliable → blank
-        win = float(row[headers.index("winms_50%")])
-        assert win < 5.0 and win > 0.0                  # actual width reported
+        assert row[headers.index("COG_50%")] == ""      # unmeasurable → blank
+        assert row[headers.index("winms_50%")] == ""    # no valid window
+        assert row[headers.index("winsource_50%")] == "too_short"
 
     def test_spectral_only_still_emits_label_rows(self, tmp_path):
         audio, tg = _write_corpus(

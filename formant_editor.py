@@ -65,11 +65,17 @@ DEFAULT_TIME_STEP = 0.0       # 0 = auto (Praat default: 25% of window length)
 DEFAULT_PRE_EMPHASIS = 50.0    # Hz — Praat default
 
 # Spectral-moment analysis (consonant / fricative / burst spectra)
-DEFAULT_SPECTRAL_WINDOW_MS = 25.0   # analysis window length (ms)
+DEFAULT_SPECTRAL_WINDOW_MS = 25.0   # fixed-mode analysis window length (ms)
 MIN_SPECTRAL_WINDOW_MS = 5.0        # hard floor — shorter is unreliable
 MAX_SPECTRAL_WINDOW_MS = 50.0       # ceiling — wider blurs short segments
 DEFAULT_SPECTRAL_HIGHPASS_HZ = 0.0  # 0 = off; ~300 Hz removes voicing bleed
 SPECTRAL_MOMENT_POWER = 2.0         # Praat default power for all moments
+# Proportional windowing: window width as a fraction of segment duration,
+# clamped to [floor, ceiling]. Removes the confound between window artefacts
+# and segment duration that a fixed-ms window introduces.
+DEFAULT_SPECTRAL_WINDOW_MODE = "proportional"   # "proportional" | "fixed"
+DEFAULT_SPECTRAL_W_PROP = 0.30      # window = 30% of segment duration
+PROP_SPECTRAL_WIN_MAX_MS = 30.0     # ceiling applied to proportional windows
 
 # Spectrogram display defaults
 DEFAULT_DYNAMIC_RANGE = 70.0   # dB
@@ -590,21 +596,42 @@ def _spectral_window_shape(name):
     return getattr(parselmouth.WindowShape, attr)
 
 
-def clip_window_to_segment(t_center, window_s, seg_xmin, seg_xmax):
-    """Return (t0, t1) for a window of *window_s* centred on *t_center*,
-    clipped so it never crosses the [seg_xmin, seg_xmax] bounds.
+def resolve_spectral_window(t_center, seg_xmin, seg_xmax, *, mode,
+                            w_prop, fixed_s, win_min_s, win_max_s):
+    """Resolve a spectral analysis window, symmetric about *t_center*.
 
-    The window stays centred on *t_center*; only the part that would spill
-    past a segment edge is trimmed, so edge windows become shorter and
-    asymmetric rather than reading neighbouring-segment audio.  Returns
-    (t0, t1) with t1 >= t0 (an empty window if the centre is out of range).
+    The centre is never moved and the window is never one-sidedly truncated
+    against a boundary: a window that will not fit symmetrically falls back
+    to the ``win_min_s`` floor, and if even that will not fit the point is
+    unmeasurable.  Returns ``(t0, t1, win_source)`` where *win_source* is one
+    of ``proportional``, ``clamped_max``, ``fixed``, ``clamped_min`` or
+    ``too_short`` (the last with ``t0 == t1``).
+
+    *mode* is ``"proportional"`` (width = ``w_prop`` × segment duration,
+    capped at ``win_max_s``) or ``"fixed"`` (width = ``fixed_s``).
     """
-    half = window_s / 2.0
-    t0 = max(seg_xmin, t_center - half)
-    t1 = min(seg_xmax, t_center + half)
-    if t1 < t0:
-        t1 = t0
-    return t0, t1
+    duration = seg_xmax - seg_xmin
+    # Largest window that stays centred on t_center inside the segment
+    max_centred = 2.0 * min(t_center - seg_xmin, seg_xmax - t_center)
+
+    if mode == "proportional":
+        w_req = w_prop * duration
+        w = min(w_req, win_max_s)
+        if w >= win_min_s and w <= max_centred:
+            src = "clamped_max" if w_req > win_max_s else "proportional"
+            half = w / 2.0
+            return t_center - half, t_center + half, src
+    else:  # fixed
+        if fixed_s <= max_centred and fixed_s >= win_min_s:
+            half = fixed_s / 2.0
+            return t_center - half, t_center + half, "fixed"
+
+    # Fall back to the minimum window, still centred
+    if win_min_s <= max_centred:
+        half = win_min_s / 2.0
+        return t_center - half, t_center + half, "clamped_min"
+
+    return t_center, t_center, "too_short"
 
 
 def highpass_sound(sound, cutoff_hz, smoothing_hz=100.0):
@@ -823,10 +850,13 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     time_step_ms=None,
                     extract_spectral=False, spectral_markers=None,
                     spectral_tier_name=None,
+                    spectral_window_mode=DEFAULT_SPECTRAL_WINDOW_MODE,
+                    spectral_w_prop=DEFAULT_SPECTRAL_W_PROP,
                     spectral_window_ms=DEFAULT_SPECTRAL_WINDOW_MS,
                     spectral_window_type="Hamming",
                     spectral_highpass_hz=DEFAULT_SPECTRAL_HIGHPASS_HZ,
                     spectral_min_window_ms=MIN_SPECTRAL_WINDOW_MS,
+                    spectral_win_max_ms=PROP_SPECTRAL_WIN_MAX_MS,
                     categorise=False, cat_chart=None,
                     cat_notation="ipa", cat_tier_names=None,
                     cat_vowel_props=None, cat_consonant_props=None,
@@ -1005,13 +1035,15 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 headers.extend([f"{tn}_start", f"{tn}_end"])
             headers.append(f"{tn}_dur")
 
-    # Spectral-moment columns (COG/SD/skew/kurt + actual window per marker)
+    # Spectral-moment columns per marker: the four moments, the effective
+    # window (ms), how that window was chosen, and its sample count
     if extract_spectral:
         for pct in spectral_markers:
             pct_s = f"{pct:g}"
             headers.extend([f"COG_{pct_s}%", f"SD_{pct_s}%",
                             f"skew_{pct_s}%", f"kurt_{pct_s}%",
-                            f"winms_{pct_s}%"])
+                            f"winms_{pct_s}%", f"winsource_{pct_s}%",
+                            f"nsamples_{pct_s}%"])
 
     # Categorisation columns
     cat_col_start = len(headers)
@@ -1245,32 +1277,39 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             return cols
 
         def _segment_spectral_cols(iv):
-            """Spectral-moment cells for one interval.
+            """Spectral-moment cells for one interval, 7 per marker.
 
-            Windows are centred at each percentage marker and clipped to the
-            interval, so they never read neighbouring-segment audio.  A window
-            clipped below the reliability floor blanks its moments but still
-            reports the actual window length (ms) for transparency.
+            Each window is symmetric about its percentage marker and never
+            crosses a segment edge (see ``resolve_spectral_window``): it is a
+            proportion of the segment (or a fixed width), falling back to the
+            minimum window, or ``too_short`` when even that will not fit.
+            Emits COG/SD/skew/kurt, the effective window (ms), the window
+            source, and the sample count; unmeasurable moments are blank.
             """
             cols = []
             seg = _resolve_sampling_interval(iv, spectral_tier_name)
             if seg is None:
-                return [""] * (5 * len(spectral_markers))
+                return [""] * (7 * len(spectral_markers))
             seg_min, seg_max = seg.xmin, seg.xmax
             dur = seg_max - seg_min
-            window_s = spectral_window_ms / 1000.0
-            min_s = spectral_min_window_ms / 1000.0
+            sr = (spectral_sound.sampling_frequency
+                  if spectral_sound is not None else 0.0)
             for pct in spectral_markers:
                 if spectral_sound is None:
-                    cols.extend(["", "", "", "", ""])
+                    cols.extend([""] * 7)
                     continue
                 t_center = seg_min + dur * pct / 100.0
-                t0, t1 = clip_window_to_segment(
-                    t_center, window_s, seg_min, seg_max)
-                actual_ms = (t1 - t0) * 1000.0
-                if (t1 - t0) < min_s:
-                    cols.extend(["", "", "", "", f"{actual_ms:.1f}"])
+                t0, t1, win_source = resolve_spectral_window(
+                    t_center, seg_min, seg_max,
+                    mode=spectral_window_mode, w_prop=spectral_w_prop,
+                    fixed_s=spectral_window_ms / 1000.0,
+                    win_min_s=spectral_min_window_ms / 1000.0,
+                    win_max_s=spectral_win_max_ms / 1000.0)
+                if win_source == "too_short":
+                    cols.extend(["", "", "", "", "", "too_short", ""])
                     continue
+                actual_ms = (t1 - t0) * 1000.0
+                nsamples = int(round((t1 - t0) * sr))
                 cog, sd, sk, ku = compute_spectral_moments(
                     spectral_sound, t0, t1, spectral_shape)
                 cols.extend([
@@ -1278,7 +1317,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     f"{sd:.1f}" if not np.isnan(sd) else "",
                     f"{sk:.4f}" if not np.isnan(sk) else "",
                     f"{ku:.4f}" if not np.isnan(ku) else "",
-                    f"{actual_ms:.1f}",
+                    f"{actual_ms:.1f}", win_source, str(nsamples),
                 ])
             return cols
 
@@ -4532,8 +4571,10 @@ class _DataOptionsPage(QWizardPage):
         spec_layout = QVBoxLayout(self._spectral_group)
 
         spec_note = QLabel(
-            "Windows are centred at each marker and clipped to the "
-            "segment edges of the chosen tier.")
+            "Each window is centred on its marker and never crosses a "
+            "segment edge. Proportional width scales with the segment; a "
+            "marker too near an edge for a valid window is flagged "
+            "too_short.")
         spec_note.setWordWrap(True)
         spec_note.setStyleSheet("color: #888888; font-size: 11px;")
         spec_layout.addWidget(spec_note)
@@ -4550,8 +4591,28 @@ class _DataOptionsPage(QWizardPage):
         smk_row.addWidget(self._spectral_markers_edit, 1)
         spec_layout.addLayout(smk_row)
 
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Window:"))
+        self._spectral_wmode_combo = QComboBox()
+        self._spectral_wmode_combo.addItems(
+            ["Proportional (% of segment)", "Fixed (ms)"])
+        self._spectral_wmode_combo.setToolTip(
+            "Proportional sizes each window to the segment (removes the "
+            "confound between window width and segment duration). Fixed "
+            "uses the same width everywhere.")
+        mode_row.addWidget(self._spectral_wmode_combo, 1)
+        spec_layout.addLayout(mode_row)
+
         win_row = QHBoxLayout()
-        win_row.addWidget(QLabel("Window length (ms):"))
+        self._spectral_wprop_label = QLabel("Width (% of segment):")
+        win_row.addWidget(self._spectral_wprop_label)
+        self._spectral_wprop_spin = QDoubleSpinBox()
+        self._spectral_wprop_spin.setRange(5.0, 100.0)
+        self._spectral_wprop_spin.setSingleStep(5.0)
+        self._spectral_wprop_spin.setValue(DEFAULT_SPECTRAL_W_PROP * 100.0)
+        win_row.addWidget(self._spectral_wprop_spin)
+        self._spectral_window_label = QLabel("Window length (ms):")
+        win_row.addWidget(self._spectral_window_label)
         self._spectral_window_spin = QDoubleSpinBox()
         self._spectral_window_spin.setRange(
             MIN_SPECTRAL_WINDOW_MS, MAX_SPECTRAL_WINDOW_MS)
@@ -4565,6 +4626,9 @@ class _DataOptionsPage(QWizardPage):
         win_row.addWidget(self._spectral_window_combo)
         win_row.addStretch()
         spec_layout.addLayout(win_row)
+        self._spectral_wmode_combo.currentIndexChanged.connect(
+            self._update_spectral_wmode_ui)
+        self._update_spectral_wmode_ui()
 
         hp_row = QHBoxLayout()
         self._spectral_hp_cb = QCheckBox("High-pass filter (Hz):")
@@ -4667,6 +4731,14 @@ class _DataOptionsPage(QWizardPage):
             self._sampling_value_label.setText("Step size (ms):")
             self._sampling_value_edit.setPlaceholderText("e.g. 5")
             self._sampling_value_edit.setText("5")
+
+    def _update_spectral_wmode_ui(self):
+        """Show the proportional-% or the fixed-ms width control."""
+        proportional = self._spectral_wmode_combo.currentIndex() == 0
+        self._spectral_wprop_label.setVisible(proportional)
+        self._spectral_wprop_spin.setVisible(proportional)
+        self._spectral_window_label.setVisible(not proportional)
+        self._spectral_window_spin.setVisible(not proportional)
 
     def validatePage(self):
         wiz = self.wizard()
@@ -4835,6 +4907,10 @@ class _DataOptionsPage(QWizardPage):
                     self, "Error",
                     "No interval tier available for spectral analysis.")
                 return False
+            wiz.spectral_window_mode = (
+                "proportional" if self._spectral_wmode_combo.currentIndex() == 0
+                else "fixed")
+            wiz.spectral_w_prop = self._spectral_wprop_spin.value() / 100.0
             wiz.spectral_window_ms = self._spectral_window_spin.value()
             wiz.spectral_window_type = self._spectral_window_combo.currentText()
             wiz.spectral_highpass_hz = (
@@ -4843,6 +4919,8 @@ class _DataOptionsPage(QWizardPage):
         else:
             wiz.spectral_markers = []
             wiz.spectral_tier_name = None
+            wiz.spectral_window_mode = DEFAULT_SPECTRAL_WINDOW_MODE
+            wiz.spectral_w_prop = DEFAULT_SPECTRAL_W_PROP
             wiz.spectral_window_ms = DEFAULT_SPECTRAL_WINDOW_MS
             wiz.spectral_window_type = "Hamming"
             wiz.spectral_highpass_hz = 0.0
@@ -5517,6 +5595,8 @@ class BuildCSVWizard(QWizard):
         self.extract_spectral = False
         self.spectral_markers = []
         self.spectral_tier_name = None
+        self.spectral_window_mode = DEFAULT_SPECTRAL_WINDOW_MODE
+        self.spectral_w_prop = DEFAULT_SPECTRAL_W_PROP
         self.spectral_window_ms = DEFAULT_SPECTRAL_WINDOW_MS
         self.spectral_window_type = "Hamming"
         self.spectral_highpass_hz = 0.0
@@ -6414,6 +6494,8 @@ class MainWindow(QMainWindow):
                 extract_spectral=wizard.extract_spectral,
                 spectral_markers=wizard.spectral_markers,
                 spectral_tier_name=wizard.spectral_tier_name,
+                spectral_window_mode=wizard.spectral_window_mode,
+                spectral_w_prop=wizard.spectral_w_prop,
                 spectral_window_ms=wizard.spectral_window_ms,
                 spectral_window_type=wizard.spectral_window_type,
                 spectral_highpass_hz=wizard.spectral_highpass_hz,
