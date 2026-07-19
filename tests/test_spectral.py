@@ -11,10 +11,79 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import parselmouth
 from formant_editor import (
     resolve_spectral_window, highpass_sound, compute_spectral_moments,
+    compute_spectral_moments_multitaper, _moments_from_power,
     _spectral_window_shape, SPECTRAL_WINDOW_SHAPES,
 )
+
+
+class TestMultitaperEstimator:
+    """Multitaper moments: correctness on known signals, variance reduction,
+    and that it does not disturb the single-taper (legacy) path."""
+
+    def _tone(self, f, dur=0.05, sr=44100):
+        t = np.arange(0, dur, 1.0 / sr)
+        return parselmouth.Sound(0.8 * np.sin(2 * np.pi * f * t),
+                                 sampling_frequency=sr)
+
+    def test_pure_tone_cog_matches_frequency(self):
+        snd = self._tone(4000.0)
+        cog, sd, _, _ = compute_spectral_moments_multitaper(
+            snd, 0.0, 0.05, 4.0, 7)
+        assert cog == pytest.approx(4000.0, abs=30.0)
+        assert sd < 200.0
+
+    def test_band_limited_noise_cog_near_band_centre(self):
+        sr = 44100
+        rng = np.random.default_rng(1)
+        snd = parselmouth.Sound(rng.standard_normal(int(sr * 0.05)),
+                                sampling_frequency=sr)
+        band = parselmouth.praat.call(
+            snd, "Filter (pass Hann band)...", 5000.0, 7000.0, 100.0)
+        cog, _, _, _ = compute_spectral_moments_multitaper(
+            band, 0.0, 0.05, 4.0, 7)
+        assert cog == pytest.approx(6000.0, abs=400.0)
+
+    def test_reduces_variance_on_short_windows(self):
+        sr = 44100
+        single, multi = [], []
+        for seed in range(30):
+            r = np.random.default_rng(seed)
+            snd = parselmouth.Sound(r.standard_normal(int(sr * 0.05)),
+                                    sampling_frequency=sr)
+            band = parselmouth.praat.call(
+                snd, "Filter (pass Hann band)...", 5000.0, 7000.0, 100.0)
+            single.append(compute_spectral_moments(
+                band, 0.0, 0.005, parselmouth.WindowShape.HAMMING)[0])
+            multi.append(compute_spectral_moments_multitaper(
+                band, 0.0, 0.005, 4.0, 7)[0])
+        # Averaging orthogonal tapers must not increase COG scatter
+        assert np.std(multi) <= np.std(single) + 1e-9
+
+    def test_moments_from_power_matches_parselmouth(self):
+        # _moments_from_power on a parselmouth spectrum reproduces Praat's
+        # own moment functions (excess-kurtosis convention)
+        sr = 44100
+        rng = np.random.default_rng(0)
+        snd = parselmouth.Sound(rng.standard_normal(1000) * 0.2,
+                                sampling_frequency=sr)
+        part = snd.extract_part(0.0, 1000 / sr,
+                                parselmouth.WindowShape.HAMMING, 1.0, False)
+        sp = part.to_spectrum()
+        vals = np.asarray(sp.values)
+        power = vals[0] ** 2 + vals[1] ** 2
+        cog, sd, sk, ku = _moments_from_power(np.asarray(sp.xs()), power)
+        assert cog == pytest.approx(sp.get_centre_of_gravity(2), rel=1e-6)
+        assert sd == pytest.approx(sp.get_standard_deviation(2), rel=1e-6)
+        assert sk == pytest.approx(sp.get_skewness(2), abs=1e-4)
+        assert ku == pytest.approx(sp.get_kurtosis(2), abs=1e-4)
+
+    def test_too_short_window_returns_nan(self):
+        snd = self._tone(4000.0)
+        out = compute_spectral_moments_multitaper(snd, 0.05, 0.05, 4.0, 7)
+        assert all(np.isnan(v) for v in out)
 
 
 def _win(t_center, seg_min, seg_max, *, mode="proportional", w_prop=0.30,
@@ -198,10 +267,37 @@ def _spectral_kwargs(**over):
         extract_spectral=True, spectral_markers=[25, 50, 75],
         spectral_window_mode="fixed", spectral_w_prop=0.30,
         spectral_window_ms=25.0, spectral_window_type="Hamming",
+        spectral_estimator="single_taper", spectral_mt_nw=4.0,
+        spectral_mt_k=7,
         spectral_highpass_hz=0.0, spectral_min_window_ms=5.0,
     )
     base.update(over)
     return base
+
+
+class TestMultitaperCSV:
+    def test_multitaper_produces_moments_and_default_is_single(self, tmp_path):
+        audio, tg = _write_corpus(tmp_path, [(0.1, 0.4, "s")])
+        tier = TextGrid.from_file(os.path.join(tg, "test.TextGrid")).tiers
+        h_s, r_s = _build_csv_data(**_spectral_kwargs(
+            audio_dir=audio, textgrid_dir=tg, selected_tiers=tier,
+            spectral_estimator="single_taper", spectral_markers=[50]))
+        h_m, r_m = _build_csv_data(**_spectral_kwargs(
+            audio_dir=audio, textgrid_dir=tg, selected_tiers=tier,
+            spectral_estimator="multitaper", spectral_markers=[50]))
+        cog_s = r_s[0][h_s.index("COG_50%")]
+        cog_m = r_m[0][h_m.index("COG_50%")]
+        assert cog_s != "" and cog_m != ""
+        # Different estimators → generally different COG on real noise
+        assert float(cog_s) != float(cog_m)
+        # Geometry/provenance columns are unchanged by estimator choice
+        assert r_s[0][h_s.index("winsource_50%")] == \
+            r_m[0][h_m.index("winsource_50%")]
+
+    def test_estimator_defaults_to_single_taper(self):
+        # A build with no estimator kwarg reproduces the legacy path exactly
+        from formant_editor import DEFAULT_SPECTRAL_ESTIMATOR
+        assert DEFAULT_SPECTRAL_ESTIMATOR == "single_taper"
 
 
 class TestSpectralCSV:

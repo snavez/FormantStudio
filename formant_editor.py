@@ -18,6 +18,7 @@ import re
 import io
 import json
 import csv
+import math
 import time as _time
 import numpy as np
 import parselmouth
@@ -76,6 +77,12 @@ SPECTRAL_MOMENT_POWER = 2.0         # Praat default power for all moments
 DEFAULT_SPECTRAL_WINDOW_MODE = "proportional"   # "proportional" | "fixed"
 DEFAULT_SPECTRAL_W_PROP = 0.30      # window = 30% of segment duration
 PROP_SPECTRAL_WIN_MAX_MS = 30.0     # ceiling applied to proportional windows
+# Spectral estimator: single_taper reproduces Praat exactly (legacy);
+# multitaper averages K DPSS-tapered spectra to stabilise moments from short
+# windows, at a small controlled loss of frequency resolution.
+DEFAULT_SPECTRAL_ESTIMATOR = "single_taper"   # "single_taper" | "multitaper"
+DEFAULT_SPECTRAL_MT_NW = 4.0        # multitaper time-bandwidth product (NW)
+DEFAULT_SPECTRAL_MT_K = 7           # number of DPSS tapers
 
 # Spectrogram display defaults
 DEFAULT_DYNAMIC_RANGE = 70.0   # dB
@@ -673,6 +680,64 @@ def compute_spectral_moments(sound, t0, t1, window_shape, power=SPECTRAL_MOMENT_
         return nan4
 
 
+def _moments_from_power(freqs, power, moment_power=SPECTRAL_MOMENT_POWER):
+    """Return (COG, SD, skew, kurt) from a power spectrum over *freqs* (Hz).
+
+    Matches Praat's convention (verified against parselmouth): moments are
+    scale-invariant ratios weighted by ``power ** (moment_power / 2)``, and
+    kurtosis is EXCESS (a Gaussian spectrum yields 0).
+    """
+    w = np.asarray(power, dtype=float)
+    if moment_power != 2.0:
+        w = np.power(np.maximum(w, 0.0), moment_power / 2.0)
+    s = w.sum()
+    if not np.isfinite(s) or s <= 0:
+        return np.nan, np.nan, np.nan, np.nan
+    f = np.asarray(freqs, dtype=float)
+    cog = float((f * w).sum() / s)
+    var = float(((f - cog) ** 2 * w).sum() / s)
+    sd = math.sqrt(var) if var > 0 else 0.0
+    if sd <= 0:
+        return cog, sd, np.nan, np.nan
+    skew = float(((f - cog) ** 3 * w).sum() / s / sd ** 3)
+    kurt = float(((f - cog) ** 4 * w).sum() / s / sd ** 4) - 3.0
+    return cog, sd, skew, kurt
+
+
+def compute_spectral_moments_multitaper(sound, t0, t1, nw, k,
+                                        power=SPECTRAL_MOMENT_POWER):
+    """Multitaper spectral moments over [*t0*, *t1*] of *sound*.
+
+    Averages the power spectra of *k* orthogonal DPSS (Slepian) tapers with
+    time-bandwidth product *nw* to reduce estimation variance on short
+    windows, then computes moments with the same convention as the
+    single-taper path (§_moments_from_power).  Returns four NaNs on failure.
+    """
+    nan4 = (np.nan, np.nan, np.nan, np.nan)
+    if t1 <= t0:
+        return nan4
+    try:
+        from scipy.signal.windows import dpss
+        part = sound.extract_part(
+            t0, t1, parselmouth.WindowShape.RECTANGULAR, 1.0, False)
+        samples = np.asarray(part.values[0], dtype=float)
+        n = samples.size
+        k_eff = int(min(k, n - 1))
+        if n < 8 or k_eff < 1:
+            return nan4
+        sr = sound.sampling_frequency
+        tapers = dpss(n, nw, k_eff)                 # (k_eff, n)
+        freqs = np.fft.rfftfreq(n, d=1.0 / sr)
+        psd = np.zeros(freqs.size, dtype=float)
+        for taper in tapers:
+            spec = np.fft.rfft(samples * taper)
+            psd += (spec.real ** 2 + spec.imag ** 2)
+        psd /= k_eff
+        return _moments_from_power(freqs, psd, power)
+    except Exception:
+        return nan4
+
+
 # ---------------------------------------------------------------------------
 # CSV Export Helpers
 # ---------------------------------------------------------------------------
@@ -857,6 +922,9 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     spectral_w_prop=DEFAULT_SPECTRAL_W_PROP,
                     spectral_window_ms=DEFAULT_SPECTRAL_WINDOW_MS,
                     spectral_window_type="Hamming",
+                    spectral_estimator=DEFAULT_SPECTRAL_ESTIMATOR,
+                    spectral_mt_nw=DEFAULT_SPECTRAL_MT_NW,
+                    spectral_mt_k=DEFAULT_SPECTRAL_MT_K,
                     spectral_highpass_hz=DEFAULT_SPECTRAL_HIGHPASS_HZ,
                     spectral_min_window_ms=MIN_SPECTRAL_WINDOW_MS,
                     spectral_win_max_ms=PROP_SPECTRAL_WIN_MAX_MS,
@@ -1343,8 +1411,12 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     continue
                 actual_ms = (t1 - t0) * 1000.0
                 nsamples = int(round((t1 - t0) * sr))
-                cog, sd, sk, ku = compute_spectral_moments(
-                    spectral_sound, t0, t1, spectral_shape)
+                if spectral_estimator == "multitaper":
+                    cog, sd, sk, ku = compute_spectral_moments_multitaper(
+                        spectral_sound, t0, t1, spectral_mt_nw, spectral_mt_k)
+                else:
+                    cog, sd, sk, ku = compute_spectral_moments(
+                        spectral_sound, t0, t1, spectral_shape)
                 cols.extend([
                     f"{cog:.1f}" if not np.isnan(cog) else "",
                     f"{sd:.1f}" if not np.isnan(sd) else "",
@@ -4713,6 +4785,43 @@ class _DataOptionsPage(QWizardPage):
         clamp_row.addStretch()
         spec_layout.addLayout(clamp_row)
 
+        est_row = QHBoxLayout()
+        est_row.addWidget(QLabel("Estimator:"))
+        self._spectral_est_combo = QComboBox()
+        self._spectral_est_combo.addItems(["Single taper", "Multitaper"])
+        self._spectral_est_combo.setToolTip(
+            "Single taper reproduces Praat exactly. Multitaper averages "
+            "several orthogonal DPSS tapers to reduce estimation variance on "
+            "short windows (recommended for short releases), at a small loss "
+            "of frequency resolution.")
+        est_row.addWidget(self._spectral_est_combo, 1)
+        self._spectral_mtnw_label = QLabel("NW:")
+        est_row.addWidget(self._spectral_mtnw_label)
+        self._spectral_mtnw_spin = QDoubleSpinBox()
+        self._spectral_mtnw_spin.setRange(2.0, 8.0)
+        self._spectral_mtnw_spin.setSingleStep(0.5)
+        self._spectral_mtnw_spin.setValue(DEFAULT_SPECTRAL_MT_NW)
+        self._spectral_mtnw_spin.setToolTip(
+            "Time-bandwidth product. Higher NW = more tapers usable and more "
+            "variance reduction, but wider spectral smoothing.")
+        est_row.addWidget(self._spectral_mtnw_spin)
+        self._spectral_mtk_label = QLabel("Tapers:")
+        est_row.addWidget(self._spectral_mtk_label)
+        self._spectral_mtk_spin = QDoubleSpinBox()
+        self._spectral_mtk_spin.setDecimals(0)
+        self._spectral_mtk_spin.setRange(1, 15)
+        self._spectral_mtk_spin.setSingleStep(1)
+        self._spectral_mtk_spin.setValue(DEFAULT_SPECTRAL_MT_K)
+        self._spectral_mtk_spin.setToolTip(
+            "Number of DPSS tapers averaged (typically ≤ 2·NW−1).")
+        est_row.addWidget(self._spectral_mtk_spin)
+        est_row.addStretch()
+        spec_layout.addLayout(est_row)
+
+        self._spectral_est_combo.currentIndexChanged.connect(
+            self._update_spectral_est_ui)
+        self._update_spectral_est_ui()
+
         self._spectral_wmode_combo.currentIndexChanged.connect(
             self._update_spectral_wmode_ui)
         self._update_spectral_wmode_ui()
@@ -4818,6 +4927,13 @@ class _DataOptionsPage(QWizardPage):
             self._sampling_value_label.setText("Step size (ms):")
             self._sampling_value_edit.setPlaceholderText("e.g. 5")
             self._sampling_value_edit.setText("5")
+
+    def _update_spectral_est_ui(self):
+        """Show the multitaper NW/Tapers controls only for multitaper."""
+        mt = self._spectral_est_combo.currentIndex() == 1
+        for w in (self._spectral_mtnw_label, self._spectral_mtnw_spin,
+                  self._spectral_mtk_label, self._spectral_mtk_spin):
+            w.setVisible(mt)
 
     def _update_spectral_wmode_ui(self):
         """Show the proportional-% or the fixed-ms width control.
@@ -5017,6 +5133,11 @@ class _DataOptionsPage(QWizardPage):
                     "Max window must be at least the min window.")
                 return False
             wiz.spectral_window_type = self._spectral_window_combo.currentText()
+            wiz.spectral_estimator = (
+                "multitaper" if self._spectral_est_combo.currentIndex() == 1
+                else "single_taper")
+            wiz.spectral_mt_nw = self._spectral_mtnw_spin.value()
+            wiz.spectral_mt_k = int(self._spectral_mtk_spin.value())
             wiz.spectral_highpass_hz = (
                 self._spectral_hp_spin.value()
                 if self._spectral_hp_cb.isChecked() else 0.0)
@@ -5029,6 +5150,9 @@ class _DataOptionsPage(QWizardPage):
             wiz.spectral_win_min_ms = MIN_SPECTRAL_WINDOW_MS
             wiz.spectral_win_max_ms = PROP_SPECTRAL_WIN_MAX_MS
             wiz.spectral_window_type = "Hamming"
+            wiz.spectral_estimator = DEFAULT_SPECTRAL_ESTIMATOR
+            wiz.spectral_mt_nw = DEFAULT_SPECTRAL_MT_NW
+            wiz.spectral_mt_k = DEFAULT_SPECTRAL_MT_K
             wiz.spectral_highpass_hz = 0.0
 
         return True
@@ -5709,6 +5833,9 @@ class BuildCSVWizard(QWizard):
         self.spectral_win_min_ms = MIN_SPECTRAL_WINDOW_MS
         self.spectral_win_max_ms = PROP_SPECTRAL_WIN_MAX_MS
         self.spectral_window_type = "Hamming"
+        self.spectral_estimator = DEFAULT_SPECTRAL_ESTIMATOR
+        self.spectral_mt_nw = DEFAULT_SPECTRAL_MT_NW
+        self.spectral_mt_k = DEFAULT_SPECTRAL_MT_K
         self.spectral_highpass_hz = 0.0
 
         # Categorisation state (Page 4)
@@ -6612,6 +6739,9 @@ class MainWindow(QMainWindow):
                 spectral_min_window_ms=wizard.spectral_win_min_ms,
                 spectral_win_max_ms=wizard.spectral_win_max_ms,
                 spectral_window_type=wizard.spectral_window_type,
+                spectral_estimator=wizard.spectral_estimator,
+                spectral_mt_nw=wizard.spectral_mt_nw,
+                spectral_mt_k=wizard.spectral_mt_k,
                 spectral_highpass_hz=wizard.spectral_highpass_hz,
                 categorise=wizard.categorise,
                 cat_chart=cat_chart,
@@ -6742,11 +6872,67 @@ class MainWindow(QMainWindow):
                 writer = csv.writer(f)
                 writer.writerow(headers)
                 writer.writerows(rows)
+            self._write_provenance_sidecar(save_path, wizard, len(rows))
             self.status.showMessage(
                 f"CSV exported: {len(rows)} rows → "
                 f"{os.path.basename(save_path)}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to write CSV:\n{e}")
+
+    def _write_provenance_sidecar(self, csv_path, wizard, n_rows):
+        """Write a JSON sidecar recording the resolved run configuration.
+
+        Reproducibility record next to every CSV: which tiers drove the
+        extraction and the exact spectral/formant settings used. Best-effort
+        — a failure here must not fail the CSV export.
+        """
+        try:
+            side = {
+                "tool": "FormantStudio",
+                "csv_file": os.path.basename(csv_path),
+                "n_rows": n_rows,
+                "primary_tier": wizard.primary_tier_name,
+                "selected_tiers": wizard.selected_tier_info,
+                "missing_value": "(empty cell)",
+                "formants": {
+                    "extract": wizard.extract_formants,
+                    "mode": wizard.formant_mode,
+                    "point_tier": wizard.point_tier_name,
+                    "segment_tier": wizard.segment_tier_name,
+                    "sampling_mode": wizard.sampling_mode,
+                    "percentage_markers": wizard.percentage_markers,
+                    "time_step_ms": wizard.time_step_ms,
+                } if wizard.extract_formants else None,
+                "durations": {
+                    "tiers": wizard.duration_tier_names,
+                    "bounds_tiers": wizard.bounds_tier_names,
+                } if wizard.extract_durations else None,
+                "segment_context": {
+                    "preceding": wizard.include_prev_segment,
+                    "following": wizard.include_next_segment,
+                },
+                "spectral": {
+                    "segment_tier": wizard.spectral_tier_name,
+                    "markers_pct": wizard.spectral_markers,
+                    "window_mode": wizard.spectral_window_mode,
+                    "w_prop": wizard.spectral_w_prop,
+                    "fixed_window_ms": wizard.spectral_window_ms,
+                    "win_min_ms": wizard.spectral_win_min_ms,
+                    "win_max_ms": wizard.spectral_win_max_ms,
+                    "window_shape": wizard.spectral_window_type,
+                    "estimator": wizard.spectral_estimator,
+                    "mt_nw": wizard.spectral_mt_nw,
+                    "mt_k": wizard.spectral_mt_k,
+                    "highpass_hz": wizard.spectral_highpass_hz,
+                    "moment_power": SPECTRAL_MOMENT_POWER,
+                    "kurtosis": "excess (Gaussian = 0)",
+                } if wizard.extract_spectral else None,
+            }
+            side_path = os.path.splitext(csv_path)[0] + ".provenance.json"
+            with open(side_path, "w", encoding="utf-8") as fh:
+                json.dump(side, fh, indent=2)
+        except Exception:
+            pass
 
     def _setup_tier_checkboxes(self, preserve_hidden=False):
         """Populate tier visibility checkboxes for the current TextGrid.

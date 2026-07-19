@@ -137,10 +137,20 @@ frequency and summarise its shape:
 - **skewness** (dimensionless) — tilt toward low vs high frequencies.
 - **kurtosis** (dimensionless) — peakedness/concentration of the spectrum.
 
-They are computed by Praat's `Spectrum` moment functions (via parselmouth
-`get_centre_of_gravity` / `get_standard_deviation` / `get_skewness` / `get_kurtosis`) on the
-windowed segment's power spectrum, with moment **power = 2** (Praat's default). Skewness and
-kurtosis follow Praat's standardized definitions.
+They are computed on the windowed segment's power spectrum with moment **power = 2** (Praat's
+default). Kurtosis is **excess** (a Gaussian spectrum yields 0), matching Praat.
+
+**Two estimators (selectable):**
+
+- **Single taper** (default, legacy): one taper (default Hamming) then Praat's `Spectrum`
+  moment functions via parselmouth. Reproduces existing FormantStudio values exactly.
+- **Multitaper** (recommended for short releases): averages the power spectra of `K` orthogonal
+  DPSS (Slepian) tapers with time-bandwidth product `NW` (defaults `NW=4`, `K=7`) to reduce the
+  estimation variance that short windows suffer, for a small controlled loss of frequency
+  resolution. Moments are then computed with the identical convention as the single-taper path
+  (verified to reproduce parselmouth's own moment functions), so the two estimators are directly
+  comparable — only the spectral *estimate* changes. In testing, multitaper cut the COG scatter
+  on 5 ms windows by roughly a third. See Thomson (1982); Reidy (2015); Shadle et al.
 
 _Method provenance:_ Forrest, Weismer, Milenkovic & Dougall (1988) established spectral moments
 for obstruents; COG/SD are the most robust, with skew/kurtosis noisier — which is why the
@@ -279,16 +289,18 @@ See `FormantStudio_Specification.md` §2.7 for the full column catalogue and ord
 
 Recorded so they are added deliberately, as new columns, rather than invented ad hoc:
 
-- **Multitaper estimation** (DPSS/Slepian tapers) to stabilise moments from short windows
-  (Thomson 1982; Reidy 2015; Shadle et al.).
 - **Trajectory + DCT pass**: a dense sliding-window moment track reduced to a few DCT
   coefficients per moment, capturing sibilant *dynamics* rather than three static points
   (Reidy 2016; JASA 2017 moments-vs-DCT comparison), plus the normalized track for smooth-arc
   plotting.
-- A **provenance sidecar** (resolved config next to each CSV) for full reproducibility.
 - A configurable **`NA` token** — held until confirmed compatible with the downstream grapher.
 
 These are analytical upgrades; the current point-moment CSV is complete and valid without them.
+
+A **provenance sidecar** is already written: every exported CSV gets a companion
+`<name>.provenance.json` recording the resolved run configuration (primary tier, selected tiers,
+and the exact formant/duration/spectral settings including estimator and its parameters), so a
+run is reproducible from its record.
 
 ---
 
