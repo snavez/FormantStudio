@@ -367,7 +367,129 @@ the tool structures each correctly rather than forcing incompatible rows togethe
 
 ---
 
-## 10. References
+## 10. FAQ — the spectral trajectory settings
+
+The trajectory pass has five controls and they interact, so here is what each one actually
+does, what changes if you turn it up or down, and how to read the output.
+
+### 10.1 What do the output columns mean?
+
+For each moment you selected (e.g. COG), the CSV gains two blocks:
+
+| Column | What it is |
+|---|---|
+| `COG_k0`, `COG_k1`, … | **DCT coefficients** — a few numbers summarising the *shape* of the track |
+| `COG_t0`, `COG_t1`, … | **Track points** — the trajectory's actual values at equally spaced points in normalised time |
+
+So `COG_t0` is the COG near the start of the segment, `COG_t5` around the middle, `COG_t10` near
+the end (with the default 11 points). The count of `_t` columns is exactly the **Track points**
+setting; the count of `_k` columns is exactly the **DCT coefficients** setting.
+
+### 10.2 What are k0, k1, k2, k3?
+
+They are the DCT-II coefficients of the normalised track — a compact description of its shape,
+in order from coarsest to finest:
+
+- **`k0` — overall level.** Essentially the mean of the track (scaled by √N). A high `COG_k0`
+  means the segment had a high centre of gravity throughout. If you only keep one number, this
+  is "how high was it on average".
+- **`k1` — overall slope.** Did the moment rise or fall across the segment?
+  **Negative = rising, positive = falling** (this is the DCT-II convention and catches people
+  out). Magnitude = steepness. For stop releases this is usually the most informative dynamic
+  number.
+- **`k2` — curvature.** An arch (rise then fall) versus a dip (fall then rise).
+- **`k3` and beyond** — progressively finer wiggles. On short segments these are increasingly
+  estimation noise rather than signal.
+
+The virtue of the coefficients is that they **average cleanly across tokens** — you can take a
+mean `k1` per category and compare directions — whereas averaging raw tracks requires them to
+be aligned (which is exactly what the time normalisation does, so both work).
+
+### 10.3 Window (ms) — what changes if I move it?
+
+The width of each sliding measurement frame.
+
+- **Decrease** → sharper in time (fast events like a burst stay crisp), the track can start
+  closer to the segment edges, and you get more frames. **But** each frame contains fewer
+  samples, so the moments are noisier, and frequency resolution coarsens (roughly 1/window:
+  6 ms ≈ 170 Hz).
+- **Increase** → steadier, better-resolved moments. **But** the track is smeared in time
+  (fast detail is averaged away) and it gets *shorter*, because every frame must sit fully
+  inside the segment — the track is inset by half a window at each edge. Push it far enough and
+  short segments produce no trajectory at all.
+
+Use the **multitaper** estimator here; it is what makes narrow frames usable.
+
+### 10.4 Hop (ms) — what changes if I move it?
+
+How far the window advances between frames.
+
+- **Decrease** → more frames, so a denser and smoother underlying track. **But** slower, and
+  adjacent frames overlap heavily so they are not independent measurements — you get smoothness,
+  not extra information.
+- **Increase** → fewer frames and a faster run, but a coarser track that can miss brief events.
+  If a segment yields fewer than three frames it gets no trajectory.
+
+**Important:** hop does **not** change how many columns you get. That is fixed by Track points.
+Hop only controls how finely the track is sampled *before* it is resampled.
+
+### 10.5 DCT coefficients — what changes if I move it?
+
+How many shape numbers to keep per moment (one column each).
+
+- **Fewer (1–2)** → just level and direction. Compact, robust, easy to interpret.
+- **More (5+)** → captures finer shape detail, but the higher coefficients are mostly noise on
+  short segments, and it is more columns to carry around.
+
+It cannot usefully exceed **Track points** — there are only that many numbers of information in
+the track, so extra coefficients come back blank.
+
+### 10.6 Track points — what changes if I move it?
+
+How many samples the track is resampled to (one column each). Every segment is resampled to
+this same number over normalised time 0–1, which is what makes segments of different durations
+comparable in the first place.
+
+- **Fewer (5–7)** → fewer columns, a coarser arc. Fine for a simple rise/fall picture.
+- **More (20+)** → a smoother plotted curve. **But** many more columns, and beyond the number
+  of underlying frames it is only interpolating — it invents smoothness, not detail. If a short
+  segment yielded 8 frames, asking for 40 track points does not give you 40 real measurements.
+
+### 10.7 What if I untick "Include time-normalised track columns"?
+
+You get the **DCT coefficients only** — the `_k` columns — and no `_t` columns.
+
+- The **measurement is identical** either way. This only controls whether the track is written
+  out.
+- **Keep it ticked** if you want to *plot the actual curve*, because a graphing tool cannot
+  reconstruct a shape from DCT coefficients (that needs an inverse DCT), or if you want to
+  average trajectories point by point across tokens.
+- **Untick it** if you only need statistics, grouping, or shape comparison — the coefficients
+  carry that, in far fewer columns.
+
+### 10.8 Why do some rows have blank trajectory columns?
+
+Two reasons, both deliberate rather than errors:
+
+- **The segment was too short** to host at least three frames at your window/hop settings, so
+  no trajectory exists. Widen the segment selection, or reduce the window.
+- **More than half the frames for that moment were unmeasurable** (silent or degenerate), so
+  that moment's track is withheld rather than reported from mostly-interpolated values. Other
+  moments on the same row may still be populated.
+
+Interior gaps are linearly interpolated and the edges clamped, so a small number of bad frames
+does not lose the track.
+
+### 10.9 Which moments should I select?
+
+**COG and SD** (the default) are the reliable pair. **Skew and kurtosis** trajectories are
+available but are noisy when computed from short frames — they are the moments most sensitive
+to estimation variance, which is precisely the trade a narrow trajectory window makes. If you
+do want them, use multitaper and consider a slightly wider window.
+
+---
+
+## 11. References
 
 - Boersma, P. & Weenink, D. *Praat: doing phonetics by computer.* (The analysis engine; Burg LPC
   formants and the Spectrum moment functions.) https://www.praat.org

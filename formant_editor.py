@@ -5036,15 +5036,36 @@ class _DataOptionsPage(QWizardPage):
         self._traj_win_spin.setSingleStep(1.0)
         self._traj_win_spin.setValue(DEFAULT_TRAJ_WIN_MS)
         self._traj_win_spin.setToolTip(
-            "Width of each sliding frame. Narrow keeps the track time-local; "
-            "multitaper is recommended at these widths.")
+            "<b>Window (ms)</b> — width of each sliding frame.<br><br>"
+            "<b>Smaller</b>: sharper in time, so fast events (a burst) stay "
+            "crisp — but each frame sees fewer samples, so the moments get "
+            "noisier and frequency resolution coarsens (~1/window: 6 ms "
+            "≈ 170 Hz).<br>"
+            "<b>Larger</b>: steadier, better-resolved moments — but smears "
+            "the track in time and shortens it, because every frame must fit "
+            "inside the segment (the track is inset by half a window at each "
+            "edge). Too large and short segments produce no trajectory at "
+            "all.<br><br>"
+            "Default 6 ms. Use the multitaper estimator at these widths — it "
+            "is what makes short frames usable.")
         tw_row.addWidget(self._traj_win_spin)
         tw_row.addWidget(QLabel("Hop (ms):"))
         self._traj_hop_spin = QDoubleSpinBox()
         self._traj_hop_spin.setRange(0.5, 25.0)
         self._traj_hop_spin.setSingleStep(0.5)
         self._traj_hop_spin.setValue(DEFAULT_TRAJ_HOP_MS)
-        self._traj_hop_spin.setToolTip("Step between successive frames.")
+        self._traj_hop_spin.setToolTip(
+            "<b>Hop (ms)</b> — how far the window advances between frames.<br>"
+            "<br>"
+            "<b>Smaller</b>: more frames, so a denser, smoother raw track "
+            "before normalising — costs processing time, and adjacent frames "
+            "overlap heavily so they are not independent measurements.<br>"
+            "<b>Larger</b>: fewer frames and a faster run, but the raw track "
+            "is coarser and may miss brief events. Below three frames a "
+            "segment gets no trajectory at all.<br><br>"
+            "Default 1 ms. Does not change the number of output columns — "
+            "that is fixed by Track points — only how finely the underlying "
+            "track is sampled before resampling.")
         tw_row.addWidget(self._traj_hop_spin)
         tw_row.addStretch()
         traj_layout.addLayout(tw_row)
@@ -5055,14 +5076,40 @@ class _DataOptionsPage(QWizardPage):
         self._traj_dct_spin.setRange(1, 10)
         self._traj_dct_spin.setValue(DEFAULT_TRAJ_DCT_COEFFS)
         self._traj_dct_spin.setToolTip(
-            "How many DCT coefficients to keep per moment (k0 upward).")
+            "<b>DCT coefficients</b> — how many shape numbers to keep per "
+            "moment, adding one column each (k0 upward).<br><br>"
+            "Each describes the track's shape:<br>"
+            "<b>k0</b> = overall level (the mean, scaled). A high COG k0 "
+            "means a high-frequency segment throughout.<br>"
+            "<b>k1</b> = overall slope. <i>Negative = rising</i>, positive = "
+            "falling. The single most useful dynamic number.<br>"
+            "<b>k2</b> = curvature — an arch (rise then fall) or a dip.<br>"
+            "<b>k3+</b> = progressively finer wiggle, increasingly noise.<br>"
+            "<br>"
+            "<b>Fewer</b> (1–2): just level and direction; compact and "
+            "robust.<br>"
+            "<b>More</b> (5+): captures finer shape, but the high "
+            "coefficients are mostly estimation noise on short segments.<br>"
+            "<br>Default 4 (k0–k3). Cannot exceed Track points — extra "
+            "coefficients would be blank.")
         tp_row.addWidget(self._traj_dct_spin)
         tp_row.addWidget(QLabel("Track points:"))
         self._traj_points_spin = QSpinBox()
         self._traj_points_spin.setRange(3, 50)
         self._traj_points_spin.setValue(DEFAULT_TRAJ_NORM_POINTS)
         self._traj_points_spin.setToolTip(
-            "Samples in the time-normalised track (one column each).")
+            "<b>Track points</b> — how many samples the track is resampled "
+            "to, adding one column each (&lt;moment&gt;_t0, _t1 …).<br><br>"
+            "Every segment is resampled to this same number of points over "
+            "normalised time 0–1, which is what makes segments of different "
+            "duration comparable.<br><br>"
+            "<b>Fewer</b> (5–7): fewer columns, a coarser arc — fine for a "
+            "simple rise/fall picture.<br>"
+            "<b>More</b> (20+): a smoother plotted curve, but many more "
+            "columns, and past the number of underlying frames it only "
+            "interpolates — it invents smoothness rather than detail.<br>"
+            "<br>Default 11. Only used when the track columns below are "
+            "ticked.")
         tp_row.addWidget(self._traj_points_spin)
         tp_row.addStretch()
         traj_layout.addLayout(tp_row)
@@ -5071,8 +5118,18 @@ class _DataOptionsPage(QWizardPage):
             "Include time-normalised track columns (for plotting arcs)")
         self._traj_track_cb.setChecked(True)
         self._traj_track_cb.setToolTip(
-            "Adds <moment>_t0 … columns. Needed to plot the trajectory "
-            "directly; untick for DCT coefficients only.")
+            "<b>Track columns</b> — the trajectory's actual values over "
+            "normalised time (&lt;moment&gt;_t0 … _t{N-1}).<br><br>"
+            "<b>Ticked</b>: you get both the DCT coefficients and the raw "
+            "shape. Needed to <i>plot the arc</i>, because a graphing tool "
+            "cannot reconstruct a curve from DCT coefficients (that needs an "
+            "inverse DCT). Also lets you average trajectories across tokens "
+            "point by point.<br>"
+            "<b>Unticked</b>: DCT coefficients only — far fewer columns, and "
+            "enough for statistics, grouping and comparing shapes. You just "
+            "cannot draw the curve itself.<br><br>"
+            "The measurement is identical either way; this only controls "
+            "whether the track is written out.")
         traj_layout.addWidget(self._traj_track_cb)
         self._traj_track_cb.toggled.connect(
             self._traj_points_spin.setEnabled)
