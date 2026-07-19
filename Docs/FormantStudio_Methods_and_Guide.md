@@ -124,7 +124,20 @@ hard-coded to particular tier names.
 
 ---
 
-## 5. Spectral-moment analysis (consonants)
+## 5. Spectral analysis (consonants)
+
+**How the settings are organised.** In the Build CSV wizard, **Extract spectral data** is the
+parent: it holds the settings both analyses share — the **segment tier**, the **estimator**
+(and its parameters), and the **high-pass filter**. Under it sit two independent sub-analyses:
+
+- **Spectral moments** — a few static snapshots at percentage markers through the segment (§5.1–5.5).
+- **Spectral trajectory** — how the spectrum evolves across the whole segment (§5.6).
+
+Either can be used on its own, or both together. They measure the same audio on the same tier
+with the same estimator, but with deliberately different windows: wide and stable for the point
+moments, narrow and time-local for the trajectory.
+
+### 5.0 The four moments
 
 ### 5.1 What it measures
 
@@ -140,11 +153,12 @@ frequency and summarise its shape:
 They are computed on the windowed segment's power spectrum with moment **power = 2** (Praat's
 default). Kurtosis is **excess** (a Gaussian spectrum yields 0), matching Praat.
 
-**Two estimators (selectable):**
+**Two estimators (selectable, shared by the moments and the trajectory):**
 
-- **Single taper** (default, legacy): one taper (default Hamming) then Praat's `Spectrum`
-  moment functions via parselmouth. Reproduces existing FormantStudio values exactly.
-- **Multitaper** (recommended for short releases): averages the power spectra of `K` orthogonal
+- **Single taper** (legacy): one taper (default Hamming) then Praat's `Spectrum`
+  moment functions via parselmouth. Reproduces existing FormantStudio values exactly — select
+  it when you need to match numbers generated before multitaper became the default.
+- **Multitaper** (**the default**): averages the power spectra of `K` orthogonal
   DPSS (Slepian) tapers with time-bandwidth product `NW` (defaults `NW=4`, `K=7`) to reduce the
   estimation variance that short windows suffer, for a small controlled loss of frequency
   resolution. Moments are then computed with the identical convention as the single-taper path

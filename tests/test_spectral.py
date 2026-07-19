@@ -294,10 +294,26 @@ class TestMultitaperCSV:
         assert r_s[0][h_s.index("winsource_50%")] == \
             r_m[0][h_m.index("winsource_50%")]
 
-    def test_estimator_defaults_to_single_taper(self):
-        # A build with no estimator kwarg reproduces the legacy path exactly
+    def test_estimator_defaults_to_multitaper(self):
+        # Multitaper is the recommended default: it cuts estimation variance
+        # on the short windows short segments force on us. single_taper
+        # remains selectable to reproduce legacy Praat numbers exactly.
         from formant_editor import DEFAULT_SPECTRAL_ESTIMATOR
-        assert DEFAULT_SPECTRAL_ESTIMATOR == "single_taper"
+        assert DEFAULT_SPECTRAL_ESTIMATOR == "multitaper"
+
+    def test_single_taper_still_available_and_differs(self, tmp_path):
+        audio, tg = _write_corpus(tmp_path, [(0.1, 0.4, "s")])
+        tier = TextGrid.from_file(os.path.join(tg, "test.TextGrid")).tiers
+        h_s, r_s = _build_csv_data(**_spectral_kwargs(
+            audio_dir=audio, textgrid_dir=tg, selected_tiers=tier,
+            spectral_estimator="single_taper"))
+        h_m, r_m = _build_csv_data(**_spectral_kwargs(
+            audio_dir=audio, textgrid_dir=tg, selected_tiers=tier,
+            spectral_estimator="multitaper"))
+        # Both produce a COG, and the two estimators are genuinely distinct
+        assert r_s[0][h_s.index("COG_50%")] != ""
+        assert r_m[0][h_m.index("COG_50%")] != ""
+        assert r_s[0][h_s.index("COG_50%")] != r_m[0][h_m.index("COG_50%")]
 
 
 class TestSpectralCSV:
