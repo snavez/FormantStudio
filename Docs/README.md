@@ -30,6 +30,7 @@ Praat's automatic formant tracking is excellent but not infallible — particula
 
 ### TextGrid Editing
 - **Load/save TextGrid files** (Praat normal + short format)
+- **TextGrid templates** — start a new grid from any existing TextGrid, with labels scaled to the new file's duration
 - **Add boundaries** (Enter key at cursor/hover position)
 - **Delete boundaries** (Del key on selected boundary)
 - **Drag boundaries** to adjust timing (blit-based visual feedback)
@@ -58,6 +59,7 @@ python formant_editor.py
 | Ctrl+Shift+O | Open WAV file |
 | Ctrl+S | Save formants |
 | Ctrl+Shift+S | Save TextGrid |
+| Ctrl+Alt+S | Save TextGrid As... |
 | Ctrl+L | Load formants |
 | Ctrl+T | Load TextGrid |
 | Ctrl+E | Toggle edit mode |

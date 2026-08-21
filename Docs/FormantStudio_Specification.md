@@ -156,7 +156,28 @@ TextGrid tiers are displayed below the spectrogram in synchronised, separately-l
 
 #### 2.4.4 Tier Management
 
-Users can add new tiers (IntervalTier or TextTier) to an existing TextGrid. TextGrid files are saved in Praat's normal text format via Ctrl+Shift+S.
+Users can add new tiers (IntervalTier or TextTier) to an existing TextGrid. TextGrid files are saved in Praat's normal text format via Ctrl+Shift+S, or under a new name via Ctrl+Alt+S.
+
+#### 2.4.5 TextGrid Templates
+
+A corpus often consists of many recordings sharing one tier structure, and frequently one script. **File > New TextGrid from Template...** builds a grid for the open audio file from any existing TextGrid. Templates are ordinary TextGrid files, so any annotation can serve as one and no separate format or library is involved; "Save TextGrid As..." is all it takes to create one.
+
+When the chosen template carries labels the user picks between two modes:
+
+| Mode | Result |
+|------|--------|
+| Copy Labels (Scaled) | Tiers, labels, and boundaries are copied, with every time mapped proportionally from the template's domain onto the current file's duration. For repeated readings of one phrase this places each boundary approximately, leaving the annotator to nudge rather than retype. |
+| Tiers Only | Tier names, types, and order are reproduced empty. |
+
+The resulting grid is marked unsaved and carries no filename, so the first save prompts for one instead of writing back over the template.
+
+#### 2.4.6 Save Safety and Time-Domain Fitting
+
+Loading another recording's TextGrid as a starting point is a normal workflow, so two safeguards protect existing annotation:
+
+**Name mismatch on save.** Saving a TextGrid whose base name differs from the open audio file's would overwrite the annotation belonging to that other recording. The save is intercepted and offers Save As... (default, pre-filled with the audio file's base name), Overwrite, or Cancel. When the names match, saving proceeds silently as before.
+
+**Duration mismatch on load.** A TextGrid's time domain need not match the sound it is opened against. A grid shorter than the audio is extended silently. A longer one is trimmed silently when nothing lies past the end; when annotations would actually be discarded, the user chooses between trimming to the audio length and keeping the grid as-is. This matters because the view cannot scroll beyond the end of the sound: out-of-range labels are invisible and uneditable, yet would still be written back on save and picked up by batch extraction as segments with no corresponding audio.
 
 ### 2.5 Audio Playback
 
@@ -298,6 +319,8 @@ FormantStudio tracks whether formant edits or TextGrid modifications have been m
 |---------|--------|-------|
 | Display TextGrid tiers below spectrogram | ✅ | IntervalTier + TextTier, batch rendering |
 | Load/save TextGrid files | ✅ | Normal and short format parsing, normal format save |
+| TextGrid templates | ✅ | New grid from any existing TextGrid; labels optionally copied and time-scaled |
+| Save-name and duration guards | ✅ | Prompts before overwriting another file's grid; fits a loaded grid to the audio's length |
 | TextGrid boundary editing | ✅ | Add (Enter), delete (Del), drag boundaries |
 | Shift+drag aligned boundaries | ✅ | Multi-tier aligned boundary movement |
 | Interval/point label editing | ✅ | Inline label editor, live update |

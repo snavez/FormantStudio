@@ -116,6 +116,10 @@ ZOOM_FACTOR = 1.3              # per scroll wheel notch
 # marker.
 DRAG_START_PX = 5.0
 
+# Tolerance for comparing TextGrid times, in seconds.  Boundaries that agree
+# to within this are treated as identical, absorbing float round-trip noise.
+TIME_EPS = 1e-6
+
 # Undo system
 from collections import namedtuple
 UndoEntry = namedtuple('UndoEntry', ['description', 'changes'])
@@ -381,6 +385,18 @@ class Tier:
                 f"{len(self.points)} points)")
 
 
+def _new_tier(name, tier_class, duration):
+    """Build an empty tier of *tier_class* spanning ``0..duration``.
+
+    Interval tiers get the single empty interval Praat expects; point tiers
+    start with no points.
+    """
+    if tier_class == "IntervalTier":
+        return Tier(name, tier_class, 0, duration,
+                    intervals=[Interval(0, duration, "")])
+    return Tier(name, tier_class, 0, duration, points=[])
+
+
 class TextGrid:
     """Top-level TextGrid container."""
 
@@ -394,6 +410,86 @@ class TextGrid:
             return NotImplemented
         return (self.xmin == other.xmin and self.xmax == other.xmax
                 and self.tiers == other.tiers)
+
+    def items_beyond(self, duration):
+        """Count intervals and points lying wholly past *duration*.
+
+        These are the annotations that fitting to a shorter sound would
+        discard, so callers can warn before data is lost.
+        """
+        n = 0
+        for tier in self.tiers:
+            n += sum(1 for iv in tier.intervals
+                     if iv.xmin >= duration - TIME_EPS)
+            n += sum(1 for pt in tier.points if pt.time > duration + TIME_EPS)
+        return n
+
+    def fit_to_duration(self, duration):
+        """Clamp this TextGrid's time domain to ``xmin..duration`` in place.
+
+        Annotations past *duration* are dropped and an interval straddling it
+        is truncated; when the grid is shorter than *duration* the final
+        interval is extended instead.  Interval tiers always keep at least one
+        interval, as Praat requires.
+        """
+        self.xmax = duration
+        for tier in self.tiers:
+            tier.xmax = duration
+            if tier.tier_class == "IntervalTier":
+                kept = [iv for iv in tier.intervals
+                        if iv.xmin < duration - TIME_EPS]
+                for iv in kept:
+                    if iv.xmax > duration:
+                        iv.xmax = duration
+                if kept:
+                    kept[-1].xmax = duration
+                else:
+                    kept = [Interval(tier.xmin, duration, "")]
+                tier.intervals = kept
+            else:
+                tier.points = [pt for pt in tier.points
+                               if pt.time <= duration + TIME_EPS]
+
+    @classmethod
+    def from_template(cls, template, duration, copy_labels=True):
+        """Build a new TextGrid for a sound of *duration* from *template*.
+
+        The template's tier structure is reproduced in order.  With
+        *copy_labels* the annotations come too, their times mapped linearly
+        from the template's domain onto ``0..duration`` so that a corpus of
+        recordings of the same material starts out roughly aligned; the first
+        and last boundaries land exactly on the endpoints.  Without it the
+        tiers are created empty.
+        """
+        span = template.xmax - template.xmin
+        if span <= 0:
+            raise ValueError("Template TextGrid has a zero-length time domain")
+        scale = duration / span
+
+        def _map(t):
+            return (t - template.xmin) * scale
+
+        tiers = []
+        for src in template.tiers:
+            if not copy_labels:
+                tiers.append(_new_tier(src.name, src.tier_class, duration))
+                continue
+            tier = _new_tier(src.name, src.tier_class, duration)
+            if src.tier_class == "IntervalTier":
+                tier.intervals = [
+                    Interval(_map(iv.xmin), _map(iv.xmax), iv.text)
+                    for iv in src.intervals
+                ]
+                if tier.intervals:
+                    tier.intervals[0].xmin = 0
+                    tier.intervals[-1].xmax = duration
+                else:
+                    tier.intervals = [Interval(0, duration, "")]
+            else:
+                tier.points = [Point(_map(pt.time), pt.mark)
+                               for pt in src.points]
+            tiers.append(tier)
+        return cls(0, duration, tiers)
 
     def save(self, filepath):
         """Save TextGrid to a file in Praat normal text format."""
@@ -896,18 +992,16 @@ def _get_formant_at_time(fd, time_s):
 
 def _find_containing_interval(tier, xmin, xmax):
     """Return the Interval in *tier* that contains [xmin, xmax], or None."""
-    eps = 1e-6
     for iv in tier.intervals:
-        if iv.xmin <= xmin + eps and iv.xmax >= xmax - eps:
+        if iv.xmin <= xmin + TIME_EPS and iv.xmax >= xmax - TIME_EPS:
             return iv
     return None
 
 
 def _find_containing_interval_for_point(tier, time_s):
     """Return the Interval in *tier* that contains *time_s*, or None."""
-    eps = 1e-6
     for iv in tier.intervals:
-        if iv.xmin - eps <= time_s <= iv.xmax + eps:
+        if iv.xmin - TIME_EPS <= time_s <= iv.xmax + TIME_EPS:
             return iv
     return None
 
@@ -1375,7 +1469,6 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         # the token subdivides into (e.g. allophone "t0; tH" under a /t/
         # row), or the marks of the points falling inside the token.
         def _label_cols(iv):
-            eps = 1e-6
             cols = []
             for t_name in interval_tier_names:
                 t = tier_map.get(t_name)
@@ -1390,8 +1483,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     else:
                         kids = [k.text for k in t.intervals
                                 if k.text.strip()
-                                and k.xmin >= iv.xmin - eps
-                                and k.xmax <= iv.xmax + eps]
+                                and k.xmin >= iv.xmin - TIME_EPS
+                                and k.xmax <= iv.xmax + TIME_EPS]
                         cols.append("; ".join(kids))
             # Point tier labels — the unit's own mark when this is the
             # primary point tier, else the marks inside the unit's bounds
@@ -1404,7 +1497,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     cols.append("")
                     continue
                 marks = [p.mark for p in pt_tier.points
-                         if iv.xmin - eps <= p.time <= iv.xmax + eps]
+                         if iv.xmin - TIME_EPS <= p.time <= iv.xmax + TIME_EPS]
                 cols.append("; ".join(marks) if marks else "")
             return cols
 
@@ -1646,7 +1739,6 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             return cols
 
         # --- Row generation: exactly one row per primary-tier unit ---
-        eps = 1e-6
         for unit in units:
             lc = _label_cols(unit)
             row = [audio_file] + lc
@@ -1662,7 +1754,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 if at_pt_tier is not None:
                     pts = sorted(
                         (p for p in at_pt_tier.points
-                         if unit.xmin - eps <= p.time <= unit.xmax + eps),
+                         if unit.xmin - TIME_EPS <= p.time <= unit.xmax + TIME_EPS),
                         key=lambda p: p.time)
                 for i in range(max_targets):
                     if i < len(pts):
@@ -4380,12 +4472,7 @@ class CreateTextGridDialog(QDialog):
         for row in self._tier_rows:
             name = row["name"].text().strip() or f"tier{len(tiers) + 1}"
             tc = _TIER_TYPE_DISPLAY[row["type"].currentText()]
-            if tc == "IntervalTier":
-                tier = Tier(name, tc, 0, self._duration,
-                            intervals=[Interval(0, self._duration, "")])
-            else:
-                tier = Tier(name, tc, 0, self._duration, points=[])
-            tiers.append(tier)
+            tiers.append(_new_tier(name, tc, self._duration))
         return TextGrid(0, self._duration, tiers)
 
 
@@ -6250,6 +6337,7 @@ class MainWindow(QMainWindow):
 
         self._filepath = None
         self._textgrid_path = None
+        self._template_path = None
         self._formants_path = None
         self._scrollbar_updating = False
         self._formants_dirty = False
@@ -6394,6 +6482,10 @@ class MainWindow(QMainWindow):
         create_tg_action.triggered.connect(self._create_textgrid_from_menu)
         file_menu.addAction(create_tg_action)
 
+        template_action = QAction("&New TextGrid from Template...", self)
+        template_action.triggered.connect(self._new_textgrid_from_template)
+        file_menu.addAction(template_action)
+
         add_tier_action = QAction("Add &Tier...", self)
         add_tier_action.setShortcut(QKeySequence("Ctrl+Shift+T"))
         add_tier_action.triggered.connect(self._add_tier_to_textgrid)
@@ -6411,8 +6503,14 @@ class MainWindow(QMainWindow):
 
         save_tg_action = QAction("Save Text&Grid", self)
         save_tg_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
-        save_tg_action.triggered.connect(self.save_textgrid)
+        save_tg_action.triggered.connect(lambda: self.save_textgrid())
         file_menu.addAction(save_tg_action)
+
+        save_tg_as_action = QAction("Save TextGrid &As...", self)
+        save_tg_as_action.setShortcut(QKeySequence("Ctrl+Alt+S"))
+        save_tg_as_action.triggered.connect(
+            lambda: self.save_textgrid(save_as=True))
+        file_menu.addAction(save_tg_as_action)
 
         save_action = QAction("&Save Formants", self)
         save_action.setShortcut(QKeySequence("Ctrl+S"))
@@ -6959,6 +7057,68 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load:\n{e}")
 
+    def _apply_textgrid(self, tg, path, dirty):
+        """Install *tg* as the current TextGrid and refresh the UI.
+
+        *path* is the file it belongs to, or None when it has never been
+        written; *dirty* marks it as having unsaved edits.
+        """
+        self.canvas.textgrid_data = tg
+        self._textgrid_path = path
+        self._textgrid_dirty = dirty
+        self._setup_tier_checkboxes()
+        self.canvas._setup_axes()
+        self.canvas.render()
+
+    def _describe_tiers(self, tg):
+        """Summarise a TextGrid's tiers for the status bar."""
+        n = len(tg.tiers)
+        tier_desc = ", ".join(t.name for t in tg.tiers)
+        return f"{n} tier{'s' if n != 1 else ''}: {tier_desc}"
+
+    def _fit_textgrid_to_audio(self, tg, filepath):
+        """Reconcile a freshly loaded TextGrid with the current sound's length.
+
+        A grid whose domain is shorter than the audio, or longer but empty past
+        the end, is adjusted silently.  When trimming would actually discard
+        annotations the user chooses, since those labels are otherwise
+        invisible — the view cannot scroll past the end of the sound — yet
+        would still be written back on save and picked up by batch extraction.
+        """
+        if self.canvas.sound is None:
+            return
+        duration = self.canvas.sound.duration
+        if abs(tg.xmax - duration) <= TIME_EPS:
+            return
+
+        lost = tg.items_beyond(duration) if tg.xmax > duration else 0
+        if lost == 0:
+            tg.fit_to_duration(duration)
+            return
+
+        audio_name = os.path.basename(self._filepath) if self._filepath else "the audio"
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("TextGrid Longer Than Audio")
+        msg.setText(
+            f"{os.path.basename(filepath)} covers {tg.xmax:.3f} s, but "
+            f"{audio_name} is only {duration:.3f} s long.\n\n"
+            f"{lost} annotation{'s' if lost != 1 else ''} "
+            f"{'lie' if lost != 1 else 'lies'} past the end of the audio. "
+            "They cannot be seen or edited here, but would still be written "
+            "back on save and picked up by batch extraction."
+        )
+        btn_trim = msg.addButton("Trim to Audio Length",
+                                 QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("Keep As-Is", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(btn_trim)
+        msg.exec()
+
+        if msg.clickedButton() is btn_trim:
+            tg.fit_to_duration(duration)
+            self._textgrid_dirty = True
+            self.canvas.render()
+
     def load_textgrid(self, filepath=None):
         """Load a TextGrid file, optionally from a given path or via dialog."""
         if filepath is None:
@@ -6972,40 +7132,89 @@ class MainWindow(QMainWindow):
 
         try:
             tg = TextGrid.from_file(filepath)
-            self._textgrid_path = filepath
-            self.canvas.textgrid_data = tg
-            self._textgrid_dirty = False
-            self._setup_tier_checkboxes()
-            self.canvas._setup_axes()
-            self.canvas.render()
-            tier_desc = ", ".join(t.name for t in tg.tiers)
-            self.status.showMessage(
-                f"TextGrid: {os.path.basename(filepath)} "
-                f"({len(tg.tiers)} tier{'s' if len(tg.tiers) != 1 else ''}: {tier_desc})"
-            )
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load TextGrid:\n{e}")
+            return
 
-    def save_textgrid(self):
-        """Save the current TextGrid to file."""
+        self._apply_textgrid(tg, filepath, dirty=False)
+        self._fit_textgrid_to_audio(tg, filepath)
+        self.status.showMessage(
+            f"TextGrid: {os.path.basename(filepath)} "
+            f"({self._describe_tiers(tg)})"
+        )
+
+    def _default_textgrid_path(self):
+        """The TextGrid path matching the open audio file, or ''."""
+        if not self._filepath:
+            return ""
+        return os.path.splitext(self._filepath)[0] + ".TextGrid"
+
+    def _textgrid_path_matches_audio(self):
+        """True if the loaded TextGrid shares the audio file's base name.
+
+        A mismatch means the grid came from some other recording's annotation,
+        so saving over it would destroy that recording's work.
+        """
+        if not self._textgrid_path or not self._filepath:
+            return True
+        tg_base = os.path.splitext(os.path.basename(self._textgrid_path))[0]
+        audio_base = os.path.splitext(os.path.basename(self._filepath))[0]
+        return tg_base.lower() == audio_base.lower()
+
+    def _resolve_textgrid_save_path(self, save_as):
+        """Decide where to save the current TextGrid, or None if cancelled.
+
+        Saves straight back to the loaded path only when it belongs to the open
+        audio file.  Reusing another file's grid as a starting point is a normal
+        workflow, so a mismatch offers a new name rather than quietly
+        overwriting the source annotation.
+        """
+        if not save_as and self._textgrid_path:
+            if self._textgrid_path_matches_audio():
+                return self._textgrid_path
+
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setWindowTitle("TextGrid Name Does Not Match Audio")
+            msg.setText(
+                f"This TextGrid was loaded from "
+                f"{os.path.basename(self._textgrid_path)}, but the open audio "
+                f"file is {os.path.basename(self._filepath)}.\n\n"
+                f"Overwriting would replace the annotation belonging to "
+                f"{os.path.basename(self._textgrid_path)}."
+            )
+            btn_save_as = msg.addButton("Save As…",
+                                        QMessageBox.ButtonRole.AcceptRole)
+            btn_overwrite = msg.addButton("Overwrite",
+                                          QMessageBox.ButtonRole.DestructiveRole)
+            msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            msg.setDefaultButton(btn_save_as)
+            msg.exec()
+
+            clicked = msg.clickedButton()
+            if clicked is btn_overwrite:
+                return self._textgrid_path
+            if clicked is not btn_save_as:
+                return None
+
+        default = self._textgrid_path if save_as else ""
+        if not default:
+            default = self._default_textgrid_path()
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Save TextGrid", default,
+            "TextGrid Files (*.TextGrid);;All Files (*)"
+        )
+        return save_path or None
+
+    def save_textgrid(self, save_as=False):
+        """Save the current TextGrid, prompting for a name where needed."""
         if self.canvas.textgrid_data is None:
             self.status.showMessage("No TextGrid to save")
             return
 
-        if self._textgrid_path:
-            save_path = self._textgrid_path
-        else:
-            # Suggest audio directory with matching basename, but let user choose
-            if self._filepath:
-                default = os.path.splitext(self._filepath)[0] + ".TextGrid"
-            else:
-                default = ""
-            save_path, _ = QFileDialog.getSaveFileName(
-                self, "Save TextGrid", default,
-                "TextGrid Files (*.TextGrid);;All Files (*)"
-            )
-            if not save_path:
-                return
+        save_path = self._resolve_textgrid_save_path(save_as)
+        if not save_path:
+            return
 
         try:
             self.canvas.textgrid_data.save(save_path)
@@ -7361,26 +7570,21 @@ class MainWindow(QMainWindow):
         msg.setWindowTitle("No TextGrid Found")
         msg.setText(
             "No TextGrid was found for this audio file.\n\n"
-            "Would you like to create a new TextGrid or load an existing one?"
+            "Would you like to create a new TextGrid, start from a template, "
+            "or load an existing one?"
         )
         btn_create = msg.addButton("Create New", QMessageBox.ButtonRole.AcceptRole)
+        btn_template = msg.addButton("From Template…",
+                                     QMessageBox.ButtonRole.ActionRole)
         btn_load = msg.addButton("Load Existing…", QMessageBox.ButtonRole.ActionRole)
         msg.addButton("Skip", QMessageBox.ButtonRole.RejectRole)
         msg.exec()
 
         clicked = msg.clickedButton()
         if clicked is btn_create:
-            tg = self._create_textgrid_from_dialog()
-            if tg is not None:
-                self.canvas.textgrid_data = tg
-                self._setup_tier_checkboxes()
-                self.canvas._setup_axes()
-                self.canvas.render()
-                tier_desc = ", ".join(t.name for t in tg.tiers)
-                self.status.showMessage(
-                    f"Created TextGrid "
-                    f"({len(tg.tiers)} tier{'s' if len(tg.tiers) != 1 else ''}: {tier_desc})"
-                )
+            self._create_textgrid_from_menu()
+        elif clicked is btn_template:
+            self._new_textgrid_from_template()
         elif clicked is btn_load:
             self.load_textgrid()
 
@@ -7389,28 +7593,85 @@ class MainWindow(QMainWindow):
         if self.canvas.sound is None:
             self.status.showMessage("Open a WAV file first")
             return
-        tg = self._create_textgrid_from_dialog()
-        if tg is not None:
-            self.canvas.textgrid_data = tg
-            self._textgrid_dirty = True
-            self._setup_tier_checkboxes()
-            self.canvas._setup_axes()
-            self.canvas.render()
-            tier_desc = ", ".join(t.name for t in tg.tiers)
-            self.status.showMessage(
-                f"Created TextGrid "
-                f"({len(tg.tiers)} tier{'s' if len(tg.tiers) != 1 else ''}: {tier_desc})"
-            )
+        dlg = CreateTextGridDialog(self.canvas.sound.duration, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        tg = dlg.get_textgrid()
+        self._apply_textgrid(tg, path=None, dirty=True)
+        self.status.showMessage(f"Created TextGrid ({self._describe_tiers(tg)})")
 
-    def _create_textgrid_from_dialog(self):
-        """Show CreateTextGridDialog and return a TextGrid or None."""
+    def _new_textgrid_from_template(self):
+        """File > New TextGrid from Template — reuse another grid's structure.
+
+        Templates are ordinary TextGrid files, so any annotation can serve as
+        one and "Save TextGrid As…" is all it takes to make one.  The result is
+        left unsaved and unnamed so the first save prompts for a filename
+        rather than writing back over the template.
+        """
         if self.canvas.sound is None:
-            return None
-        duration = self.canvas.sound.duration
-        dlg = CreateTextGridDialog(duration, parent=self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            return dlg.get_textgrid()
-        return None
+            self.status.showMessage("Open a WAV file first")
+            return
+
+        start_dir = ""
+        if self._template_path:
+            start_dir = os.path.dirname(self._template_path)
+        elif self._filepath:
+            start_dir = os.path.dirname(self._filepath)
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Select TextGrid Template", start_dir,
+            "TextGrid Files (*.TextGrid *.textgrid);;All Files (*)"
+        )
+        if not filepath:
+            return
+
+        try:
+            template = TextGrid.from_file(filepath)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load template:\n{e}")
+            return
+
+        has_labels = any(
+            any(iv.text for iv in tier.intervals) or bool(tier.points)
+            for tier in template.tiers
+        )
+        copy_labels = False
+        if has_labels:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Use Template")
+            msg.setText(
+                f"{os.path.basename(filepath)} contains labels as well as "
+                f"tiers ({self._describe_tiers(template)}).\n\n"
+                "Copy the labels across, scaling their times to this file's "
+                "length, or take the tier structure only?"
+            )
+            btn_labels = msg.addButton("Copy Labels (Scaled)",
+                                       QMessageBox.ButtonRole.AcceptRole)
+            btn_tiers = msg.addButton("Tiers Only",
+                                      QMessageBox.ButtonRole.ActionRole)
+            msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            msg.setDefaultButton(btn_labels)
+            msg.exec()
+
+            clicked = msg.clickedButton()
+            if clicked is btn_labels:
+                copy_labels = True
+            elif clicked is not btn_tiers:
+                return
+
+        try:
+            tg = TextGrid.from_template(
+                template, self.canvas.sound.duration, copy_labels=copy_labels)
+        except ValueError as e:
+            QMessageBox.critical(self, "Error", str(e))
+            return
+
+        self._template_path = filepath
+        self._apply_textgrid(tg, path=None, dirty=True)
+        source = "labels scaled" if copy_labels else "tiers only"
+        self.status.showMessage(
+            f"New TextGrid from {os.path.basename(filepath)} ({source}; "
+            f"{self._describe_tiers(tg)}) — unsaved"
+        )
 
     def _insert_tier(self, new_tier, pos):
         """Insert *new_tier* at *pos*, fixing active/hidden indices and UI."""
