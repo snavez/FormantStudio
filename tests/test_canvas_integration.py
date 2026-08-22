@@ -666,3 +666,81 @@ class TestTimeThreshold:
         threshold = c._time_threshold_for_pixels(5)
         assert threshold > 0
         assert threshold < c.view_width
+
+
+# ---------------------------------------------------------------------------
+# Horizontal alignment between the audio plots and the tier panes
+# ---------------------------------------------------------------------------
+
+class TestPlotAlignment:
+    """The waveform, spectrogram and tier panes are separate PlotItems.
+
+    Linking their x ranges only aligns the data if their plot areas also start
+    at the same pixel, which requires their left axes to share a width. When
+    they did not, a boundary in a tier sat well away from the moment in the
+    spectrogram it marked.
+    """
+
+    def _plot_areas(self, canvas):
+        plots = []
+        if canvas._wave_plot is not None:
+            plots.append(canvas._wave_plot)
+        if canvas._spec_plot is not None:
+            plots.append(canvas._spec_plot)
+        plots.extend(canvas._tier_plots)
+        return [p.getViewBox().sceneBoundingRect() for p in plots]
+
+    def test_plot_areas_share_horizontal_extent(self, canvas_with_sound,
+                                                simple_textgrid, qapp):
+        canvas_with_sound.textgrid_data = simple_textgrid
+        canvas_with_sound._setup_axes()
+        canvas_with_sound.render()
+        qapp.processEvents()
+
+        rects = self._plot_areas(canvas_with_sound)
+        assert len(rects) >= 3
+        assert max(r.left() for r in rects) - min(r.left() for r in rects) < 0.5
+        assert max(r.right() for r in rects) - min(r.right() for r in rects) < 0.5
+
+    def test_left_axis_width_is_uniform(self, canvas_with_sound,
+                                        simple_textgrid, qapp):
+        canvas_with_sound.textgrid_data = simple_textgrid
+        canvas_with_sound._setup_axes()
+        qapp.processEvents()
+
+        plots = [canvas_with_sound._spec_plot] + canvas_with_sound._tier_plots
+        if canvas_with_sound._wave_plot is not None:
+            plots.append(canvas_with_sound._wave_plot)
+        widths = {p.getAxis('left').width() for p in plots}
+        assert len(widths) == 1, widths
+
+    def test_alignment_survives_a_very_long_tier_name(self, canvas_with_sound,
+                                                      simple_textgrid, qapp):
+        simple_textgrid.tiers[0].name = "a"
+        simple_textgrid.tiers[1].name = "an extremely long tier name indeed"
+        canvas_with_sound.textgrid_data = simple_textgrid
+        canvas_with_sound._setup_axes()
+        canvas_with_sound.render()
+        qapp.processEvents()
+
+        rects = self._plot_areas(canvas_with_sound)
+        assert max(r.left() for r in rects) - min(r.left() for r in rects) < 0.5
+
+    def test_alignment_holds_without_a_textgrid(self, canvas_with_sound, qapp):
+        canvas_with_sound.textgrid_data = None
+        canvas_with_sound._setup_axes()
+        canvas_with_sound.render()
+        qapp.processEvents()
+
+        rects = self._plot_areas(canvas_with_sound)
+        assert max(r.left() for r in rects) - min(r.left() for r in rects) < 0.5
+
+    def test_left_axis_width_accommodates_frequency_labels(self, canvas):
+        """The shared width must not crop the spectrogram's own axis."""
+        assert canvas._left_axis_width([]) >= canvas.MIN_LEFT_AXIS_WIDTH
+        assert canvas._left_axis_width(["x"]) >= canvas.MIN_LEFT_AXIS_WIDTH
+
+    def test_left_axis_width_grows_with_tier_names(self, canvas):
+        narrow = canvas._left_axis_width(["ab"])
+        wide = canvas._left_axis_width(["ab", "a very much longer tier name"])
+        assert wide > narrow

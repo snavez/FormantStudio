@@ -9,7 +9,10 @@ __pycache__/
 # PyInstaller
 build/
 dist/
+# PyInstaller writes throwaway specs; ours is hand-maintained and carries the
+# bundled aligner model, so a build from a fresh clone depends on it.
 *.spec
+!FormantStudio.spec
 FormantStudio.exe
 
 # Misc

@@ -34,6 +34,7 @@ Praat's automatic formant tracking is excellent but not infallible — particula
 - **Create or load TextGrid** — on opening a WAV, choose to create a new TextGrid or load an existing one
 - **Load/save TextGrid files** (Praat normal + short format)
 - **TextGrid templates** — start a new grid from any existing TextGrid, with labels scaled to the new file's duration
+- **First-pass forced alignment** — place a template's phone labels against the recording's acoustics (median 12.7 ms boundary error on held-out data); no pronunciation dictionary needed
 - **Add boundaries** (Enter key at cursor/hover position)
 - **Delete boundaries and points** (Del key on selected boundary or point)
 - **Drag boundaries** to adjust timing (blit-based visual feedback)

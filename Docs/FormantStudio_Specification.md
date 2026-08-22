@@ -166,10 +166,52 @@ When the chosen template carries labels the user picks between two modes:
 
 | Mode | Result |
 |------|--------|
-| Copy Labels (Scaled) | Tiers, labels, and boundaries are copied, with every time mapped proportionally from the template's domain onto the current file's duration. For repeated readings of one phrase this places each boundary approximately, leaving the annotator to nudge rather than retype. |
+| Align to acoustics | Boundaries are placed by forced alignment against the recording (see 2.4.7). The default when the template has a tier of phone-like labels. |
+| Scale labels | Tiers, labels, and boundaries are copied, with every time mapped proportionally from the template's domain onto the current file's duration. |
 | Tiers Only | Tier names, types, and order are reproduced empty. |
 
 The resulting grid is marked unsaved and carries no filename, so the first save prompts for one instead of writing back over the template.
+
+#### 2.4.7 First-Pass Forced Alignment
+
+Choosing "Align to acoustics" places the template's labels where the recording
+actually puts them, rather than stretching them uniformly. The user nominates the
+tier carrying phone labels; every other tier is carried along by the same
+transformation.
+
+The method is a Viterbi decode of the phone sequence against per-frame acoustic
+likelihoods. The acoustic model covers seven broad manner classes -- silence,
+vowel, nasal, approximant, fricative, stop, affricate -- rather than individual
+phones, and phone labels are assigned to a class from their SAMPA symbol. No
+pronunciation dictionary is involved, because the phones are already given; and
+because the class table keys off SAMPA rather than any one language's inventory,
+the same model serves other languages.
+
+Seventeen features are computed every 10 ms: energy (both peak-relative and
+normalised to the recording's own noise-floor-to-peak range), its delta,
+zero-crossing rate, spectral centroid, 85% rolloff, high- and low-frequency
+energy ratios, spectral flux, an autocorrelation voicing measure and F0, and the
+first three formants with their rates of change. The formant tracks are what
+separate a vowel from a neighbouring approximant, which differ little in energy
+or spectral shape.
+
+Crucially the result is applied as a **monotonic time warp** rather than as a set
+of boundaries. Every tier maps through one function, so boundaries that coincide
+in the template still coincide afterwards -- identical inputs give identical
+outputs -- and their ordering cannot invert.
+
+Measured against 51 held-out hand-aligned recordings, median boundary error is
+12.7 ms, with 81% inside 50 ms and 90% inside 100 ms; laying the same sequence out
+by average phone durations without consulting the acoustics gives a median of
+633 ms. Accuracy varies by boundary type: onsets from a stop, fricative or
+affricate into a vowel land within about 5 ms, while vowel-to-vowel junctions
+average 52 ms because there is little acoustic discontinuity to find. The
+alignment degrades gracefully when the template's phones do not match what was
+said: at a simulated 10% label error rate the median moves by under a
+millisecond, since errors stay local and the alignment re-synchronises at the
+next pause.
+
+The output is a first pass and is always left unsaved, for checking by hand.
 
 #### 2.4.6 Save Safety and Time-Domain Fitting
 

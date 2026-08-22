@@ -24,6 +24,8 @@ import numpy as np
 import parselmouth
 from parselmouth import praat
 
+import phone_aligner
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QFileDialog, QLabel, QSlider, QGroupBox, QStatusBar,
@@ -39,8 +41,8 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtMultimedia import QAudioSink, QAudioFormat
 from PyQt6.QtGui import (
-    QAction, QKeySequence, QColor, QFont, QTransform, QPainter, QPen,
-    QPixmap, QPolygonF,
+    QAction, QKeySequence, QColor, QFont, QFontMetrics, QTransform, QPainter,
+    QPen, QPixmap, QPolygonF,
 )
 
 import pyqtgraph as pg
@@ -2135,10 +2137,16 @@ class SpectrogramCanvas(QWidget):
         # Build layout with row stretch factors
         row = 0
 
+        visible_indices = ([i for i in range(len(tg.tiers))
+                            if i not in self.hidden_tiers] if has_tiers else [])
+        axis_width = self._left_axis_width(
+            [tg.tiers[i].name for i in visible_indices])
+
         if has_wave:
             # Waveform on top
             self._wave_plot = self._glw.addPlot(row=row, col=0)
             self._configure_plot(self._wave_plot, '#1a1a2e')
+            self._wave_plot.getAxis('left').setWidth(axis_width)
             self._wave_plot.getAxis('bottom').setStyle(showValues=False)
             self._wave_plot.getAxis('bottom').setHeight(0)
             self._wave_plot.setLabel('left', 'Amp', **{'font-size': '8pt', 'color': '#eeeeee'})
@@ -2156,6 +2164,7 @@ class SpectrogramCanvas(QWidget):
         self._spec_plot = self._glw.addPlot(row=row, col=0)
         self._configure_plot(self._spec_plot, '#1a1a2e')
         self._spec_plot.setLabel('left', 'Frequency (Hz)', **{'font-size': '9pt', 'color': '#eeeeee'})
+        self._spec_plot.getAxis('left').setWidth(axis_width)
         self._glw.ci.layout.setRowStretchFactor(row, spec_stretch)
         row += 1
 
@@ -2165,20 +2174,8 @@ class SpectrogramCanvas(QWidget):
 
         # Tier plots (skip hidden tiers)
         if has_tiers:
-            visible_indices = [i for i in range(len(tg.tiers))
-                               if i not in self.hidden_tiers]
             n_visible = len(visible_indices)
             if n_visible > 0:
-                # Compute left axis width from longest visible tier name
-                from PyQt6.QtGui import QFontMetrics
-                measure_font = QFont("Segoe UI", 10)
-                fm = QFontMetrics(measure_font)
-                max_name_w = max(
-                    fm.horizontalAdvance(tg.tiers[i].name)
-                    for i in visible_indices
-                )
-                axis_width = max(60, max_name_w + 20)  # padding for offset
-
                 tier_share = max(3, 30 // n_visible)
                 for vi, tier_i in enumerate(visible_indices):
                     tp = self._glw.addPlot(row=row + vi, col=0)
@@ -2236,6 +2233,25 @@ class SpectrogramCanvas(QWidget):
 
         # Crosshair
         self._setup_crosshair()
+
+    # Enough room for the spectrogram's frequency ticks and rotated label.
+    MIN_LEFT_AXIS_WIDTH = 70
+
+    def _left_axis_width(self, visible_tier_names):
+        """The left-axis width shared by every stacked plot.
+
+        The waveform, spectrogram and tier panes are separate PlotItems, so
+        linking their x ranges only aligns the data if their plot areas also
+        begin at the same pixel. Forcing one width on every left axis is what
+        makes a boundary in a tier pane sit directly under the moment in the
+        spectrogram it marks.
+        """
+        width = self.MIN_LEFT_AXIS_WIDTH
+        if visible_tier_names:
+            fm = QFontMetrics(QFont("Segoe UI", 10))
+            width = max(width,
+                        max(fm.horizontalAdvance(n) for n in visible_tier_names) + 20)
+        return width
 
     def _configure_plot(self, plot, bg_color):
         """Apply common configuration to a PlotItem."""
@@ -4479,6 +4495,85 @@ class CreateTextGridDialog(QDialog):
 # ---------------------------------------------------------------------------
 # Add Tier dialog
 # ---------------------------------------------------------------------------
+
+class TemplateOptionsDialog(QDialog):
+    """Choose how a template's contents are carried onto the current file.
+
+    Alignment needs a tier of phone-like labels to work from; the others are
+    carried along by the same time warp, so whatever relationships they have
+    with the driving tier survive untouched.
+    """
+
+    SCALED = "scaled"
+    ALIGNED = "aligned"
+    TIERS_ONLY = "tiers"
+
+    def __init__(self, template, template_name, duration, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Use Template")
+        self.setMinimumWidth(460)
+        self.setStyleSheet(_DIALOG_FIELD_STYLE + _checked_tick_qss())
+
+        self._tier_names = phone_aligner.alignable_tiers(template)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"<b>{template_name}</b> contains labels as well as tiers.<br>"
+            f"{len(template.tiers)} tiers, {template.xmax:.2f} s &rarr; "
+            f"this file is {duration:.2f} s."))
+
+        self._group = QButtonGroup(self)
+
+        self._aligned_rb = QRadioButton(
+            "Align labels to the acoustics (first pass)")
+        self._scaled_rb = QRadioButton(
+            "Scale labels to this file's length")
+        self._tiers_rb = QRadioButton("Tiers only, no labels")
+        for i, rb in enumerate((self._aligned_rb, self._scaled_rb, self._tiers_rb)):
+            self._group.addButton(rb, i)
+            layout.addWidget(rb)
+            if rb is self._aligned_rb:
+                row = QHBoxLayout()
+                row.addSpacing(24)
+                row.addWidget(QLabel("Phoneme tier:"))
+                self._tier_combo = QComboBox()
+                self._tier_combo.addItems(self._tier_names)
+                row.addWidget(self._tier_combo, 1)
+                layout.addLayout(row)
+                self._hint = QLabel(
+                    "Boundaries are placed from the acoustics, then every "
+                    "other tier is moved with them. Always check the result.")
+                self._hint.setStyleSheet("color: #666666; font-size: 11px;")
+                layout.addWidget(self._hint)
+
+        if self._tier_names:
+            self._aligned_rb.setChecked(True)
+        else:
+            self._aligned_rb.setEnabled(False)
+            self._tier_combo.setEnabled(False)
+            self._hint.setText("    No tier of phone-like labels to align from.")
+            self._scaled_rb.setChecked(True)
+        self._aligned_rb.toggled.connect(self._sync)
+        self._sync()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _sync(self):
+        on = self._aligned_rb.isChecked() and bool(self._tier_names)
+        self._tier_combo.setEnabled(on)
+
+    def mode(self):
+        return [self.ALIGNED, self.SCALED, self.TIERS_ONLY][
+            self._group.checkedId()]
+
+    def tier_name(self):
+        return self._tier_combo.currentText() if self._tier_names else None
+
 
 class AddTierDialog(QDialog):
     """Dialog for adding a tier to an existing TextGrid."""
@@ -7604,7 +7699,7 @@ class MainWindow(QMainWindow):
         """File > New TextGrid from Template — reuse another grid's structure.
 
         Templates are ordinary TextGrid files, so any annotation can serve as
-        one and "Save TextGrid As…" is all it takes to make one.  The result is
+        one and "Save TextGrid As…" is all it takes to make one. The result is
         left unsaved and unnamed so the first save prompts for a filename
         rather than writing back over the template.
         """
@@ -7630,48 +7725,94 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to load template:\n{e}")
             return
 
+        duration = self.canvas.sound.duration
         has_labels = any(
             any(iv.text for iv in tier.intervals) or bool(tier.points)
             for tier in template.tiers
         )
-        copy_labels = False
+        mode = TemplateOptionsDialog.TIERS_ONLY
+        tier_name = None
         if has_labels:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Use Template")
-            msg.setText(
-                f"{os.path.basename(filepath)} contains labels as well as "
-                f"tiers ({self._describe_tiers(template)}).\n\n"
-                "Copy the labels across, scaling their times to this file's "
-                "length, or take the tier structure only?"
-            )
-            btn_labels = msg.addButton("Copy Labels (Scaled)",
-                                       QMessageBox.ButtonRole.AcceptRole)
-            btn_tiers = msg.addButton("Tiers Only",
-                                      QMessageBox.ButtonRole.ActionRole)
-            msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-            msg.setDefaultButton(btn_labels)
-            msg.exec()
-
-            clicked = msg.clickedButton()
-            if clicked is btn_labels:
-                copy_labels = True
-            elif clicked is not btn_tiers:
+            dlg = TemplateOptionsDialog(
+                template, os.path.basename(filepath), duration, parent=self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
+            mode, tier_name = dlg.mode(), dlg.tier_name()
 
-        try:
+        note = ""
+        if mode == TemplateOptionsDialog.ALIGNED:
+            tg, note = self._align_template(template, tier_name, duration)
+            if tg is None:
+                return
+        else:
             tg = TextGrid.from_template(
-                template, self.canvas.sound.duration, copy_labels=copy_labels)
-        except ValueError as e:
-            QMessageBox.critical(self, "Error", str(e))
-            return
+                template, duration,
+                copy_labels=(mode == TemplateOptionsDialog.SCALED))
+            note = ("labels scaled" if mode == TemplateOptionsDialog.SCALED
+                    else "tiers only")
 
         self._template_path = filepath
         self._apply_textgrid(tg, path=None, dirty=True)
-        source = "labels scaled" if copy_labels else "tiers only"
         self.status.showMessage(
-            f"New TextGrid from {os.path.basename(filepath)} ({source}; "
-            f"{self._describe_tiers(tg)}) — unsaved"
+            f"New TextGrid from {os.path.basename(filepath)} ({note}; "
+            f"{self._describe_tiers(tg)}) — unsaved, please check"
         )
+
+    def _align_template(self, template, tier_name, duration):
+        """Warp *template* onto the open recording using its acoustics.
+
+        Returns (TextGrid, status note), or (None, "") if the user cancelled
+        after an alignment failure.
+        """
+        tier = next((t for t in template.tiers if t.name == tier_name), None)
+        if tier is None or not tier.intervals:
+            QMessageBox.warning(self, "Cannot Align",
+                                f"Tier '{tier_name}' has no intervals to align.")
+            return None, ""
+
+        intervals = [(iv.xmin, iv.xmax, iv.text) for iv in tier.intervals]
+
+        # Label alphabets vary between annotation conventions; say so rather
+        # than quietly guessing a class for symbols we do not recognise.
+        unknown = phone_aligner.unrecognised_labels(
+            [lab for _, _, lab in intervals])
+        if unknown:
+            shown = ", ".join(unknown[:8]) + ("…" if len(unknown) > 8 else "")
+            reply = QMessageBox.question(
+                self, "Unfamiliar Phone Symbols",
+                f"{len(unknown)} label(s) on '{tier.name}' were not "
+                f"recognised as phone symbols:\n\n{shown}\n\n"
+                "They will be treated as vowels, which may place their "
+                "boundaries poorly. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if reply != QMessageBox.StandardButton.Yes:
+                return None, ""
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.status.showMessage(
+            f"Aligning {len(intervals)} labels from '{tier_name}'...")
+        QApplication.processEvents()
+        try:
+            warp = phone_aligner.align_tier(intervals, self.canvas.sound)
+            tg = phone_aligner.warp_textgrid(template, warp, duration)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            reply = QMessageBox.question(
+                self, "Alignment Failed",
+                f"Could not align to the acoustics:\n{e}\n\n"
+                "Scale the labels to fit instead?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if reply != QMessageBox.StandardButton.Yes:
+                return None, ""
+            return (TextGrid.from_template(template, duration, copy_labels=True),
+                    "alignment failed, labels scaled")
+        QApplication.restoreOverrideCursor()
+
+        spoken = sum(1 for _, _, lab in intervals
+                     if not phone_aligner.is_pause(lab))
+        return tg, f"aligned on '{tier_name}', {spoken} phones"
 
     def _insert_tier(self, new_tier, pos):
         """Insert *new_tier* at *pos*, fixing active/hidden indices and UI."""
