@@ -13,6 +13,7 @@ boundaries, so every tier in a TextGrid can be mapped through the same
 function. Boundaries that coincide in the template still coincide afterwards,
 because identical inputs produce identical outputs.
 """
+import io
 import os
 import sys
 
@@ -30,8 +31,32 @@ FRIC = "FRIC"
 STOP = "STOP"
 AFFR = "AFFR"
 
+# Broad manner classes, used for reporting and for deciding what a label is.
 CLASSES = [SIL, VOWEL, NASAL, APPROX, FRIC, STOP, AFFR]
 CLASS_INDEX = {c: i for i, c in enumerate(CLASSES)}
+
+# The acoustic model splits VOWEL by quality. With a single vowel class nothing
+# changes across an /i/-/e/ boundary, leaving the decoder only the duration
+# prior to place it by; separating qualities makes such a boundary a real class
+# transition. Height and fronting are relative descriptions, so the split
+# carries no assumption about any speaker's formant frequencies.
+VOWEL_HEIGHTS = ("high", "mid-high", "mid", "mid-low", "low")
+VOWEL_FRONTINGS = ("front", "centre", "back")
+UNKNOWN_QUALITY = "unknown"
+
+
+def _vowel_class(height, fronting):
+    return f"{VOWEL}_{height}_{fronting}"
+
+
+# Fixed and exhaustive, so the class list never depends on what a particular
+# corpus happened to contain and a stored model always lines up with the code.
+MODEL_CLASSES = (
+    [c for c in CLASSES if c != VOWEL]
+    + [_vowel_class(h, f) for h in VOWEL_HEIGHTS for f in VOWEL_FRONTINGS]
+    + [_vowel_class(UNKNOWN_QUALITY, UNKNOWN_QUALITY)]
+)
+MODEL_CLASS_INDEX = {c: i for i, c in enumerate(MODEL_CLASSES)}
 
 # SAMPA base symbols, plus their IPA equivalents, so a template may be
 # transcribed in either. Nothing here is specific to one language.
@@ -119,6 +144,74 @@ def unrecognised_labels(labels):
     return sorted({l for l in labels if classify_known(l) is None})
 
 
+_CHART_FILENAME = os.path.join("Docs", "ipa_symbol_chart.csv")
+_vowel_quality_cache = None
+
+
+def _load_vowel_qualities():
+    """Map every vowel symbol in the bundled IPA chart to (height, fronting).
+
+    The chart already backs the CSV export's feature columns, so vowel quality
+    has one definition in the app rather than a second hand-written one here.
+    A missing or unreadable chart is not fatal: vowels simply fall back to the
+    unknown-quality class, which the model treats as uninformative.
+    """
+    global _vowel_quality_cache
+    if _vowel_quality_cache is not None:
+        return _vowel_quality_cache
+
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(base, _CHART_FILENAME)
+    table = {}
+    try:
+        import csv
+        with io.open(path, encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                if (not row.get("ipa") or row["ipa"].startswith("#")
+                        or row.get("type") != "vowel"):
+                    continue
+                height = (row.get("height") or "").strip()
+                fronting = (row.get("fronting") or "").strip()
+                if height not in VOWEL_HEIGHTS or fronting not in VOWEL_FRONTINGS:
+                    continue
+                for key in ("ipa", "sampa", "xsampa"):
+                    sym = (row.get(key) or "").strip()
+                    if sym:
+                        table.setdefault(sym, (height, fronting))
+    except (OSError, ImportError, csv.Error):
+        table = {}
+    _vowel_quality_cache = table
+    return table
+
+
+def vowel_quality(label):
+    """(height, fronting) for a vowel *label*, or None if it is not known.
+
+    A diphthong is one segment, not two, so it takes the quality of its onset:
+    that is where the segment begins, which is what the boundary before it has
+    to find.
+    """
+    base = _base_symbol(label.strip())
+    if not base:
+        return None
+    table = _load_vowel_qualities()
+    for candidate in (base, base[:1]):
+        if candidate in table:
+            return table[candidate]
+    return None
+
+
+def model_class(label):
+    """The acoustic model's class for *label*: manner, or vowel quality."""
+    manner = classify(label)
+    if manner != VOWEL:
+        return manner
+    quality = vowel_quality(label)
+    if quality is None:
+        return _vowel_class(UNKNOWN_QUALITY, UNKNOWN_QUALITY)
+    return _vowel_class(*quality)
+
+
 def is_pause(label):
     """True if *label* marks silence rather than a spoken phone.
 
@@ -138,6 +231,7 @@ FEATURE_NAMES = [
     "energy", "energy_range", "d_energy", "zcr", "centroid", "rolloff85",
     "hf_ratio", "lf_ratio", "flux", "voicing", "autocorr_f0",
     "f1", "f2", "f3", "d_f1", "d_f2", "d_f3",
+    "bark_f1_f0", "bark_f2_f1", "bark_f3_f2",
 ]
 
 # Formant search ceiling, high enough to cover female speakers.
@@ -177,6 +271,13 @@ def _voicing(frames, sr):
     k = np.argmax(seg, axis=1)
     return np.clip(seg[np.arange(n_frames), k] / energy, 0.0, 1.0), \
         sr / (k + lo).astype(float)
+
+
+def _bark(hz):
+    """Convert Hz to the Bark scale, on which formant distances are comparable
+    across speakers of different vocal tract length."""
+    hz = np.maximum(np.asarray(hz, dtype=float), 1.0)
+    return 13 * np.arctan(0.00076 * hz) + 3.5 * np.arctan((hz / 7500.0) ** 2)
 
 
 def _formant_track(sound, times):
@@ -252,10 +353,20 @@ def extract_features(sound):
     d_formants = np.zeros_like(formants)
     d_formants[1:-1] = np.abs(formants[2:] - formants[:-2]) / 2.0
 
+    # Distances between formants on the Bark scale largely cancel vocal tract
+    # length, so they describe vowel quality in the relative terms it is
+    # actually defined by rather than in a particular speaker's frequencies.
+    bark_f = _bark(formants * 1000.0)
+    bark_0 = _bark(f0)
+    bark_diffs = np.column_stack([
+        bark_f[:, 0] - bark_0, bark_f[:, 1] - bark_f[:, 0],
+        bark_f[:, 2] - bark_f[:, 1],
+    ])
+
     feats = np.column_stack([
         energy, energy_range, d_energy, zcr, centroid / 1000.0,
         rolloff / 1000.0, hf, lf, flux, voicing, f0 / 100.0,
-        formants, d_formants,
+        formants, d_formants, bark_diffs,
     ])
     return feats.astype(np.float32), times.astype(np.float32)
 
@@ -294,7 +405,7 @@ class ClassModel:
         z = (frames - mu) / sd
 
         n_feat = frames.shape[1]
-        n_cls = len(CLASSES)
+        n_cls = len(MODEL_CLASSES)
         means = np.zeros((n_cls, n_feat))
         variances = np.ones((n_cls, n_feat))
         log_prior = np.full(n_cls, -np.log(n_cls))
@@ -436,7 +547,7 @@ def align_tier(intervals, sound, model=None, duration_weight=1.0):
     model = model or ClassModel.load()
 
     labels = [lab for _, _, lab in intervals]
-    classes = np.array([CLASS_INDEX[classify(l)] for l in labels])
+    classes = np.array([MODEL_CLASS_INDEX[model_class(l)] for l in labels])
 
     frames, times = extract_features(sound)
     if frames.shape[0] < 2:

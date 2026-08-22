@@ -182,18 +182,34 @@ transformation.
 The method is a Viterbi decode of the phone sequence against per-frame acoustic
 likelihoods. The acoustic model covers seven broad manner classes -- silence,
 vowel, nasal, approximant, fricative, stop, affricate -- rather than individual
-phones, and phone labels are assigned to a class from their SAMPA symbol. No
-pronunciation dictionary is involved, because the phones are already given; and
-because the class table keys off SAMPA rather than any one language's inventory,
-the same model serves other languages.
+phones, and phone labels are assigned to a class from their SAMPA or IPA symbol.
+No pronunciation dictionary is involved, because the phones are already given;
+and because the class table keys off the symbol rather than any one language's
+inventory, the same model serves other languages.
 
-Seventeen features are computed every 10 ms: energy (both peak-relative and
+Vowels are split further, by height and fronting, giving 22 model classes in all.
+With a single vowel class nothing in the model changes across an /i/-/e/
+boundary, so the decoder has only the duration prior to place it by; separating
+qualities makes such a boundary a real class transition. The split is driven by
+the same IPA chart that supplies the CSV export's feature columns, so vowel
+quality has one definition in the application. A diphthong is one segment rather
+than two and takes the quality of its onset. Qualities absent from a language
+simply go untrained and act as uninformative fallbacks.
+
+Height and fronting are relative descriptions, and the features follow suit:
+alongside the absolute formants the model sees the distances between them on the
+Bark scale (F1-F0, F2-F1, F3-F2), which largely cancel vocal tract length and so
+describe vowel quality in terms comparable across speakers. Those relative
+features earn nothing on their own -- they only pay off once the model
+distinguishes vowel qualities at all.
+
+Twenty features are computed every 10 ms: energy (both peak-relative and
 normalised to the recording's own noise-floor-to-peak range), its delta,
 zero-crossing rate, spectral centroid, 85% rolloff, high- and low-frequency
-energy ratios, spectral flux, an autocorrelation voicing measure and F0, and the
-first three formants with their rates of change. The formant tracks are what
-separate a vowel from a neighbouring approximant, which differ little in energy
-or spectral shape.
+energy ratios, spectral flux, an autocorrelation voicing measure and F0, the
+first three formants with their rates of change, and the three Bark formant
+distances described above. The formant tracks are what separate a vowel from a
+neighbouring approximant, which differ little in energy or spectral shape.
 
 Crucially the result is applied as a **monotonic time warp** rather than as a set
 of boundaries. Every tier maps through one function, so boundaries that coincide
@@ -201,11 +217,11 @@ in the template still coincide afterwards -- identical inputs give identical
 outputs -- and their ordering cannot invert.
 
 Measured against 51 held-out hand-aligned recordings, median boundary error is
-12.7 ms, with 81% inside 50 ms and 90% inside 100 ms; laying the same sequence out
+12.5 ms, with 84% inside 50 ms and 92% inside 100 ms; laying the same sequence out
 by average phone durations without consulting the acoustics gives a median of
 633 ms. Accuracy varies by boundary type: onsets from a stop, fricative or
 affricate into a vowel land within about 5 ms, while vowel-to-vowel junctions
-average 52 ms because there is little acoustic discontinuity to find. The
+average 20 ms, having the least acoustic discontinuity to find. The
 alignment degrades gracefully when the template's phones do not match what was
 said: at a simulated 10% label error rate the median moves by under a
 millisecond, since errors stay local and the alignment re-synchronises at the

@@ -216,9 +216,9 @@ def test_alignable_tiers_empty_when_nothing_usable():
 
 def test_shipped_model_loads_and_matches_the_feature_set():
     model = ClassModel.load()
-    assert model.means.shape == (len(phone_aligner.CLASSES),
+    assert model.means.shape == (len(phone_aligner.MODEL_CLASSES),
                                  len(phone_aligner.FEATURE_NAMES))
-    assert model.min_frames.shape == (len(phone_aligner.CLASSES),)
+    assert model.min_frames.shape == (len(phone_aligner.MODEL_CLASSES),)
     assert np.all(model.min_frames >= 1)
 
 
@@ -226,7 +226,7 @@ def test_shipped_model_scores_frames():
     model = ClassModel.load()
     frames = np.zeros((5, len(phone_aligner.FEATURE_NAMES)), dtype=np.float32)
     ll = model.log_likelihood(frames)
-    assert ll.shape == (5, len(phone_aligner.CLASSES))
+    assert ll.shape == (5, len(phone_aligner.MODEL_CLASSES))
     assert np.all(np.isfinite(ll))
 
 
@@ -305,3 +305,94 @@ def test_warp_textgrid_keeps_arbitrary_tier_names_and_order():
         "Speaker A : words", "segmental", "notes"]
     assert [t.tier_class for t in out.tiers] == [
         "IntervalTier", "IntervalTier", "TextTier"]
+
+
+# ---------------------------------------------------------------------------
+# Vowel-quality sub-classes
+# ---------------------------------------------------------------------------
+
+from phone_aligner import (
+    MODEL_CLASSES, MODEL_CLASS_INDEX, UNKNOWN_QUALITY, VOWEL_FRONTINGS,
+    VOWEL_HEIGHTS, model_class, vowel_quality,
+)
+
+
+def test_manner_classification_is_unchanged_by_sub_classing():
+    """classify() stays the broad phonetic answer; only the model splits."""
+    assert classify("i") == classify("u") == classify("6") == VOWEL
+    assert classify("k") == STOP and classify("m") == NASAL
+
+
+@pytest.mark.parametrize("label,height,fronting", [
+    ("i", "high", "front"),
+    ("u", "high", "back"),
+    ("e", "mid-high", "front"),
+    ("o", "mid-high", "back"),
+    ("6", "mid-low", "centre"),
+    ("@", "mid", "centre"),
+    ("}", "high", "centre"),
+])
+def test_vowel_quality_from_the_chart(label, height, fronting):
+    assert vowel_quality(label) == (height, fronting)
+
+
+def test_vowel_quality_reads_ipa_as_well_as_sampa():
+    assert vowel_quality("\u0254") == ("mid-low", "back")
+    assert vowel_quality("\u025b") is not None
+
+
+def test_length_and_devoicing_do_not_change_quality():
+    assert vowel_quality("6:") == vowel_quality("6")
+    assert vowel_quality("6_0") == vowel_quality("6")
+
+
+def test_diphthong_takes_its_onset_quality():
+    """A diphthong is one segment, so it is classed by where it begins."""
+    assert vowel_quality("6i") == vowel_quality("6")
+    assert vowel_quality("6u") == vowel_quality("6")
+    assert model_class("6i") == model_class("6")
+
+
+def test_distinct_vowels_get_distinct_model_classes():
+    classes = {model_class(v) for v in ("i", "e", "6", "o", "u", "@", "}")}
+    assert len(classes) == 7
+
+
+def test_unknown_vowel_falls_back_to_its_own_class():
+    unknown = model_class("\u2603")
+    assert UNKNOWN_QUALITY in unknown
+    assert unknown in MODEL_CLASS_INDEX
+
+
+def test_non_vowels_are_not_sub_classed():
+    for label in ("k", "m", "f", "ts", "w", "<p:>", "-"):
+        assert model_class(label) == classify(label)
+
+
+def test_model_class_list_is_fixed_and_complete():
+    """The class list must not depend on any corpus, or a stored model would
+    stop lining up with the code that loads it."""
+    expected = ((len(phone_aligner.CLASSES) - 1)
+                + len(VOWEL_HEIGHTS) * len(VOWEL_FRONTINGS) + 1)
+    assert len(MODEL_CLASSES) == expected
+    assert len(set(MODEL_CLASSES)) == len(MODEL_CLASSES)
+    for label in ("i", "u", "6", "\u2603", "k", "<p:>"):
+        assert model_class(label) in MODEL_CLASS_INDEX
+
+
+def test_bark_difference_features_are_present():
+    for name in ("bark_f1_f0", "bark_f2_f1", "bark_f3_f2"):
+        assert name in phone_aligner.FEATURE_NAMES
+
+
+def test_bark_scale_is_monotonic_and_compresses_high_frequencies():
+    from phone_aligner import _bark
+    b = _bark(np.array([100.0, 500.0, 1000.0, 2000.0, 4000.0]))
+    assert np.all(np.diff(b) > 0)
+
+    # The same distance in Hz spans far fewer Bark higher up. That compression
+    # is what lets a formant difference mean the same thing for a small vocal
+    # tract as for a large one.
+    low = _bark(np.array([100.0, 1100.0]))
+    high = _bark(np.array([3000.0, 4000.0]))
+    assert (low[1] - low[0]) > 4 * (high[1] - high[0])
