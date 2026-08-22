@@ -122,6 +122,80 @@ enough editing to prepare extraction targets:
 The tier structure you build is what the CSV builder draws on; nothing about the annotation is
 hard-coded to particular tier names.
 
+- **Empty intervals**: a bare `-` marks an interval as deliberately empty and behaves exactly
+  like a blank one — extraction skips it, and it never becomes a row in the CSV. It is one
+  keypress, which matters when you are marking pauses across hundreds of files. Longer
+  conventions such as `<p:>` still work as ordinary labels.
+
+### 4.1 Templates — one annotation reused across a corpus
+
+A corpus is often many recordings of the same material: the same phrase, read by many
+speakers. Rebuilding the same tiers and typing the same labels for each one is wasted effort,
+so **File → New TextGrid from Template...** builds a grid for the open recording out of an
+existing TextGrid.
+
+Templates are ordinary TextGrid files. Any annotation you have already made can serve as one,
+and **File → Save TextGrid As...** is all it takes to create a template; there is no separate
+format, and Praat can open and edit them like anything else. Keeping one per project —
+`project1_template.TextGrid` — is usually enough.
+
+A template carries whatever tiers you gave it, in order, and may carry labels as well as
+structure. For repeated utterances that is the point: put the phoneme sequence of the phrase
+into the template once, and every recording starts with the words and phones already written,
+leaving you to place boundaries rather than retype the script.
+
+When a template has labels you are asked how to carry them over:
+
+| Choice | What happens |
+|--------|--------------|
+| **Align to acoustics** | Boundaries placed by forced alignment against this recording (§4.2) |
+| **Scale labels** | Every time is scaled proportionally to the new recording's duration |
+| **Tiers only** | Tier names, types and order are reproduced, with no labels |
+
+The result is left **unsaved and unnamed**, so the first save prompts for a filename instead of
+writing back over the template.
+
+Two related safeguards apply whenever a grid comes from elsewhere. Saving a TextGrid whose name
+does not match the open audio file offers *Save As...* rather than silently overwriting the
+annotation it came from. And a grid whose time domain does not match the recording is
+reconciled on load: a short one is extended, and a long one is trimmed — with your confirmation
+if that would discard annotation past the end of the audio, since such labels are invisible
+here yet would still be saved and picked up by extraction.
+
+### 4.2 First-pass forced alignment
+
+Scaling a template's labels proportionally puts boundaries roughly where the phrase would fall
+if the speaker had kept an even pace, which is to say not very close: on our material the
+average word boundary landed the better part of a second from where it belonged. Choosing
+**Align to acoustics** instead places them from the recording itself.
+
+You nominate the tier carrying phone labels; the list is ordered by a guess at which tier is
+most phone-like, but the choice is yours and any interval tier may be used. Every other tier is
+carried along by the same transformation, so tiers that were time-aligned with each other in
+the template stay time-aligned afterwards — that relationship is preserved by construction, not
+by anything you need to check.
+
+Because the phones are given, **no pronunciation dictionary is involved**; labels are read as
+either SAMPA or IPA, and any symbol not recognised is reported before alignment runs rather
+than quietly guessed at. The acoustic model describes broad manner classes with vowels split by
+height and fronting, so it is not tied to any one language, though it has so far only been
+validated on te reo Māori.
+
+**What to expect.** Measured against hand-aligned recordings the aligner had not seen, the
+median boundary lands 12.5 ms from where a human placed it, with 84% inside 50 ms. Accuracy
+depends on what kind of boundary it is: onsets from a stop, fricative or affricate into a vowel
+are acoustically sharp and land within about 5 ms, while a junction between two vowels has far
+less discontinuity to find and averages around 20 ms. Errors stay local when the speaker
+departs from the script — at a simulated 10% rate of wrong labels the median barely moved,
+because the alignment re-synchronises at the next pause.
+
+**What not to expect.** This is a first pass, and it is always left unsaved for that reason. It
+cannot rescue a recording whose audio does not match its transcription — if the speaker read
+something else, the aligner will confidently place labels that were never spoken, as any forced
+aligner would. Very noisy recordings, particularly ones with a compressed dynamic range, are
+the other case where it can fail outright rather than merely imprecisely. Check the result by
+eye and ear as you would any first pass.
+
 ---
 
 ## 5. Spectral analysis (consonants)
