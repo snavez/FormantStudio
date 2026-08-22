@@ -118,6 +118,22 @@ ZOOM_FACTOR = 1.3              # per scroll wheel notch
 # marker.
 DRAG_START_PX = 5.0
 
+# Labels that mark an interval as deliberately empty rather than unannotated.
+# A bare "-" is one keypress, so a pause or a gap can be marked without the
+# typo risk of a longer convention.
+EMPTY_LABEL_MARKERS = frozenset({"-"})
+
+
+def is_empty_label(text):
+    """True if *text* leaves an interval empty rather than labelling it.
+
+    Blank text and any marker in :data:`EMPTY_LABEL_MARKERS` count, so an
+    interval the annotator deliberately marked empty behaves exactly like one
+    they have not filled in.
+    """
+    return text.strip() in EMPTY_LABEL_MARKERS or not text.strip()
+
+
 # Tolerance for comparing TextGrid times, in seconds.  Boundaries that agree
 # to within this are treated as identical, absorbing float round-trip noise.
 TIME_EPS = 1e-6
@@ -1046,7 +1062,7 @@ def _classify_label(label, chart_lookup, notation, known_vowels):
     Returns ``(properties_dict, modifiers_list, matched_bool)``.
     """
     label = label.strip()
-    if not label:
+    if is_empty_label(label):
         return {}, [], True
 
     # Exact lookup
@@ -1217,7 +1233,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             ivs = primary_tier.intervals
             units = []
             for i, iv in enumerate(ivs):
-                if not iv.text.strip():
+                if is_empty_label(iv.text):
                     continue
                 prev = ivs[i - 1].text if i > 0 else ""
                 nxt = ivs[i + 1].text if i + 1 < len(ivs) else ""
@@ -1256,7 +1272,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 tier = tmap.get(segment_tier_name)
                 if tier is not None and tier.tier_class == "IntervalTier":
                     for iv in tier.intervals:
-                        if iv.text.strip():
+                        if not is_empty_label(iv.text):
                             d = iv.xmax - iv.xmin
                             if d > max_dur_s:
                                 max_dur_s = d
@@ -1480,11 +1496,11 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     cols.append(iv.text)
                 else:
                     civ = _find_containing_interval(t, iv.xmin, iv.xmax)
-                    if civ is not None and civ.text.strip():
+                    if civ is not None and not is_empty_label(civ.text):
                         cols.append(civ.text)
                     else:
                         kids = [k.text for k in t.intervals
-                                if k.text.strip()
+                                if not is_empty_label(k.text)
                                 and k.xmin >= iv.xmin - TIME_EPS
                                 and k.xmax <= iv.xmax + TIME_EPS]
                         cols.append("; ".join(kids))
@@ -1549,7 +1565,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             if civ is None:
                 civ = _find_containing_interval_for_point(
                     t, (iv.xmin + iv.xmax) / 2)
-            if civ is None or not civ.text.strip():
+            if civ is None or is_empty_label(civ.text):
                 return None
             return civ
 
@@ -3082,8 +3098,10 @@ class SpectrogramCanvas(QWidget):
                     right_idx = i
             if left_idx is not None and right_idx is not None:
                 # Merge labels from both sides of the deleted boundary
-                left_text = tier.intervals[left_idx].text.strip()
-                right_text = tier.intervals[right_idx].text.strip()
+                left = tier.intervals[left_idx].text
+                right = tier.intervals[right_idx].text
+                left_text = "" if is_empty_label(left) else left.strip()
+                right_text = "" if is_empty_label(right) else right.strip()
                 if left_text and right_text:
                     merged = f"{left_text} {right_text}"
                 else:
@@ -4840,7 +4858,8 @@ class _TierSelectionPage(QWizardPage):
         default_primary = 0
         for idx, tier in enumerate(tg.tiers):
             kind = "Interval" if tier.tier_class == "IntervalTier" else "Point"
-            n = (len([iv for iv in tier.intervals if iv.text.strip()])
+            n = (len([iv for iv in tier.intervals
+                      if not is_empty_label(iv.text)])
                  if tier.tier_class == "IntervalTier"
                  else len(tier.points))
             self._primary_combo.addItem(

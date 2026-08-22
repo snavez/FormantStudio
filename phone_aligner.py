@@ -54,8 +54,10 @@ _AFFRS = {"ts", "dz", "tS", "dZ", "kC", "pf",
 
 # Markers for silence. Matched case-insensitively, and an empty label always
 # counts, since that is the one convention every annotation tool shares.
-PAUSE_LABELS = {"", "<p:>", "<p>", "sil", "sp", "sp:", "#", "_", "pau", "pause",
-                "silence", "<sil>", "<silence>", "<pause>", "sil.", "-",
+# Markers for silence, matched case-insensitively. A bare "-" is the app's own
+# empty-interval marker; the rest cover conventions from other tools.
+PAUSE_LABELS = {"", "-", "<p:>", "<p>", "sil", "sp", "sp:", "#", "_", "pau",
+                "pause", "silence", "<sil>", "<silence>", "<pause>", "sil.",
                 "<eps>", "spn", "<unk>"}
 
 _DIACRITICS = ("_h", "_0", "_j", "_w", "_t", "_d", "_n", "_G")

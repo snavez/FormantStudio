@@ -260,3 +260,57 @@ def test_default_save_path_follows_the_audio_file():
 
 def test_default_save_path_empty_without_audio():
     assert _PathHolder(None, None)._default_textgrid_path() == ""
+
+
+# ---------------------------------------------------------------------------
+# The "-" empty-interval marker
+# ---------------------------------------------------------------------------
+
+from formant_editor import EMPTY_LABEL_MARKERS, is_empty_label
+
+
+@pytest.mark.parametrize("text", ["-", "", "   ", " - ", "\t-\n"])
+def test_marker_and_blanks_are_empty(text):
+    assert is_empty_label(text)
+
+
+@pytest.mark.parametrize("text", ["6", "k", "<p:>", "-a", "a-", "a-b", "--"])
+def test_real_labels_are_not_empty(text):
+    """Only a bare marker counts; hyphens inside a label are part of it."""
+    assert not is_empty_label(text)
+
+
+def test_marker_does_not_clash_with_the_pause_convention():
+    """<p:> stays a real label to the editor, so existing data is unaffected."""
+    assert "-" in EMPTY_LABEL_MARKERS
+    assert "<p:>" not in EMPTY_LABEL_MARKERS
+    assert not is_empty_label("<p:>")
+
+
+def test_marker_reads_as_silence_to_the_aligner():
+    import phone_aligner
+    assert phone_aligner.is_pause("-")
+    assert phone_aligner.classify("-") == phone_aligner.SIL
+
+
+def test_marked_intervals_survive_a_save_and_reload(tmp_path):
+    path = tmp_path / "marked.TextGrid"
+    TextGrid(0, 3.0, [
+        Tier("phones", "IntervalTier", 0, 3.0, intervals=[
+            Interval(0.0, 1.0, "k"), Interval(1.0, 2.0, "-"),
+            Interval(2.0, 3.0, "o")]),
+    ]).save(str(path))
+
+    reloaded = TextGrid.from_file(str(path))
+    labels = [iv.text for iv in reloaded.tiers[0].intervals]
+    assert labels == ["k", "-", "o"]
+    assert [is_empty_label(l) for l in labels] == [False, True, False]
+
+
+def test_marker_survives_template_instantiation():
+    src = TextGrid(0, 4.0, [
+        Tier("phones", "IntervalTier", 0, 4.0, intervals=[
+            Interval(0.0, 2.0, "k"), Interval(2.0, 4.0, "-")]),
+    ])
+    tg = TextGrid.from_template(src, 8.0)
+    assert [iv.text for iv in tg.tiers[0].intervals] == ["k", "-"]
