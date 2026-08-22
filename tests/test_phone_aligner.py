@@ -396,3 +396,38 @@ def test_bark_scale_is_monotonic_and_compresses_high_frequencies():
     low = _bark(np.array([100.0, 1100.0]))
     high = _bark(np.array([3000.0, 4000.0]))
     assert (low[1] - low[0]) > 4 * (high[1] - high[0])
+
+
+def test_chart_and_model_resolve_inside_a_bundle(tmp_path, monkeypatch):
+    """Frozen builds resolve data files against sys._MEIPASS.
+
+    A chart the aligner cannot find is not an error — every vowel quietly
+    becomes the unknown quality — so the failure would only show as worse
+    alignment. Worth asserting rather than trusting.
+    """
+    import shutil
+    root = os.path.join(os.path.dirname(__file__), "..")
+    (tmp_path / "Docs").mkdir()
+    shutil.copy(os.path.join(root, "Docs", "ipa_symbol_chart.csv"),
+                str(tmp_path / "Docs"))
+    shutil.copy(os.path.join(root, "phone_class_model.npz"), str(tmp_path))
+
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    monkeypatch.setattr(phone_aligner, "_vowel_quality_cache", None)
+
+    assert phone_aligner.default_model_path().startswith(str(tmp_path))
+    assert ClassModel.load().means.shape == (len(MODEL_CLASSES),
+                                             len(phone_aligner.FEATURE_NAMES))
+    assert UNKNOWN_QUALITY not in model_class("i")
+    assert model_class("i") != model_class("u")
+
+
+def test_missing_chart_degrades_without_raising(tmp_path, monkeypatch):
+    """No chart must mean uninformative vowels, not a crash mid-alignment."""
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    monkeypatch.setattr(phone_aligner, "_vowel_quality_cache", None)
+
+    assert vowel_quality("i") is None
+    assert model_class("i") in MODEL_CLASS_INDEX
+    assert UNKNOWN_QUALITY in model_class("i")
+    assert model_class("k") == STOP
