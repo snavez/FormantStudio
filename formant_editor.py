@@ -5005,36 +5005,66 @@ class _TierSelectionPage(QWizardPage):
         wiz = self.wizard()
         tg_dir = wiz.textgrid_dir
 
-        tg_file = None
-        for f in sorted(os.listdir(tg_dir)):
-            if f.lower().endswith(".textgrid"):
-                tg_file = os.path.join(tg_dir, f)
-                break
-        if tg_file is None:
-            self._primary_combo.blockSignals(False)
-            return
-        try:
-            tg = TextGrid.from_file(tg_file)
-        except Exception as e:
-            self._example_label.setText(f"Error reading TextGrid: {e}")
+        files = [os.path.join(tg_dir, f) for f in sorted(os.listdir(tg_dir))
+                 if f.lower().endswith(".textgrid")]
+        if not files:
             self._primary_combo.blockSignals(False)
             return
 
-        wiz.example_textgrid = tg
-        self._example_label.setText(
-            f"Example TextGrid: {os.path.basename(tg_file)} "
-            f"({len(tg.tiers)} tiers)")
+        # The tiers on offer come from one file, so check the rest agree
+        # rather than discovering at build time that half the corpus was
+        # skipped for want of the primary tier.
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            first, first_file, signature = None, None, None
+            differing, unreadable = [], []
+            for path in files:
+                try:
+                    tg = TextGrid.from_file(path)
+                except Exception:
+                    unreadable.append(os.path.basename(path))
+                    continue
+                sig = tuple((t.name, t.tier_class) for t in tg.tiers)
+                if first is None:
+                    first, first_file, signature = tg, os.path.basename(path), sig
+                elif sig != signature:
+                    differing.append(os.path.basename(path))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if first is None:
+            self._example_label.setText(
+                f"No readable TextGrid among {len(files)} files")
+            self._primary_combo.blockSignals(False)
+            return
+
+        wiz.example_textgrid = first
+        checked = len(files) - len(unreadable)
+        summary = (f"Tiers from {first_file} — {checked} TextGrid"
+                   f"{'s' if checked != 1 else ''} checked")
+        if unreadable:
+            summary += f", {len(unreadable)} unreadable"
+        if differing:
+            shown = ", ".join(differing[:3])
+            if len(differing) > 3:
+                shown += f" and {len(differing) - 3} more"
+            noun = "file has" if len(differing) == 1 else "files have"
+            summary += (f"\n⚠  {len(differing)} {noun} different tiers: "
+                        f"{shown}. Skipped at build time.")
+            self._example_label.setStyleSheet("color: #aa3300;")
+        else:
+            self._example_label.setStyleSheet("")
+        self._example_label.setText(summary)
 
         # Tiers in TextGrid file order — reflects how the annotation was built
         default_primary = 0
-        for idx, tier in enumerate(tg.tiers):
+        for idx, tier in enumerate(first.tiers):
             kind = "Interval" if tier.tier_class == "IntervalTier" else "Point"
             n = (len([iv for iv in tier.intervals
                       if not is_empty_label(iv.text)])
                  if tier.tier_class == "IntervalTier"
                  else len(tier.points))
-            self._primary_combo.addItem(
-                f"{tier.name}  [{kind}]", tier.name)
+            self._primary_combo.addItem(f"{tier.name}  [{kind}]", tier.name)
             item = QListWidgetItem(f"{tier.name}  [{kind}, {n} items]")
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked)
@@ -7599,15 +7629,10 @@ class MainWindow(QMainWindow):
         if wizard.exec() != QDialog.DialogCode.Accepted:
             return
 
-        # Resolve selected tiers to Tier objects from the example TextGrid
-        # (used only for hierarchy info; each file's tiers are looked up fresh)
-        tg = wizard.example_textgrid
-        selected_tiers = []
-        for name, tc in wizard.selected_tier_info:
-            for t in tg.tiers:
-                if t.name == name and t.tier_class == tc:
-                    selected_tiers.append(t)
-                    break
+        # Only the name and class matter here — each file's tiers are looked
+        # up fresh — so a tier need not appear in any one particular file.
+        selected_tiers = [Tier(name, tc, 0, 0)
+                          for name, tc in wizard.selected_tier_info]
 
         if not selected_tiers:
             QMessageBox.warning(self, "Error", "No valid tiers selected.")
