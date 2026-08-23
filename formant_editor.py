@@ -1149,6 +1149,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     spectral_min_window_ms=MIN_SPECTRAL_WINDOW_MS,
                     spectral_win_max_ms=PROP_SPECTRAL_WIN_MAX_MS,
                     include_prev_segment=False, include_next_segment=False,
+                    context_tier_name=None,
                     categorise=False, cat_chart=None,
                     cat_notation="ipa", cat_tier_names=None,
                     cat_vowel_props=None, cat_consonant_props=None,
@@ -1330,6 +1331,34 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                                   rec.kind, rec.realised))
         return units
 
+    def _context_labels(unit, tier):
+        """Labels of the segments either side of *unit* on *tier*.
+
+        Sounds that were never produced are stepped over: an arrow marks a
+        phoneme with no segment of its own, so treating it as context would
+        report a neighbour the speaker never uttered. A pause is kept, since
+        silence really did occur there.
+        """
+        ivs = tier.intervals
+        mid = (unit.xmin + unit.xmax) / 2.0
+        here = None
+        for i, iv in enumerate(ivs):
+            if iv.xmin - TIME_EPS <= mid <= iv.xmax + TIME_EPS:
+                here = i
+                break
+        if here is None:
+            return "", ""
+
+        def _walk(step):
+            i = here + step
+            while 0 <= i < len(ivs):
+                if not divergence.is_arrow(ivs[i].text):
+                    return ivs[i].text
+                i += step
+            return ""
+
+        return _walk(-1), _walk(1)
+
     # --- Build header ---
     headers = ["filename"]
 
@@ -1349,10 +1378,11 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
 
     # Flanking-segment context columns (labels of the adjacent units on the
     # primary tier)
+    context_name = context_tier_name or primary_tier_name
     if include_prev_segment:
-        headers.append(f"{primary_tier_name}_prev")
+        headers.append(f"{context_name}_prev")
     if include_next_segment:
-        headers.append(f"{primary_tier_name}_next")
+        headers.append(f"{context_name}_next")
 
     # A point primary contributes its own time column (a point has no
     # width, so a single time replaces start/end bounds). Interval-primary
@@ -1824,15 +1854,24 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             row = [audio_file] + lc
             if reconcile_allophone_tier:
                 row.append(unit.alignment or "")
-                if unit.alignment == divergence.DELETION:
-                    # Expected but not produced: there is no signal belonging
-                    # to it, so every measurement column stays empty.
-                    rows.append(row + [""] * (len(headers) - len(row)))
-                    continue
-            if include_prev_segment:
-                row.append(unit.prev)
-            if include_next_segment:
-                row.append(unit.next)
+
+            if include_prev_segment or include_next_segment:
+                ctier = tier_map.get(context_name)
+                if ctier is not None and ctier.tier_class == "IntervalTier":
+                    prev, nxt = _context_labels(unit, ctier)
+                else:
+                    prev, nxt = unit.prev, unit.next
+                if include_prev_segment:
+                    row.append(prev)
+                if include_next_segment:
+                    row.append(nxt)
+
+            if unit.alignment == divergence.DELETION:
+                # Expected but not produced: there is no signal belonging to
+                # it, so every measurement column stays empty. Its labels and
+                # its context are still worth having.
+                rows.append(row + [""] * (len(headers) - len(row)))
+                continue
             if primary_is_point:
                 row.append(f"{unit.xmin:.4f}")
 
@@ -5152,21 +5191,37 @@ class _DataOptionsPage(QWizardPage):
         scroll.setWidget(container)
         layout = QVBoxLayout(container)
 
-        # --- Segment context (flanking labels from the primary tier) ---
-        ctx_group = QGroupBox("Segment context (from primary tier)")
+        # --- Segment context (flanking labels) ---
+        ctx_group = QGroupBox("Segment context")
         ctx_layout = QVBoxLayout(ctx_group)
         self._prev_seg_cb = QCheckBox("Include preceding segment label")
         self._prev_seg_cb.setToolTip(
-            "Adds a <primary>_prev column: the label of the segment "
-            "immediately before each row on the primary tier (blank at a "
-            "recording edge or a pause).")
+            "Adds a <tier>_prev column: the label of the segment immediately "
+            "before each row on the tier chosen below.")
         self._next_seg_cb = QCheckBox("Include following segment label")
         self._next_seg_cb.setToolTip(
-            "Adds a <primary>_next column: the label of the segment "
-            "immediately after each row on the primary tier (blank at a "
-            "recording edge or a pause).")
+            "Adds a <tier>_next column: the label of the segment immediately "
+            "after each row on the tier chosen below.")
         ctx_layout.addWidget(self._prev_seg_cb)
         ctx_layout.addWidget(self._next_seg_cb)
+
+        ctx_form = QFormLayout()
+        self._context_tier_combo = QComboBox()
+        self._context_tier_combo.setToolTip(
+            "Which tier the neighbouring labels are read from. A tier of "
+            "what was expected gives the canonical context; a tier of what "
+            "was produced gives what the speaker actually said either side. "
+            "Sounds marked as not produced are stepped over.")
+        ctx_form.addRow("Read context from:", self._context_tier_combo)
+        ctx_layout.addLayout(ctx_form)
+
+        def _sync_ctx():
+            on = self._prev_seg_cb.isChecked() or self._next_seg_cb.isChecked()
+            self._context_tier_combo.setEnabled(on)
+        self._prev_seg_cb.toggled.connect(_sync_ctx)
+        self._next_seg_cb.toggled.connect(_sync_ctx)
+        _sync_ctx()
+
         layout.addWidget(ctx_group)
 
         # --- Formants ---
@@ -5611,6 +5666,7 @@ class _DataOptionsPage(QWizardPage):
         self._point_tier_combo.clear()
         self._seg_tier_combo.clear()
         self._reconcile_combo.clear()
+        self._context_tier_combo.clear()
 
         # Clear duration checkboxes
         for dur_cb, bounds_cb, _ in self._dur_checks:
@@ -5629,6 +5685,7 @@ class _DataOptionsPage(QWizardPage):
                 self._seg_tier_combo.addItem(name)
                 self._spectral_tier_combo.addItem(name)
                 self._reconcile_combo.addItem(name)
+                self._context_tier_combo.addItem(name)
                 dur_cb = QCheckBox(name)
                 dur_cb.setChecked(True)
                 bounds_cb = QCheckBox("+ start/end times")
@@ -5648,6 +5705,11 @@ class _DataOptionsPage(QWizardPage):
                 continue
             idx = combo.findText(primary) if primary else -1
             combo.setCurrentIndex(idx if idx >= 0 else combo.count() - 1)
+
+        # Context has always come from the primary tier, so start there.
+        idx = self._context_tier_combo.findText(primary) if primary else -1
+        if idx >= 0:
+            self._context_tier_combo.setCurrentIndex(idx)
 
         # The produced-sounds tier is read against the primary one, so it must
         # be a different tier; start on the first that is.
@@ -5745,6 +5807,8 @@ class _DataOptionsPage(QWizardPage):
         wiz.extract_trajectory = spectral_on and self._traj_cb.isChecked()
         wiz.include_prev_segment = self._prev_seg_cb.isChecked()
         wiz.include_next_segment = self._next_seg_cb.isChecked()
+        wiz.context_tier_name = (self._context_tier_combo.currentText()
+                                 or None)
 
         if spectral_on and not (wiz.extract_spectral
                                 or wiz.extract_trajectory):
@@ -6641,6 +6705,7 @@ class BuildCSVWizard(QWizard):
         self.extract_durations = False
         self.duration_tier_names = []
         self.reconcile_allophone_tier = None
+        self.context_tier_name = None
         self.bounds_tier_names = []
         self.include_prev_segment = False
         self.include_next_segment = False
@@ -7696,6 +7761,7 @@ class MainWindow(QMainWindow):
                 selected_tiers=selected_tiers,
                 primary_tier_name=wizard.primary_tier_name,
                 reconcile_allophone_tier=wizard.reconcile_allophone_tier,
+                context_tier_name=wizard.context_tier_name,
                 extract_formants=wizard.extract_formants,
                 formant_mode=wizard.formant_mode,
                 point_tier_name=wizard.point_tier_name,
@@ -7898,6 +7964,8 @@ class MainWindow(QMainWindow):
                     "produced_tier": wizard.reconcile_allophone_tier,
                 } if wizard.reconcile_allophone_tier else None,
                 "segment_context": {
+                    "tier": (wizard.context_tier_name
+                             or wizard.primary_tier_name),
                     "preceding": wizard.include_prev_segment,
                     "following": wizard.include_next_segment,
                 },
