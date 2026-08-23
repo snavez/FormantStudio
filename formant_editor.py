@@ -956,8 +956,13 @@ def dct_coefficients(track, n_coeffs, norm=TRAJ_DCT_NORM):
 # is a zero-width unit (xmin == xmax == time, text == mark). prev/next hold
 # the immediately adjacent unit's label on the primary tier ("" at an edge
 # or an unlabelled neighbour), for optional context columns.
+# *alignment* is None unless the phoneme and allophone tiers were reconciled;
+# a unit whose alignment is "deletion" describes a sound that was not produced,
+# so it has labels but nothing to measure.
 _RowUnit = namedtuple(
-    "_RowUnit", ["xmin", "xmax", "text", "is_point", "prev", "next"])
+    "_RowUnit", ["xmin", "xmax", "text", "is_point", "prev", "next",
+                 "alignment", "realised"])
+_RowUnit.__new__.__defaults__ = (None, None)
 
 
 def _get_formant_at_time(fd, time_s):
@@ -1120,6 +1125,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     percentage_markers, extract_durations,
                     duration_tier_names, bounds_tier_names=None,
                     primary_tier_name=None,
+                    reconcile_allophone_tier=None,
                     progress_callback=None,
                     include_point_times=False,
                     time_step_ms=None,
@@ -1297,6 +1303,33 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     if do_at_points:
         max_targets = max(1, max_targets)
 
+    def _reconciled_units(primary, allophone_tier):
+        """Row units from a phoneme tier read against an allophone tier.
+
+        One unit per expected sound. A sound that survived a coalescence is
+        given the whole span it was realised over rather than its own interval;
+        one that was not produced keeps its interval so its labels still
+        resolve, but is marked so nothing is measured for it.
+        """
+        ivs = primary.intervals
+        records = divergence.resolve(
+            [(iv.xmin, iv.xmax, iv.text) for iv in ivs],
+            [(iv.xmin, iv.xmax, iv.text) for iv in allophone_tier.intervals])
+
+        units = []
+        for i, rec in enumerate(records):
+            if rec.kind in (divergence.NOT_ANALYSED, divergence.UNANNOTATED):
+                continue
+            prev = ivs[i - 1].text if i > 0 else ""
+            nxt = ivs[i + 1].text if i + 1 < len(ivs) else ""
+            if rec.kind == divergence.DELETION:
+                xmin, xmax = ivs[i].xmin, ivs[i].xmax
+            else:
+                xmin, xmax = rec.xmin, rec.xmax
+            units.append(_RowUnit(xmin, xmax, ivs[i].text, False, prev, nxt,
+                                  rec.kind, rec.realised))
+        return units
+
     # --- Build header ---
     headers = ["filename"]
 
@@ -1309,6 +1342,10 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     point_tier_names = [t.name for t in selected_tiers
                         if t.tier_class == "TextTier"]
     headers.extend(point_tier_names)
+
+    # How each expected sound turned out, when the tiers were reconciled
+    if reconcile_allophone_tier:
+        headers.append("alignment")
 
     # Flanking-segment context columns (labels of the adjacent units on the
     # primary tier)
@@ -1472,7 +1509,28 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     audio_file,
                     f"primary tier '{primary_tier_name}' not in this TextGrid"))
             continue
-        units = _units_for(primary)
+        if reconcile_allophone_tier:
+            allo = tier_map.get(reconcile_allophone_tier)
+            if allo is None:
+                if skipped_files is not None:
+                    skipped_files.append((
+                        audio_file,
+                        f"allophone tier '{reconcile_allophone_tier}' not in "
+                        "this TextGrid"))
+                continue
+            problems = divergence.validate(
+                [(iv.xmin, iv.xmax, iv.text) for iv in primary.intervals],
+                [(iv.xmin, iv.xmax, iv.text) for iv in allo.intervals])
+            if problems:
+                if skipped_files is not None:
+                    skipped_files.append((
+                        audio_file,
+                        f"{primary_tier_name} and {reconcile_allophone_tier} "
+                        f"do not reconcile: {problems[0]}"))
+                continue
+            units = _reconciled_units(primary, allo)
+        else:
+            units = _units_for(primary)
 
         # Resolve point tier for at-points formant extraction
         at_pt_tier = None
@@ -1495,6 +1553,9 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     cols.append("")
                 elif t_name == primary_tier_name:
                     cols.append(iv.text)
+                elif (t_name == reconcile_allophone_tier
+                      and iv.realised is not None):
+                    cols.append(iv.realised)
                 else:
                     civ = _find_containing_interval(t, iv.xmin, iv.xmax)
                     if civ is not None and not is_empty_label(civ.text):
@@ -1761,6 +1822,13 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         for unit in units:
             lc = _label_cols(unit)
             row = [audio_file] + lc
+            if reconcile_allophone_tier:
+                row.append(unit.alignment or "")
+                if unit.alignment == divergence.DELETION:
+                    # Expected but not produced: there is no signal belonging
+                    # to it, so every measurement column stays empty.
+                    rows.append(row + [""] * (len(headers) - len(row)))
+                    continue
             if include_prev_segment:
                 row.append(unit.prev)
             if include_next_segment:
@@ -3181,6 +3249,72 @@ class SpectrogramCanvas(QWidget):
     # -------------------------------------------------------------------
     # Interval/point selection
     # -------------------------------------------------------------------
+
+    def visible_tier_indices(self):
+        """Indices of the tiers currently shown, in display order."""
+        if self.textgrid_data is None:
+            return []
+        return [i for i in range(len(self.textgrid_data.tiers))
+                if i not in self.hidden_tiers]
+
+    def step_active_tier(self, delta):
+        """Move the active tier *delta* places through the visible tiers."""
+        visible = self.visible_tier_indices()
+        if not visible:
+            return None
+        if self._active_tier in visible:
+            pos = visible.index(self._active_tier) + delta
+            pos = max(0, min(len(visible) - 1, pos))
+        else:
+            pos = 0
+        self._active_tier = visible[pos]
+        self._clear_selection()
+        self.render()
+        return self.textgrid_data.tiers[self._active_tier].name
+
+    def step_selection(self, delta):
+        """Select the interval *delta* places along the active tier.
+
+        With nothing selected yet this starts from whatever is at the centre
+        of the view, so the keyboard picks up where the eye already is.
+        """
+        if self.textgrid_data is None or self._active_tier is None:
+            return None
+        tier = self.textgrid_data.tiers[self._active_tier]
+        if tier.tier_class != "IntervalTier" or not tier.intervals:
+            return None
+
+        if (self._selected_interval is not None
+                and self._selected_interval[0] == self._active_tier):
+            index = self._selected_interval[1] + delta
+        else:
+            centre = (self.view_start + self.view_end) / 2.0
+            index = 0
+            for i, iv in enumerate(tier.intervals):
+                if iv.xmin <= centre <= iv.xmax:
+                    index = i
+                    break
+            else:
+                index = 0 if delta > 0 else len(tier.intervals) - 1
+                delta = 0
+            index += delta
+
+        index = max(0, min(len(tier.intervals) - 1, index))
+        iv = tier.intervals[index]
+        self._select_interval(self._active_tier, (iv.xmin + iv.xmax) / 2.0)
+        self.scroll_into_view(iv.xmin, iv.xmax)
+        self._draw_selection_overlay()
+        return iv
+
+    def scroll_into_view(self, xmin, xmax):
+        """Shift the view so [xmin, xmax] is visible, keeping its width."""
+        if xmin >= self.view_start and xmax <= self.view_end:
+            return False
+        width = self.view_end - self.view_start
+        centre = (xmin + xmax) / 2.0
+        start = max(0.0, min(self.total_duration - width, centre - width / 2.0))
+        self.set_view(start, start + width)
+        return True
 
     def _select_interval(self, tier_idx, click_time):
         """Select the interval or point containing/nearest to click_time."""
@@ -5079,6 +5213,30 @@ class _DataOptionsPage(QWizardPage):
         self._dur_group.setVisible(False)
         self._dur_cb.toggled.connect(self._dur_group.setVisible)
 
+        # --- Reconcile expected against produced ---
+        self._reconcile_cb = QCheckBox(
+            "Reconcile phonemic and allophonic transcriptions")
+        self._reconcile_cb.setToolTip(
+            "Read the primary tier against a tier of what was actually "
+            "produced. Adds an 'alignment' column saying whether each sound "
+            "was a match, a substitution, an insertion or a deletion, and "
+            "measures a sound that absorbed a neighbour over the whole span "
+            "it was realised across.")
+        layout.addWidget(self._reconcile_cb)
+
+        self._reconcile_group = QGroupBox("Produced sounds")
+        rec_form = QFormLayout(self._reconcile_group)
+        self._reconcile_combo = QComboBox()
+        rec_form.addRow("Allophone tier:", self._reconcile_combo)
+        self._reconcile_note = QLabel(
+            "The expected sounds come from the primary tier. Sounds that were "
+            "not\nproduced are reported but carry no measurements.")
+        self._reconcile_note.setStyleSheet("color: #666666; font-size: 11px;")
+        rec_form.addRow(self._reconcile_note)
+        layout.addWidget(self._reconcile_group)
+        self._reconcile_group.setVisible(False)
+        self._reconcile_cb.toggled.connect(self._reconcile_group.setVisible)
+
         # --- Spectral data: shared settings, then two sub-analyses ---
         self._spectral_data_cb = QCheckBox("Extract spectral data")
         self._spectral_data_cb.setToolTip(
@@ -5422,6 +5580,10 @@ class _DataOptionsPage(QWizardPage):
         # Populate combos
         self._point_tier_combo.clear()
         self._seg_tier_combo.clear()
+        self._reconcile_combo.clear()
+        self._reconcile_combo.addItems(
+            [t.name for t in tg.tiers if t.tier_class == "IntervalTier"])
+
         # Clear duration checkboxes
         for dur_cb, bounds_cb, _ in self._dur_checks:
             self._dur_layout.removeWidget(dur_cb)
@@ -5524,6 +5686,23 @@ class _DataOptionsPage(QWizardPage):
 
         wiz.extract_formants = self._fmt_cb.isChecked()
         wiz.extract_durations = self._dur_cb.isChecked()
+
+        wiz.reconcile_allophone_tier = None
+        if self._reconcile_cb.isChecked():
+            allophone = self._reconcile_combo.currentText()
+            if not allophone:
+                QMessageBox.warning(
+                    self, "Reconciliation",
+                    "Choose the tier holding the sounds that were produced.")
+                return False
+            if allophone == wiz.primary_tier_name:
+                QMessageBox.warning(
+                    self, "Reconciliation",
+                    "The expected and produced tiers must be different.\n\n"
+                    f"The primary tier is '{wiz.primary_tier_name}', so pick "
+                    "a different tier for what was produced.")
+                return False
+            wiz.reconcile_allophone_tier = allophone
         # Both spectral analyses hang off the shared parent
         spectral_on = self._spectral_data_cb.isChecked()
         wiz.extract_spectral = spectral_on and self._spectral_cb.isChecked()
@@ -6425,6 +6604,7 @@ class BuildCSVWizard(QWizard):
         self.time_step_ms = None
         self.extract_durations = False
         self.duration_tier_names = []
+        self.reconcile_allophone_tier = None
         self.bounds_tier_names = []
         self.include_prev_segment = False
         self.include_next_segment = False
@@ -6953,6 +7133,32 @@ class MainWindow(QMainWindow):
                 event.accept()
                 return
 
+        # Arrow keys — step between intervals and between tiers. Skipped while
+        # the label editor has focus, where the arrows belong to the text.
+        if (key in (Qt.Key.Key_Left, Qt.Key.Key_Right,
+                    Qt.Key.Key_Up, Qt.Key.Key_Down)
+                and not self.label_edit.hasFocus()
+                and not event.modifiers()
+                and self.canvas.textgrid_data is not None):
+            c = self.canvas
+            if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+                name = c.step_active_tier(-1 if key == Qt.Key.Key_Up else 1)
+                if name is not None:
+                    self._update_scrollbar()
+                    self.status.showMessage(f"Active tier: {name}")
+                    event.accept()
+                    return
+            else:
+                iv = c.step_selection(-1 if key == Qt.Key.Key_Left else 1)
+                if iv is not None:
+                    self._update_scrollbar()
+                    label = iv.text.strip() or "(empty)"
+                    self.status.showMessage(
+                        f"{label}    {iv.xmin:.3f}–{iv.xmax:.3f} s "
+                        f"({(iv.xmax - iv.xmin) * 1000:.0f} ms)")
+                    event.accept()
+                    return
+
         # Escape — stop playback, clear selection, defocus label editor
         if key == Qt.Key.Key_Escape:
             if self.canvas._playback_playing:
@@ -7458,6 +7664,7 @@ class MainWindow(QMainWindow):
                 formants_dir=wizard.formants_dir,
                 selected_tiers=selected_tiers,
                 primary_tier_name=wizard.primary_tier_name,
+                reconcile_allophone_tier=wizard.reconcile_allophone_tier,
                 extract_formants=wizard.extract_formants,
                 formant_mode=wizard.formant_mode,
                 point_tier_name=wizard.point_tier_name,
@@ -7655,6 +7862,10 @@ class MainWindow(QMainWindow):
                     "tiers": wizard.duration_tier_names,
                     "bounds_tiers": wizard.bounds_tier_names,
                 } if wizard.extract_durations else None,
+                "reconciliation": {
+                    "expected_tier": wizard.primary_tier_name,
+                    "produced_tier": wizard.reconcile_allophone_tier,
+                } if wizard.reconcile_allophone_tier else None,
                 "segment_context": {
                     "preceding": wizard.include_prev_segment,
                     "following": wizard.include_next_segment,

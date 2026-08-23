@@ -115,6 +115,9 @@ enough editing to prepare extraction targets:
   existing one by clicking it will not nudge the original.
 - **Snapping**: an optional snap-to-nearest-boundary aids cross-tier time alignment.
 - **Labels**: click an interval/point to edit its label inline.
+- **Keyboard**: `←` and `→` step through the intervals of the active tier, scrolling the view
+  when the next one is off-screen; `↑` and `↓` move between tiers. The arrows are left to the
+  text while a label is being edited.
 - **Tiers**: add, delete, **rename** (click the tier's name in the left margin), and
   **duplicate** (File → Duplicate Tier) — the last is for seeding a tier that mostly mirrors
   another (e.g. an allophone tier from the phoneme tier) so you edit only the differences.
@@ -316,6 +319,18 @@ an arrow rather than as an empty interval.
 
 That last rule is the one worth guarding: a single dragged boundary breaks the correspondence
 silently, and everything downstream depends on it.
+
+In the Build CSV wizard, **Reconcile phonemic and allophonic transcriptions** turns this into
+output. The expected sounds come from the primary tier and the produced ones from a tier you
+nominate; the export gains an `alignment` column, and a sound that absorbed a neighbour is
+measured across the whole span it was realised over. A file whose tiers do not reconcile is
+skipped with the reason given, rather than exported from an annotation that does not hold
+together.
+
+Note what this changes for the rows themselves. Insertions reach the CSV, which they cannot
+without reconciliation, since a `-` on the primary tier is otherwise skipped. And a sound that
+was not produced becomes a row with its labels but no measurements, where it would otherwise
+have been measured over an interval that is not really there.
 
 **File → Check Annotation...** reads one tier against another and reports either the problems it
 found or, when there are none, a tally of what the speaker produced — how many sounds came out as

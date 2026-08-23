@@ -188,3 +188,29 @@ def test_label_helpers():
     assert divergence.is_arrow("<") and divergence.is_arrow(">")
     assert divergence.is_anchor("@") and not divergence.is_anchor("-")
     assert not divergence.is_anchor("") and not divergence.is_anchor(">")
+
+
+# ---------------------------------------------------------------------------
+# What the CSV builder relies on
+# ---------------------------------------------------------------------------
+
+def test_row_units_come_only_from_reportable_kinds():
+    """Gaps and unannotated intervals must not become rows."""
+    pairs = [("k", "k"), ("-", "-"), ("", ""), ("N", "n")]
+    reportable = [d for d in resolve(*tiers(pairs))
+                  if d.kind not in (NOT_ANALYSED, UNANNOTATED)]
+    assert [d.kind for d in reportable] == [MATCH, SUBSTITUTION]
+
+
+def test_a_deletion_keeps_its_labels_for_the_row():
+    """A deletion has no span, but its labels still identify the row."""
+    out = resolve(*tiers([("i", ">"), ("e", "@")]))
+    assert out[0].phoneme == "i" and out[0].realised == ">"
+
+
+def test_the_realised_label_is_the_anchors_own():
+    """The widened span covers absorbed intervals, so the label must not be
+    looked up across it."""
+    out = resolve(*tiers([("i", ">"), ("e", "@"), ("a", "<")]))
+    assert out[1].realised == "@"
+    assert out[1].xmin == pytest.approx(0.0) and out[1].xmax == pytest.approx(0.3)
