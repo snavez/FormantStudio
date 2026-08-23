@@ -135,6 +135,10 @@ def is_empty_label(text):
     return text.strip() in EMPTY_LABEL_MARKERS or not text.strip()
 
 
+# A CSV wider than this is worth a word before it is written: splitting
+# spectral data per acoustic segment multiplies the columns.
+WIDE_CSV_COLUMNS = 300
+
 # Tolerance for comparing TextGrid times, in seconds.  Boundaries that agree
 # to within this are treated as identical, absorbing float round-trip noise.
 TIME_EPS = 1e-6
@@ -1257,8 +1261,60 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     # Pre-scan TextGrids for corpus-dependent column counts: the longest
     # segment (time-step sampling columns) and the most target points in any
     # one row unit (wide FN_<tier>N at-point columns).
+    def _spectral_segments(unit, tmap):
+        """Labelled intervals on the spectral tier that lie inside *unit*.
+
+        A stop marked with a closure and a release has two, and sampling one
+        of them for the row would report numbers from an arbitrary half of the
+        sound. When the spectral tier is the primary tier, or is coarser than
+        it, this is the single containing interval as before.
+        """
+        if not spectral_tier_name or spectral_tier_name == primary_tier_name:
+            return [unit]
+        t = tmap.get(spectral_tier_name)
+        if t is None or t.tier_class != "IntervalTier":
+            return []
+        inside = [iv for iv in t.intervals
+                  if not is_empty_label(iv.text)
+                  and iv.xmin >= unit.xmin - TIME_EPS
+                  and iv.xmax <= unit.xmax + TIME_EPS]
+        if inside:
+            return inside
+        # Coarser than the row unit: fall back to the interval containing it.
+        civ = _find_containing_interval(t, unit.xmin, unit.xmax)
+        if civ is None:
+            civ = _find_containing_interval_for_point(
+                t, (unit.xmin + unit.xmax) / 2)
+        return [] if civ is None or is_empty_label(civ.text) else [civ]
+
     time_offsets_ms = []
     max_targets = 0
+    max_spectral_segs = 1
+    if ((extract_spectral or extract_trajectory) and spectral_tier_name
+            and spectral_tier_name != primary_tier_name):
+        for af in audio_files:
+            bn = os.path.splitext(af)[0]
+            tg_path = None
+            for ext in (".TextGrid", ".textgrid"):
+                candidate = os.path.join(textgrid_dir, bn + ext)
+                if os.path.exists(candidate):
+                    tg_path = candidate
+                    break
+            if tg_path is None:
+                continue
+            try:
+                tg = TextGrid.from_file(tg_path)
+            except Exception:
+                continue
+            tmap = {t.name: t for t in tg.tiers}
+            pri = tmap.get(primary_tier_name)
+            if pri is None or pri.tier_class != "IntervalTier":
+                continue
+            for u in _units_for(pri):
+                n = len(_spectral_segments(u, tmap))
+                if n > max_spectral_segs:
+                    max_spectral_segs = n
+
     if time_mode or do_at_points:
         max_dur_s = 0.0
         for af in audio_files:
@@ -1423,22 +1479,37 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
 
     # Spectral-moment columns per marker: the four moments, the effective
     # window (ms), how that window was chosen, and its sample count
+    # With more than one segment inside a row unit each gets its own block,
+    # named by position and carrying its label; an unsplit set would not say
+    # which part of the sound it came from.
+    seg_suffixes = ([""] if max_spectral_segs <= 1
+                    else [f"_seg{i}" for i in range(1, max_spectral_segs + 1)])
+
     if extract_spectral:
-        for pct in spectral_markers:
-            pct_s = f"{pct:g}"
-            headers.extend([f"COG_{pct_s}%", f"SD_{pct_s}%",
-                            f"skew_{pct_s}%", f"kurt_{pct_s}%",
-                            f"winms_{pct_s}%", f"winsource_{pct_s}%",
-                            f"nsamples_{pct_s}%"])
+        for sfx in seg_suffixes:
+            if sfx:
+                headers.append(f"{sfx.lstrip('_')}_label")
+            for pct in spectral_markers:
+                pct_s = f"{pct:g}"
+                headers.extend([f"COG{sfx}_{pct_s}%", f"SD{sfx}_{pct_s}%",
+                                f"skew{sfx}_{pct_s}%", f"kurt{sfx}_{pct_s}%",
+                                f"winms{sfx}_{pct_s}%",
+                                f"winsource{sfx}_{pct_s}%",
+                                f"nsamples{sfx}_{pct_s}%"])
 
     # Trajectory columns — wide: per moment, the DCT coefficients then the
     # time-normalised track (so a grapher can draw the arc without an
     # inverse DCT).
     if extract_trajectory:
-        for m in traj_moments:
-            headers.extend([f"{m}_k{i}" for i in range(traj_dct_coeffs)])
-            if traj_include_track:
-                headers.extend([f"{m}_t{i}" for i in range(traj_norm_points)])
+        for sfx in seg_suffixes:
+            if sfx:
+                headers.append(f"{sfx.lstrip('_')}_traj_label")
+            for m in traj_moments:
+                headers.extend([f"{m}{sfx}_k{i}"
+                                for i in range(traj_dct_coeffs)])
+                if traj_include_track:
+                    headers.extend([f"{m}{sfx}_t{i}"
+                                    for i in range(traj_norm_points)])
 
     # Categorisation columns
     cat_col_start = len(headers)
@@ -1705,7 +1776,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             source, and the sample count; unmeasurable moments are blank.
             """
             cols = []
-            seg = _resolve_sampling_interval(iv, spectral_tier_name)
+            seg = iv
             if seg is None:
                 return [""] * (7 * len(spectral_markers))
             seg_min, seg_max = seg.xmin, seg.xmax
@@ -1754,7 +1825,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             per_moment = traj_dct_coeffs + (
                 traj_norm_points if traj_include_track else 0)
             blank = [""] * (per_moment * len(traj_moments))
-            seg = _resolve_sampling_interval(iv, spectral_tier_name)
+            seg = iv
             if seg is None or spectral_sound is None:
                 return blank
             tracks = compute_spectral_trajectory(
@@ -1901,11 +1972,22 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             if extract_durations:
                 row.extend(_dur_cols(unit))
 
+            if extract_spectral or extract_trajectory:
+                segs = _spectral_segments(unit, tier_map)
+
             if extract_spectral:
-                row.extend(_segment_spectral_cols(unit))
+                for i in range(len(seg_suffixes)):
+                    seg = segs[i] if i < len(segs) else None
+                    if seg_suffixes[i]:
+                        row.append(seg.text if seg is not None else "")
+                    row.extend(_segment_spectral_cols(seg))
 
             if extract_trajectory:
-                row.extend(_trajectory_cols(unit))
+                for i in range(len(seg_suffixes)):
+                    seg = segs[i] if i < len(segs) else None
+                    if seg_suffixes[i]:
+                        row.append(seg.text if seg is not None else "")
+                    row.extend(_trajectory_cols(seg))
 
             row.extend(_cat_cols(lc))
 
@@ -7919,6 +8001,20 @@ class MainWindow(QMainWindow):
         if not save_path:
             return
 
+        # Splitting spectral data per acoustic segment multiplies the columns,
+        # and the header has to cover the busiest row in the corpus, so say so
+        # before writing something unwieldy.
+        if len(headers) > WIDE_CSV_COLUMNS:
+            reply = QMessageBox.question(
+                self, "Wide CSV",
+                f"This export has {len(headers)} columns across "
+                f"{len(rows)} rows.\n\nWrite it anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if reply != QMessageBox.StandardButton.Yes:
+                self.status.showMessage("CSV export cancelled")
+                return
+
         try:
             with open(save_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -7926,7 +8022,7 @@ class MainWindow(QMainWindow):
                 writer.writerows(rows)
             self._write_provenance_sidecar(save_path, wizard, len(rows))
             self.status.showMessage(
-                f"CSV exported: {len(rows)} rows → "
+                f"CSV exported: {len(rows)} rows, {len(headers)} columns → "
                 f"{os.path.basename(save_path)}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to write CSV:\n{e}")
