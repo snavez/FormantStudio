@@ -226,10 +226,13 @@ second a phoneme with no segment of its own.
 
 | Phoneme | Allophone | Reading |
 |---------|-----------|---------|
-| `k` | `k` | produced as expected |
+| `k` | `k` | **exact** — produced as expected |
 | `N` | `n` | **substitution** |
 | `-` | `g` | **insertion** — a sound with no canonical counterpart |
 | `i` | `>` or `<` | **deletion** — absorbed into a neighbouring segment |
+
+Those four names are the values that reach the CSV's `alignment` column, matching the
+schema the downstream analysis already expects.
 
 #### Deletion in practice
 

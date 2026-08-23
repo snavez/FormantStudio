@@ -7863,7 +7863,7 @@ class MainWindow(QMainWindow):
 
         counts = divergence.summarise(
             divergence.resolve(phonemes, allophones))
-        order = [divergence.CANONICAL, divergence.SUBSTITUTION,
+        order = [divergence.EXACT, divergence.SUBSTITUTION,
                  divergence.INSERTION, divergence.DELETION,
                  divergence.NOT_ANALYSED, divergence.UNANNOTATED]
         lines = [f"  {k}: {counts[k]}" for k in order if counts.get(k)]

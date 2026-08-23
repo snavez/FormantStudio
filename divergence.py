@@ -27,7 +27,7 @@ ABSORB_RIGHT = ">"
 ABSORB_LEFT = "<"
 ARROWS = (ABSORB_LEFT, ABSORB_RIGHT)
 
-CANONICAL = "canonical"
+EXACT = "exact"
 SUBSTITUTION = "substitution"
 INSERTION = "insertion"
 DELETION = "deletion"
@@ -165,7 +165,7 @@ def resolve(phonemes, allophones):
         elif not realised:
             kind, xmin, xmax = UNANNOTATED, p[0], p[1]
         else:
-            kind = CANONICAL if expected == realised else SUBSTITUTION
+            kind = EXACT if expected == realised else SUBSTITUTION
             xmin, xmax = _extent(allophones, i)
 
         out.append(Divergence(i, expected, realised, kind, xmin, xmax))
