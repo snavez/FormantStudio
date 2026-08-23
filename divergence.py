@@ -27,7 +27,7 @@ ABSORB_RIGHT = ">"
 ABSORB_LEFT = "<"
 ARROWS = (ABSORB_LEFT, ABSORB_RIGHT)
 
-EXACT = "exact"
+MATCH = "match"
 SUBSTITUTION = "substitution"
 INSERTION = "insertion"
 DELETION = "deletion"
@@ -152,20 +152,21 @@ def resolve(phonemes, allophones):
     for i, (p, a) in enumerate(zip(phonemes, allophones)):
         expected, realised = _text(p), _text(a)
 
-        if is_arrow(realised):
-            # Not produced: its time belongs to a neighbour, so there is no
-            # span of its own to measure.
+        if is_empty(expected) and is_empty(realised):
+            # Nothing was expected and nothing produced: a pause or a stretch
+            # deliberately left out of the analysis.
+            kind, xmin, xmax = NOT_ANALYSED, p[0], p[1]
+        elif is_arrow(realised) or (expected and is_empty(realised)):
+            # Expected but not produced. An arrow says a neighbour took its
+            # time; a "-" says nothing analysable is there. Either way the
+            # sound has no span of its own, so there is nothing to measure.
             kind, xmin, xmax = DELETION, None, None
         elif is_empty(expected) and is_anchor(realised):
             kind, (xmin, xmax) = INSERTION, _extent(allophones, i)
-        elif is_empty(expected) or is_empty(realised):
-            kind, xmin, xmax = NOT_ANALYSED, p[0], p[1]
-        elif not expected and not realised:
-            kind, xmin, xmax = UNANNOTATED, p[0], p[1]
-        elif not realised:
+        elif not expected or not realised:
             kind, xmin, xmax = UNANNOTATED, p[0], p[1]
         else:
-            kind = EXACT if expected == realised else SUBSTITUTION
+            kind = MATCH if expected == realised else SUBSTITUTION
             xmin, xmax = _extent(allophones, i)
 
         out.append(Divergence(i, expected, realised, kind, xmin, xmax))

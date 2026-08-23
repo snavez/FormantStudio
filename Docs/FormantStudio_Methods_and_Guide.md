@@ -226,13 +226,16 @@ second a phoneme with no segment of its own.
 
 | Phoneme | Allophone | Reading |
 |---------|-----------|---------|
-| `k` | `k` | **exact** — produced as expected |
+| `k` | `k` | **match** — produced as expected |
 | `N` | `n` | **substitution** |
-| `-` | `g` | **insertion** — a sound with no canonical counterpart |
+| `-` | `g` | **insertion** — a sound that was not expected |
 | `i` | `>` or `<` | **deletion** — absorbed into a neighbouring segment |
+| `i` | `-` | **deletion** — expected, but nothing analysable there |
+| `-` | `-` | a gap, hesitation or pause — no row is produced |
 
-Those four names are the values that reach the CSV's `alignment` column, matching the
-schema the downstream analysis already expects.
+Those four names are the only values the CSV's `alignment` column can take. The last row
+produces nothing at all: with neither an expected sound nor a produced one there is nothing
+to report.
 
 #### Deletion in practice
 
@@ -278,9 +281,13 @@ Every allophone interval whose label is not `<`, `>` or `-` **anchors** a realis
 Each `>` attaches to the first anchor on its right, each `<` to the first on its left, and the
 segment spans the union of its anchor and everything attached to it.
 
-The CSV gets **one row per canonical phoneme**, so every sound that was expected is
-accounted for whether or not it was produced. Each row carries the phoneme, what was realised
-in its place, and the divergence type — canonical, substitution, insertion or deletion.
+The CSV gets **one row per expected sound**, so everything that was planned is accounted for
+whether or not it was produced. The two tiers appear as columns named after themselves — the
+tiers are the annotator's to name, and nothing here assumes what they are called — and one
+further column, `alignment`, records which of the four cases applies.
+
+Rows marked `deletion` carry no acoustic data: there is no signal belonging to them. Every
+other row is measured, including insertions, which the export would otherwise miss entirely.
 
 The markers do a second job here. A phoneme marked `<` or `>` was not produced, so its row
 carries no acoustic measurements: there is no signal belonging to it. The phoneme that *did*

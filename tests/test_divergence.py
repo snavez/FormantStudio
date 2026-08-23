@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import divergence
 from divergence import (
-    EXACT, DELETION, INSERTION, NOT_ANALYSED, SUBSTITUTION, UNANNOTATED,
+    MATCH, DELETION, INSERTION, NOT_ANALYSED, SUBSTITUTION, UNANNOTATED,
     AnnotationError, resolve, summarise, validate,
 )
 
@@ -33,8 +33,8 @@ def kinds(pairs):
 # The four divergence types
 # ---------------------------------------------------------------------------
 
-def test_matching_labels_are_exact():
-    assert kinds([("k", "k"), ("o", "o")]) == [EXACT, EXACT]
+def test_matching_labels_are_a_match():
+    assert kinds([("k", "k"), ("o", "o")]) == [MATCH, MATCH]
 
 
 def test_differing_labels_are_a_substitution():
@@ -47,11 +47,26 @@ def test_empty_phoneme_against_a_label_is_an_insertion():
 
 def test_an_arrow_is_a_deletion():
     assert kinds([("k", "k"), ("i", ">"), ("e", "@")]) == [
-        EXACT, DELETION, SUBSTITUTION]
+        MATCH, DELETION, SUBSTITUTION]
 
 
 def test_empty_on_both_tiers_is_not_analysed():
+    """A gap, hesitation or pause: nothing expected and nothing produced."""
     assert kinds([("-", "-")]) == [NOT_ANALYSED]
+
+
+def test_an_expected_sound_with_nothing_produced_is_a_deletion():
+    """"-" against a real phoneme means it was not produced, so no data."""
+    out = resolve(*tiers([("k", "-"), ("o", "o")]))
+    assert out[0].kind == DELETION
+    assert out[0].xmin is None and out[0].xmax is None
+
+
+def test_only_four_kinds_can_reach_a_csv_row():
+    """Gaps and unannotated intervals are skipped before a row is built."""
+    measurable = {MATCH, SUBSTITUTION, INSERTION, DELETION}
+    pairs = [("k", "k"), ("N", "n"), ("-", "g"), ("i", ">"), ("e", "@")]
+    assert {d.kind for d in resolve(*tiers(pairs))} <= measurable
 
 
 def test_blank_on_both_tiers_is_unannotated():
@@ -165,7 +180,7 @@ def test_resolve_refuses_tiers_it_cannot_pair():
 def test_summarise_counts_each_kind():
     pairs = [("k", "k"), ("N", "n"), ("-", "g"), ("i", ">"), ("e", "@")]
     counts = summarise(resolve(*tiers(pairs)))
-    assert counts == {EXACT: 1, SUBSTITUTION: 2, INSERTION: 1, DELETION: 1}
+    assert counts == {MATCH: 1, SUBSTITUTION: 2, INSERTION: 1, DELETION: 1}
 
 
 def test_label_helpers():
