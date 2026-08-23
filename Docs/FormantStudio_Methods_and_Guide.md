@@ -275,11 +275,24 @@ Every allophone interval whose label is not `<`, `>` or `-` **anchors** a realis
 Each `>` attaches to the first anchor on its right, each `<` to the first on its left, and the
 segment spans the union of its anchor and everything attached to it.
 
-The CSV gets **one row per realised segment**, not per canonical phoneme, because only a
-realised segment has an extent that can be measured. Each row carries the segment's start and
-end, its realised label, the canonical phoneme it is attributed to, the divergence type, and
-the phonemes it absorbed — so a deletion remains visible and countable even though it has no
-segment of its own.
+The CSV gets **one row per canonical phoneme**, so every sound that was expected is
+accounted for whether or not it was produced. Each row carries the phoneme, what was realised
+in its place, and the divergence type — canonical, substitution, insertion or deletion.
+
+The markers do a second job here. A phoneme marked `<` or `>` was not produced, so its row
+carries no acoustic measurements: there is no signal belonging to it. The phoneme that *did*
+survive is measured over the **whole coalesced span**, not just its own interval. For
+/i e a/ realised as one [@] with `> @ <`:
+
+| Row | Divergence | Measured over |
+|-----|------------|---------------|
+| `/i/` | deletion | nothing — not produced |
+| `/e/` | substitution to `[@]` | `/i/` onset to `/a/` offset |
+| `/a/` | deletion | nothing — not produced |
+
+Measuring the surviving phoneme over its own interval alone would sample only the middle of a
+vowel that actually ran three intervals long, which is the whole reason deletion is written as
+an arrow rather than as an empty interval.
 
 #### Rules the annotation must obey
 
