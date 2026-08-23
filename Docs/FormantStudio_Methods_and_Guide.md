@@ -196,6 +196,104 @@ aligner would. Very noisy recordings, particularly ones with a compressed dynami
 the other case where it can fail outright rather than merely imprecisely. Check the result by
 eye and ear as you would any first pass.
 
+### 4.3 Recording what the speaker actually produced
+
+A phoneme tier says what *should* have been said. Speakers depart from it: they
+substitute one sound for another, add sounds, and leave sounds out. Recording those
+departures needs a second tier and a convention, because the interesting cases do not fit
+one-interval-per-sound.
+
+The arrangement is two tiers sharing every boundary: a **phoneme tier** carrying the
+canonical sequence, and an **allophone tier** carrying what was realised. Keeping the
+boundaries identical is what lets the two be read together; the convention below covers the
+cases where a canonical sound and a realised segment do not correspond one to one.
+
+#### The four markers
+
+| Tier | Label | Meaning |
+|------|-------|---------|
+| allophone | a symbol | realised as that sound |
+| allophone | `>` | this phoneme has no segment of its own; its span belongs to the realised segment on the **right** |
+| allophone | `<` | …belongs to the realised segment on the **left** |
+| allophone | `-` | silence where a sound was expected (a hesitation, not a deletion) |
+| phoneme | `-` | no canonical sound here; this interval hosts an inserted one |
+
+The arrow points at the segment it joins. `-` on the phoneme tier and `<`/`>` on the
+allophone tier are duals: the first is a realised segment with no phoneme behind it, the
+second a phoneme with no segment of its own.
+
+#### The four divergences
+
+| Phoneme | Allophone | Reading |
+|---------|-----------|---------|
+| `k` | `k` | produced as expected |
+| `N` | `n` | **substitution** |
+| `-` | `g` | **insertion** — a sound with no canonical counterpart |
+| `i` | `>` or `<` | **deletion** — absorbed into a neighbouring segment |
+
+#### Deletion in practice
+
+A deleted sound leaves no acoustic trace, so it has no segment of its own — its time belongs
+to whatever *was* produced there. That is why deletion is written as an arrow rather than as
+an empty interval: the arrow says which neighbour took the time.
+
+Canonical /k i e/ where the speaker produced only [k] and [@]:
+
+```
+phoneme    | k | i | e |
+allophone  | k | > | @ |     /i/ absorbed into the following [@]
+```
+
+```
+phoneme    | k | i | e |
+allophone  | k | @ | < |     /i/ produced as [@], /e/ absorbed into it
+```
+
+Both describe the same audio. They differ in which phoneme you judge to have survived, and
+that judgement is yours: nothing in the acoustics distinguishes them, which is exactly why it
+is worth writing down rather than leaving to be inferred.
+
+Runs work the same way, and an anchor may take material from both sides. For canonical
+/i e a/ realised as a single [@]:
+
+| Allophone | Survives | Segment runs from | Absorbed |
+|-----------|----------|-------------------|----------|
+| `> > @` | `/a/` | `/i/` onset to `/a/` offset | `/i/`, `/e/` |
+| `> @ <` | `/e/` | `/i/` onset to `/a/` offset | `/i/`, `/a/` |
+| `@ < <` | `/i/` | `/i/` onset to `/a/` offset | `/e/`, `/a/` |
+
+#### Where to put the boundaries
+
+Inside an absorbed run the boundaries are fictional — if `/i/` left no trace there is no real
+answer to where `/i/` ends and `/e/` begins. **Put them wherever is convenient**, a narrow
+sliver at the edge is fine. The marker carries the meaning, and extraction measures the whole
+coalesced span, so the internal boundary never reaches a measurement.
+
+#### How this reaches the CSV
+
+Every allophone interval whose label is not `<`, `>` or `-` **anchors** a realised segment.
+Each `>` attaches to the first anchor on its right, each `<` to the first on its left, and the
+segment spans the union of its anchor and everything attached to it.
+
+The CSV gets **one row per realised segment**, not per canonical phoneme, because only a
+realised segment has an extent that can be measured. Each row carries the segment's start and
+end, its realised label, the canonical phoneme it is attributed to, the divergence type, and
+the phonemes it absorbed — so a deletion remains visible and countable even though it has no
+segment of its own.
+
+#### Rules the annotation must obey
+
+- `<` may not be the first interval of a tier, nor `>` the last: there would be nothing to
+  attach to.
+- `>` immediately followed by `<` with no anchor between them is an error — both would be
+  absorbed into nothing.
+- A marker may not reach its anchor across a `-`: silence breaks the span, so `@ - <` is
+  incoherent.
+- The phoneme and allophone tiers must share every boundary.
+
+That last rule is the one worth guarding: a single dragged boundary breaks the correspondence
+silently, and everything downstream depends on it.
+
 ---
 
 ## 5. Spectral analysis (consonants)
