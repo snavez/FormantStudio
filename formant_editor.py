@@ -5611,8 +5611,6 @@ class _DataOptionsPage(QWizardPage):
         self._point_tier_combo.clear()
         self._seg_tier_combo.clear()
         self._reconcile_combo.clear()
-        self._reconcile_combo.addItems(
-            [t.name for t in tg.tiers if t.tier_class == "IntervalTier"])
 
         # Clear duration checkboxes
         for dur_cb, bounds_cb, _ in self._dur_checks:
@@ -5630,6 +5628,7 @@ class _DataOptionsPage(QWizardPage):
             else:
                 self._seg_tier_combo.addItem(name)
                 self._spectral_tier_combo.addItem(name)
+                self._reconcile_combo.addItem(name)
                 dur_cb = QCheckBox(name)
                 dur_cb.setChecked(True)
                 bounds_cb = QCheckBox("+ start/end times")
@@ -5649,6 +5648,13 @@ class _DataOptionsPage(QWizardPage):
                 continue
             idx = combo.findText(primary) if primary else -1
             combo.setCurrentIndex(idx if idx >= 0 else combo.count() - 1)
+
+        # The produced-sounds tier is read against the primary one, so it must
+        # be a different tier; start on the first that is.
+        for i in range(self._reconcile_combo.count()):
+            if self._reconcile_combo.itemText(i) != primary:
+                self._reconcile_combo.setCurrentIndex(i)
+                break
 
         self._update_fmt_ui()
 
