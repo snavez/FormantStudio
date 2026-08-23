@@ -24,6 +24,7 @@ import numpy as np
 import parselmouth
 from parselmouth import praat
 
+import divergence
 import phone_aligner
 
 from PyQt6.QtWidgets import (
@@ -4514,6 +4515,42 @@ class CreateTextGridDialog(QDialog):
 # Add Tier dialog
 # ---------------------------------------------------------------------------
 
+class TierPairDialog(QDialog):
+    """Pick which tier holds the expected sounds and which holds the produced."""
+
+    def __init__(self, tier_names, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Check Annotation")
+        self.setMinimumWidth(380)
+        self.setStyleSheet(_DIALOG_FIELD_STYLE + _checked_tick_qss())
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Read one tier against another to check they agree and to "
+            "summarise\nwhat the speaker actually produced."))
+
+        form = QFormLayout()
+        self._phoneme = QComboBox()
+        self._phoneme.addItems(tier_names)
+        self._allophone = QComboBox()
+        self._allophone.addItems(tier_names)
+        if len(tier_names) > 1:
+            self._allophone.setCurrentIndex(1)
+        form.addRow("Expected sounds:", self._phoneme)
+        form.addRow("Produced sounds:", self._allophone)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def tier_names(self):
+        return self._phoneme.currentText(), self._allophone.currentText()
+
+
 class TemplateOptionsDialog(QDialog):
     """Choose how a template's contents are carried onto the current file.
 
@@ -6600,6 +6637,10 @@ class MainWindow(QMainWindow):
         template_action.triggered.connect(self._new_textgrid_from_template)
         file_menu.addAction(template_action)
 
+        check_action = QAction("Chec&k Annotation...", self)
+        check_action.triggered.connect(self._check_annotation)
+        file_menu.addAction(check_action)
+
         add_tier_action = QAction("Add &Tier...", self)
         add_tier_action.setShortcut(QKeySequence("Ctrl+Shift+T"))
         add_tier_action.triggered.connect(self._add_tier_to_textgrid)
@@ -7776,6 +7817,63 @@ class MainWindow(QMainWindow):
             f"New TextGrid from {os.path.basename(filepath)} ({note}; "
             f"{self._describe_tiers(tg)}) — unsaved, please check"
         )
+
+    def _check_annotation(self):
+        """Read a phoneme tier against an allophone tier and report on it.
+
+        Everything downstream assumes the two tiers share their boundaries, and
+        a single dragged boundary breaks that silently, so it is worth being
+        able to ask.
+        """
+        tg = self.canvas.textgrid_data
+        if tg is None:
+            self.status.showMessage("No TextGrid loaded")
+            return
+        names = [t.name for t in tg.tiers if t.tier_class == "IntervalTier"]
+        if len(names) < 2:
+            QMessageBox.information(
+                self, "Check Annotation",
+                "Two interval tiers are needed: one for the expected sounds "
+                "and one for what was produced.")
+            return
+
+        dlg = TierPairDialog(names, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        phoneme_name, allophone_name = dlg.tier_names()
+
+        def spans(name):
+            tier = next(t for t in tg.tiers if t.name == name)
+            return [(iv.xmin, iv.xmax, iv.text) for iv in tier.intervals]
+
+        phonemes, allophones = spans(phoneme_name), spans(allophone_name)
+        problems = divergence.validate(phonemes, allophones)
+
+        if problems:
+            shown = "\n".join(f"  • {p}" for p in problems[:12])
+            if len(problems) > 12:
+                shown += f"\n  … and {len(problems) - 12} more"
+            QMessageBox.warning(
+                self, "Check Annotation",
+                f"{len(problems)} problem(s) found between "
+                f"'{phoneme_name}' and '{allophone_name}':\n\n{shown}")
+            self.status.showMessage(
+                f"Annotation check: {len(problems)} problem(s)")
+            return
+
+        counts = divergence.summarise(
+            divergence.resolve(phonemes, allophones))
+        order = [divergence.CANONICAL, divergence.SUBSTITUTION,
+                 divergence.INSERTION, divergence.DELETION,
+                 divergence.NOT_ANALYSED, divergence.UNANNOTATED]
+        lines = [f"  {k}: {counts[k]}" for k in order if counts.get(k)]
+        QMessageBox.information(
+            self, "Check Annotation",
+            f"'{phoneme_name}' and '{allophone_name}' are consistent.\n\n"
+            + "\n".join(lines))
+        self.status.showMessage(
+            "Annotation check: no problems — "
+            + ", ".join(f"{k} {counts[k]}" for k in order if counts.get(k)))
 
     def _align_template(self, template, tier_name, duration):
         """Warp *template* onto the open recording using its acoustics.

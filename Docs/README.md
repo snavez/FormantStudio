@@ -31,6 +31,7 @@ Praat's automatic formant tracking is excellent but not infallible — particula
 ### TextGrid Editing
 - **Load/save TextGrid files** (Praat normal + short format)
 - **TextGrid templates** — start a new grid from any existing TextGrid, with labels scaled to the new file's duration
+- **Phoneme/allophone annotation** — record substitutions, insertions and deletions against the expected sounds, with Check Annotation to validate the pair
 - **First-pass forced alignment** — place a template's phone labels against the recording's acoustics (median 12.5 ms boundary error on held-out data, 84% within 50 ms); no pronunciation dictionary needed
 - **Add boundaries** (Enter key at cursor/hover position)
 - **Delete boundaries** (Del key on selected boundary)

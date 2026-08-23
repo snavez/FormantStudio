@@ -307,6 +307,11 @@ an arrow rather than as an empty interval.
 That last rule is the one worth guarding: a single dragged boundary breaks the correspondence
 silently, and everything downstream depends on it.
 
+**File → Check Annotation...** reads one tier against another and reports either the problems it
+found or, when there are none, a tally of what the speaker produced — how many sounds came out as
+expected, and how many were substituted, inserted or left out. Worth running as you go rather
+than discovering a stranded arrow at extraction time.
+
 ---
 
 ## 5. Spectral analysis (consonants)
