@@ -18,6 +18,7 @@ import re
 import io
 import json
 import csv
+import errno
 import math
 import time as _time
 import numpy as np
@@ -8016,14 +8017,15 @@ class MainWindow(QMainWindow):
                 msg += f"\n  ... and {len(items) - 50} more."
             QMessageBox.information(self, "Unmatched Labels", msg)
 
-        # Save dialog
-        default_name = os.path.join(wizard.audio_dir, "formant_data.csv")
-        save_path, _ = QFileDialog.getSaveFileName(
-            self, "Save CSV", default_name,
-            "CSV Files (*.csv);;All Files (*)")
-        if not save_path:
-            return
+        self._save_csv_result(headers, rows, wizard)
 
+    def _save_csv_result(self, headers, rows, wizard):
+        """Ask where to put the finished CSV and write it there.
+
+        The extraction that produced these rows is the expensive part, so a
+        write that fails is recoverable: the rows are held and another name
+        asked for.
+        """
         # Splitting spectral data per acoustic segment multiplies the columns,
         # and the header has to cover the busiest row in the corpus, so say so
         # before writing something unwieldy.
@@ -8038,17 +8040,49 @@ class MainWindow(QMainWindow):
                 self.status.showMessage("CSV export cancelled")
                 return
 
-        try:
-            with open(save_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(headers)
-                writer.writerows(rows)
+        # The extraction is the expensive part, so a write that fails — most
+        # often because the file is open in a spreadsheet — asks for another
+        # name rather than discarding the rows and making the user run it all
+        # again.
+        default_name = os.path.join(wizard.audio_dir, "acoustic_data.csv")
+        while True:
+            save_path, _ = QFileDialog.getSaveFileName(
+                self, "Save CSV", default_name,
+                "CSV Files (*.csv);;All Files (*)")
+            if not save_path:
+                self.status.showMessage(
+                    f"CSV not saved — {len(rows)} rows discarded")
+                return
+
+            try:
+                with open(save_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(headers)
+                    writer.writerows(rows)
+            except OSError as e:
+                hint = ""
+                if getattr(e, "errno", None) in (errno.EACCES, errno.EBUSY):
+                    hint = ("\n\nIt may be open in another program — close it, "
+                            "or choose a different name.")
+                reply = QMessageBox.warning(
+                    self, "Could Not Write CSV",
+                    f"{os.path.basename(save_path)} could not be written:\n"
+                    f"{e}{hint}\n\nTry another name?",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes)
+                if reply != QMessageBox.StandardButton.Yes:
+                    self.status.showMessage(
+                        f"CSV not saved — {len(rows)} rows discarded")
+                    return
+                default_name = save_path
+                continue
+
             self._write_provenance_sidecar(save_path, wizard, len(rows))
             self.status.showMessage(
                 f"CSV exported: {len(rows)} rows, {len(headers)} columns → "
                 f"{os.path.basename(save_path)}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to write CSV:\n{e}")
+            return
 
     def _write_provenance_sidecar(self, csv_path, wizard, n_rows):
         """Write a JSON sidecar recording the resolved run configuration.
