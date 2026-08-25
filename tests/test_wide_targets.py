@@ -90,30 +90,32 @@ def _run(corpus, order, **over):
 
 
 class TestWideTargetColumns:
-    def test_headers_sized_by_corpus_max(self, corpus):
+    def test_headers_named_after_the_point_marks(self, corpus):
+        """A column says which target it holds, not where it fell in the row."""
         headers, _ = _run(corpus, ["words", "phones", "Target"])
-        # 'a' has two targets → two numbered sets, none more
-        for i in (1, 2):
-            assert f"Target{i}_time" in headers
+        for mark in ("rel", "T1", "T2"):     # the marks this corpus uses
+            assert f"{mark}_time" in headers
             for f in ("F1", "F2", "F3"):
-                assert f"{f}_Target{i}" in headers
-        assert "F1_Target3" not in headers
-        assert "F1_Target" not in headers   # old un-numbered form is gone
+                assert f"{f}_{mark}" in headers
+        # Position-numbered columns are gone, and so is the un-numbered form.
+        assert not [h for h in headers if h.startswith("F1_Target")]
 
-    def test_one_row_per_token_with_time_ordered_values(self, corpus):
+    def test_one_row_per_token_with_each_mark_in_its_own_column(self, corpus):
         headers, rows = _run(corpus, ["words", "phones", "Target"])
         assert len(rows) == 2               # 't' and 'a' — never row-per-point
         r_t, r_a = rows
-        f1_1 = headers.index("F1_Target1")
-        f1_2 = headers.index("F1_Target2")
-        # 't': one target at 0.10 → F1 = 300 + 1000*0.10 = 400; slot 2 blank
-        assert float(r_t[f1_1]) == pytest.approx(400.0, abs=6)
-        assert r_t[f1_2] == ""
-        assert r_t[headers.index("Target2_time")] == ""
-        # 'a': targets at 0.25 and 0.40, in time order
-        assert float(r_a[f1_1]) == pytest.approx(550.0, abs=6)
-        assert float(r_a[f1_2]) == pytest.approx(700.0, abs=6)
-        assert float(r_a[headers.index("Target1_time")]) == pytest.approx(0.25)
+        f1_rel = headers.index("F1_rel")
+        f1_t1 = headers.index("F1_T1")
+        f1_t2 = headers.index("F1_T2")
+        # 't': one target marked 'rel' at 0.10 → F1 = 300 + 1000*0.10 = 400,
+        # and the columns for the other marks stay empty.
+        assert float(r_t[f1_rel]) == pytest.approx(400.0, abs=6)
+        assert r_t[f1_t1] == "" and r_t[f1_t2] == ""
+        # 'a': targets marked T1 and T2, each landing in its own column.
+        assert r_a[f1_rel] == ""
+        assert float(r_a[f1_t1]) == pytest.approx(550.0, abs=6)
+        assert float(r_a[f1_t2]) == pytest.approx(700.0, abs=6)
+        assert float(r_a[headers.index("T1_time")]) == pytest.approx(0.25)
 
     def test_no_unconditional_bounds_columns(self, corpus):
         headers, _ = _run(corpus, ["words", "phones", "Target"])
@@ -246,13 +248,18 @@ class TestPointTierPrimary:
             corpus, ["words", "phones", "Target"],
             primary_tier_name="Target",
             formant_mode="at_points", point_tier_name="Target")
-        # one target per zero-width unit → single wide set, F1_Target1
-        f1 = headers.index("F1_Target1")
+        # Each row is one point, so it fills the column named after its own
+        # mark and leaves the columns for the other marks empty.
         tcol = headers.index("Target")
-        vals = {r[tcol]: float(r[f1]) for r in rows}
+        vals = {r[tcol]: float(r[headers.index(f"F1_{r[tcol]}")]) for r in rows}
         assert vals["rel"] == pytest.approx(400.0, abs=6)   # 300+1000*0.10
         assert vals["T1"] == pytest.approx(550.0, abs=6)    # 0.25
         assert vals["T2"] == pytest.approx(700.0, abs=6)    # 0.40
+
+        for r in rows:
+            others = [h for h in headers
+                      if h.startswith("F1_") and h != f"F1_{r[tcol]}"]
+            assert all(r[headers.index(h)] == "" for h in others)
 
 
 class TestFlankingSegments:

@@ -1280,7 +1280,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                   and iv.xmax <= unit.xmax + TIME_EPS]
         if inside:
             return inside
-        # Coarser than the row unit: fall back to the interval containing it.
+        # Coarser than the row unit: one containing interval, so nothing is
+        # subdivided and the plain column names still apply.
         civ = _find_containing_interval(t, unit.xmin, unit.xmax)
         if civ is None:
             civ = _find_containing_interval_for_point(
@@ -1289,7 +1290,11 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
 
     time_offsets_ms = []
     max_targets = 0
-    max_spectral_segs = 1
+    target_marks = []
+    # Wide columns are named after the labels that fill them, so the corpus
+    # has to be surveyed for which labels occur. First-appearance order keeps
+    # them in the order they occur in the sound — a closure before its release.
+    spectral_labels = []
     if ((extract_spectral or extract_trajectory) and spectral_tier_name
             and spectral_tier_name != primary_tier_name):
         for af in audio_files:
@@ -1311,9 +1316,19 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             if pri is None or pri.tier_class != "IntervalTier":
                 continue
             for u in _units_for(pri):
-                n = len(_spectral_segments(u, tmap))
-                if n > max_spectral_segs:
-                    max_spectral_segs = n
+                inside = [seg for seg in _spectral_segments(u, tmap)
+                          if seg.xmin >= u.xmin - TIME_EPS
+                          and seg.xmax <= u.xmax + TIME_EPS]
+                # Only a tier that genuinely subdivides a row unit is worth
+                # splitting. One interval per unit is a correspondence, not a
+                # subdivision, and keying columns on its label would give a
+                # set per label in the whole inventory.
+                if len(inside) < 2:
+                    continue
+                for seg in inside:
+                    label = seg.text.strip()
+                    if label and label not in spectral_labels:
+                        spectral_labels.append(label)
 
     if time_mode or do_at_points:
         max_dur_s = 0.0
@@ -1346,8 +1361,14 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 if (pri is not None and ptt is not None
                         and ptt.tier_class == "TextTier"):
                     for u in _units_for(pri):
-                        n = sum(1 for p in ptt.points
-                                if u.xmin - 1e-6 <= p.time <= u.xmax + 1e-6)
+                        n = 0
+                        for pt in sorted(ptt.points, key=lambda x: x.time):
+                            if not (u.xmin - 1e-6 <= pt.time <= u.xmax + 1e-6):
+                                continue
+                            n += 1
+                            mark = pt.mark.strip()
+                            if mark and mark not in target_marks:
+                                target_marks.append(mark)
                         if n > max_targets:
                             max_targets = n
 
@@ -1449,12 +1470,13 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     # Formant columns — at-points, wide: one numbered set per target point
     # (F1_Target1 … F1_TargetN, sized by the corpus maximum per row segment)
     if do_at_points:
-        pt_suffix = point_tier_name or "pt"
-        for i in range(1, max_targets + 1):
+        # Named after the point's own mark, so a column says which target it
+        # holds rather than where it happened to fall in the row.
+        pt_keys = target_marks or [point_tier_name or "pt"]
+        for key in pt_keys:
             if include_point_times:
-                headers.append(f"{pt_suffix}{i}_time")
-            headers.extend([f"F1_{pt_suffix}{i}", f"F2_{pt_suffix}{i}",
-                            f"F3_{pt_suffix}{i}"])
+                headers.append(f"{key}_time")
+            headers.extend([f"F1_{key}", f"F2_{key}", f"F3_{key}"])
 
     # Formant columns — for-segments
     if do_for_segments:
@@ -1482,13 +1504,11 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     # With more than one segment inside a row unit each gets its own block,
     # named by position and carrying its label; an unsplit set would not say
     # which part of the sound it came from.
-    seg_suffixes = ([""] if max_spectral_segs <= 1
-                    else [f"_seg{i}" for i in range(1, max_spectral_segs + 1)])
+    seg_suffixes = ([""] if not spectral_labels
+                    else [f"_{lab}" for lab in spectral_labels])
 
     if extract_spectral:
         for sfx in seg_suffixes:
-            if sfx:
-                headers.append(f"{sfx.lstrip('_')}_label")
             for pct in spectral_markers:
                 pct_s = f"{pct:g}"
                 headers.extend([f"COG{sfx}_{pct_s}%", f"SD{sfx}_{pct_s}%",
@@ -1502,8 +1522,6 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     # inverse DCT).
     if extract_trajectory:
         for sfx in seg_suffixes:
-            if sfx:
-                headers.append(f"{sfx.lstrip('_')}_traj_label")
             for m in traj_moments:
                 headers.extend([f"{m}{sfx}_k{i}"
                                 for i in range(traj_dct_coeffs)])
@@ -1953,18 +1971,23 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                         (p for p in at_pt_tier.points
                          if unit.xmin - TIME_EPS <= p.time <= unit.xmax + TIME_EPS),
                         key=lambda p: p.time)
-                for i in range(max_targets):
-                    if i < len(pts):
-                        pt = pts[i]
-                        if include_point_times:
-                            row.append(f"{pt.time:.4f}")
-                        f1, f2, f3 = _get_formant_at_time(fd, pt.time)
-                        for v in (f1, f2, f3):
-                            row.append(f"{v:.1f}" if not np.isnan(v) else "")
-                    else:
+                by_mark = {}
+                for pt in pts:
+                    by_mark.setdefault(pt.mark.strip(), pt)
+                for k, key in enumerate(pt_keys):
+                    pt = by_mark.get(key)
+                    if pt is None and not target_marks and k < len(pts):
+                        pt = pts[k]        # unmarked points: fall back to order
+                    if pt is None:
                         if include_point_times:
                             row.append("")
                         row.extend(["", "", ""])
+                        continue
+                    if include_point_times:
+                        row.append(f"{pt.time:.4f}")
+                    f1, f2, f3 = _get_formant_at_time(fd, pt.time)
+                    for v in (f1, f2, f3):
+                        row.append(f"{v:.1f}" if not np.isnan(v) else "")
 
             if do_for_segments:
                 row.extend(_segment_formant_cols(unit))
@@ -1974,19 +1997,19 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
 
             if extract_spectral or extract_trajectory:
                 segs = _spectral_segments(unit, tier_map)
+                by_label = {}
+                for seg in segs:
+                    by_label.setdefault(seg.text.strip(), seg)
+                ordered = ([by_label.get(lab) for lab in spectral_labels]
+                           if spectral_labels
+                           else [segs[0] if segs else None])
 
             if extract_spectral:
-                for i in range(len(seg_suffixes)):
-                    seg = segs[i] if i < len(segs) else None
-                    if seg_suffixes[i]:
-                        row.append(seg.text if seg is not None else "")
+                for seg in ordered:
                     row.extend(_segment_spectral_cols(seg))
 
             if extract_trajectory:
-                for i in range(len(seg_suffixes)):
-                    seg = segs[i] if i < len(segs) else None
-                    if seg_suffixes[i]:
-                        row.append(seg.text if seg is not None else "")
+                for seg in ordered:
                     row.extend(_trajectory_cols(seg))
 
             row.extend(_cat_cols(lc))
