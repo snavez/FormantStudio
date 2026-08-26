@@ -5724,27 +5724,39 @@ class _DataOptionsPage(QWizardPage):
         # A blunter measure than a moment, and steadier for it: energy up
         # there over energy down here, which just indexes whether there is
         # frication rather than describing the spectrum's shape.
-        ratio_row = QHBoxLayout()
-        ratio_row.addWidget(QLabel("Band ratio (Hz): low"))
-        self._ratio_lo_spin = QDoubleSpinBox()
-        self._ratio_lo_spin.setRange(0.0, 20000.0)
-        self._ratio_lo_spin.setSingleStep(500.0)
-        self._ratio_lo_spin.setValue(DEFAULT_RATIO_LOW_BAND[1])
-        self._ratio_hi_spin = QDoubleSpinBox()
-        self._ratio_hi_spin.setRange(1000.0, 48000.0)
-        self._ratio_hi_spin.setSingleStep(1000.0)
-        self._ratio_hi_spin.setValue(DEFAULT_RATIO_HIGH_BAND[1])
-        ratio_row.addWidget(QLabel("0 to"))
-        ratio_row.addWidget(self._ratio_lo_spin)
-        ratio_row.addWidget(QLabel("  over  that to"))
-        ratio_row.addWidget(self._ratio_hi_spin)
-        ratio_row.addStretch()
+        # Each band carries its own edges. They need not meet: leaving a gap
+        # between them sharpens the contrast, and a band need not start at
+        # zero when the high-pass has already removed what is down there.
         ratio_tip = ("Reported in dB as power in the high band over power in "
-                     "the low band. The high band runs from the low band's "
-                     "edge up to this ceiling.")
-        self._ratio_lo_spin.setToolTip(ratio_tip)
-        self._ratio_hi_spin.setToolTip(ratio_tip)
-        data_layout.addLayout(ratio_row)
+                     "the low band. The two bands are independent — they may "
+                     "leave a gap, and neither has to start at zero.")
+
+        def _ratio_spin(value, ceiling=48000.0):
+            spin = QDoubleSpinBox()
+            spin.setRange(0.0, ceiling)
+            spin.setSingleStep(500.0)
+            spin.setValue(value)
+            spin.setToolTip(ratio_tip)
+            return spin
+
+        self._ratio_low_lo_spin = _ratio_spin(DEFAULT_RATIO_LOW_BAND[0])
+        self._ratio_low_hi_spin = _ratio_spin(DEFAULT_RATIO_LOW_BAND[1])
+        self._ratio_high_lo_spin = _ratio_spin(DEFAULT_RATIO_HIGH_BAND[0])
+        self._ratio_high_hi_spin = _ratio_spin(DEFAULT_RATIO_HIGH_BAND[1])
+
+        ratio_form = QFormLayout()
+        for label, lo_spin, hi_spin in (
+                ("Band ratio, low band (Hz):",
+                 self._ratio_low_lo_spin, self._ratio_low_hi_spin),
+                ("Band ratio, high band (Hz):",
+                 self._ratio_high_lo_spin, self._ratio_high_hi_spin)):
+            row = QHBoxLayout()
+            row.addWidget(lo_spin)
+            row.addWidget(QLabel("to"))
+            row.addWidget(hi_spin)
+            row.addStretch()
+            ratio_form.addRow(label, row)
+        data_layout.addLayout(ratio_form)
 
         # Sub-analysis 1 — moments at percentage markers
         self._spectral_cb = QCheckBox(
@@ -6315,14 +6327,23 @@ class _DataOptionsPage(QWizardPage):
                 if self._spectral_hp_cb.isChecked() else 0.0)
             wiz.band_low_hz = self._band_lo_spin.value()
             wiz.band_high_hz = self._band_hi_spin.value()
-            wiz.ratio_low_band = (0.0, self._ratio_lo_spin.value())
-            wiz.ratio_high_band = (self._ratio_lo_spin.value(),
-                                   self._ratio_hi_spin.value())
+            wiz.ratio_low_band = (self._ratio_low_lo_spin.value(),
+                                  self._ratio_low_hi_spin.value())
+            wiz.ratio_high_band = (self._ratio_high_lo_spin.value(),
+                                   self._ratio_high_hi_spin.value())
             if wiz.band_high_hz <= wiz.band_low_hz:
                 QMessageBox.warning(
                     self, "Analysis Band",
                     "The band's upper edge must be above its lower edge.")
                 return False
+            for name, (lo, hi) in (("low", wiz.ratio_low_band),
+                                   ("high", wiz.ratio_high_band)):
+                if hi <= lo:
+                    QMessageBox.warning(
+                        self, "Band Ratio",
+                        f"The {name} band's upper edge must be above its "
+                        "lower edge.")
+                    return False
         else:
             wiz.spectral_tier_name = None
             wiz.spectral_window_type = "Hamming"

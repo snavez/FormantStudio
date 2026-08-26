@@ -143,3 +143,38 @@ def test_trajectory_carries_a_ratio_track():
     tracks = fe.compute_spectral_trajectory(snd, 0.05, 0.35)
     assert tracks is not None
     assert fe.BAND_RATIO_NAME in tracks
+
+
+# ---------------------------------------------------------------------------
+# The two ratio bands are independent
+# ---------------------------------------------------------------------------
+
+def test_ratio_bands_need_not_touch():
+    """A gap between the bands ignores whatever falls in it."""
+    snd = _tone_sound([500.0, 2500.0, 6000.0], amps=[1.0, 5.0, 1.0])
+    touching = measure_window(snd, 0.02, 0.18,
+                              ratio_low=(0, 2000), ratio_high=(2000, 8000))[4]
+    with_gap = measure_window(snd, 0.02, 0.18,
+                              ratio_low=(0, 1000), ratio_high=(4000, 8000))[4]
+    # The loud 2500 Hz tone counts as high-band energy when the bands touch,
+    # and is excluded entirely when the gap steps over it.
+    assert touching > with_gap + 10
+
+
+def test_ratio_low_band_need_not_start_at_zero():
+    """With a high-pass already applied, starting above zero is reasonable."""
+    snd = _tone_sound([100.0, 1500.0, 6000.0], amps=[10.0, 1.0, 1.0])
+    from_zero = measure_window(snd, 0.02, 0.18,
+                               ratio_low=(0, 2000), ratio_high=(2000, 8000))[4]
+    above = measure_window(snd, 0.02, 0.18,
+                           ratio_low=(1000, 2000), ratio_high=(2000, 8000))[4]
+    # Excluding the very loud 100 Hz tone shrinks the denominator, so the
+    # ratio rises.
+    assert above > from_zero + 10
+
+
+def test_ratio_bands_may_be_placed_anywhere():
+    snd = _tone_sound([3000.0, 9000.0], amps=[1.0, 1.0])
+    r = measure_window(snd, 0.02, 0.18,
+                       ratio_low=(2500, 3500), ratio_high=(8500, 9500))[4]
+    assert np.isfinite(r) and abs(r) < 6      # two equal tones, near 0 dB
