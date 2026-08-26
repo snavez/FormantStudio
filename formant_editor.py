@@ -1262,6 +1262,41 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     # Pre-scan TextGrids for corpus-dependent column counts: the longest
     # segment (time-step sampling columns) and the most target points in any
     # one row unit (wide FN_<tier>N at-point columns).
+    def _labelled_within(unit, tier):
+        """Labelled intervals of *tier* lying inside *unit*.
+
+        A tier finer than the row unit subdivides it — a stop's closure and
+        release inside its phoneme — and each of those parts is worth
+        reporting separately. Unlabelled stretches are skipped: they mark
+        where the tier has nothing to say.
+        """
+        if tier is None or tier.tier_class != "IntervalTier":
+            return []
+        return [iv for iv in tier.intervals
+                if not is_empty_label(iv.text)
+                and iv.xmin >= unit.xmin - TIME_EPS
+                and iv.xmax <= unit.xmax + TIME_EPS]
+
+    def _subdividing_labels(tier_name, tmap_units):
+        """Distinct labels of *tier_name* where it subdivides a row unit.
+
+        Empty when the tier matches the row unit one for one, or is coarser:
+        that is a correspondence rather than a subdivision, and splitting on
+        it would give a column for every label in the inventory.
+        """
+        labels = []
+        for tmap, units in tmap_units:
+            tier = tmap.get(tier_name)
+            for u in units:
+                inside = _labelled_within(u, tier)
+                if len(inside) < 2:
+                    continue
+                for iv in inside:
+                    lab = iv.text.strip()
+                    if lab not in labels:
+                        labels.append(lab)
+        return labels
+
     def _spectral_segments(unit, tmap):
         """Labelled intervals on the spectral tier that lie inside *unit*.
 
@@ -1275,10 +1310,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         t = tmap.get(spectral_tier_name)
         if t is None or t.tier_class != "IntervalTier":
             return []
-        inside = [iv for iv in t.intervals
-                  if not is_empty_label(iv.text)
-                  and iv.xmin >= unit.xmin - TIME_EPS
-                  and iv.xmax <= unit.xmax + TIME_EPS]
+        inside = _labelled_within(unit, t)
         if inside:
             return inside
         # Coarser than the row unit: one containing interval, so nothing is
@@ -1296,8 +1328,13 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     # has to be surveyed for which labels occur. First-appearance order keeps
     # them in the order they occur in the sound — a closure before its release.
     spectral_labels = []
-    if ((extract_spectral or extract_trajectory) and spectral_tier_name
-            and spectral_tier_name != primary_tier_name):
+    duration_labels = {}
+    _scan_needed = [tn for tn in (duration_tier_names or [])
+                    if tn != primary_tier_name] if extract_durations else []
+    if _scan_needed or ((extract_spectral or extract_trajectory)
+                        and spectral_tier_name
+                        and spectral_tier_name != primary_tier_name):
+        scanned = []
         for af in audio_files:
             bn = os.path.splitext(af)[0]
             tg_path = None
@@ -1316,20 +1353,15 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             pri = tmap.get(primary_tier_name)
             if pri is None or pri.tier_class != "IntervalTier":
                 continue
-            for u in _units_for(pri):
-                inside = [seg for seg in _spectral_segments(u, tmap)
-                          if seg.xmin >= u.xmin - TIME_EPS
-                          and seg.xmax <= u.xmax + TIME_EPS]
-                # Only a tier that genuinely subdivides a row unit is worth
-                # splitting. One interval per unit is a correspondence, not a
-                # subdivision, and keying columns on its label would give a
-                # set per label in the whole inventory.
-                if len(inside) < 2:
-                    continue
-                for seg in inside:
-                    label = seg.text.strip()
-                    if label and label not in spectral_labels:
-                        spectral_labels.append(label)
+            scanned.append((tmap, _units_for(pri)))
+
+        if ((extract_spectral or extract_trajectory) and spectral_tier_name
+                and spectral_tier_name != primary_tier_name):
+            spectral_labels = _subdividing_labels(spectral_tier_name, scanned)
+        for tn in _scan_needed:
+            labels = _subdividing_labels(tn, scanned)
+            if labels:
+                duration_labels[tn] = labels
 
     if time_mode or do_at_points:
         max_dur_s = 0.0
@@ -1496,9 +1528,12 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     # interval's bounds when the tier was also ticked for start/end times
     if extract_durations:
         for tn in duration_tier_names:
-            if tn in bounds_set:
-                headers.extend([f"{tn}_start", f"{tn}_end"])
-            headers.append(f"{tn}_dur")
+            # A tier that subdivides the row unit gets a column per label,
+            # since one duration cannot describe a closure and a release.
+            for key in duration_labels.get(tn, [tn]):
+                if tn in bounds_set:
+                    headers.extend([f"{key}_start", f"{key}_end"])
+                headers.append(f"{key}_dur")
 
     # Spectral-moment columns per marker: the four moments, the effective
     # window (ms), how that window was chosen, and its sample count
@@ -1706,19 +1741,33 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             cols = []
             for tn in duration_tier_names:
                 t = tier_map.get(tn)
-                if t is None or t.tier_class != "IntervalTier":
-                    span = None
+                labels = duration_labels.get(tn)
+
+                if labels:
+                    # Each labelled part of the row unit reports its own span.
+                    by_label = {}
+                    for sub_iv in _labelled_within(iv, t):
+                        by_label.setdefault(sub_iv.text.strip(), sub_iv)
+                    spans = [
+                        ((by_label[k].xmin, by_label[k].xmax)
+                         if k in by_label else None)
+                        for k in labels
+                    ]
+                elif t is None or t.tier_class != "IntervalTier":
+                    spans = [None]
                 elif tn == primary_tier_name and not iv.is_point:
-                    span = (iv.xmin, iv.xmax)
+                    spans = [(iv.xmin, iv.xmax)]
                 else:
                     civ = _find_containing_interval(t, iv.xmin, iv.xmax)
                     if civ is None:
                         civ = _find_containing_interval_for_point(
                             t, (iv.xmin + iv.xmax) / 2)
-                    span = (civ.xmin, civ.xmax) if civ else None
-                if span is None:
-                    cols.extend([""] * (3 if tn in bounds_set else 1))
-                else:
+                    spans = [(civ.xmin, civ.xmax) if civ else None]
+
+                for span in spans:
+                    if span is None:
+                        cols.extend([""] * (3 if tn in bounds_set else 1))
+                        continue
                     if tn in bounds_set:
                         cols.extend([f"{span[0]:.4f}", f"{span[1]:.4f}"])
                     cols.append(f"{span[1] - span[0]:.4f}")
