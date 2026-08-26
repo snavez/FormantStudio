@@ -54,12 +54,13 @@ class TestTrajectoryGeometry:
                 estimator="multitaper")
             assert tracks["COG"].size == n
 
-    def test_all_four_moments_returned(self):
+    def test_every_tracked_quantity_returned(self):
+        """The four moments, plus the band ratio that rides alongside them."""
         snd = _chirp(2000.0, 6000.0)
         tracks = compute_spectral_trajectory(
             snd, 0.0, 0.12, win_ms=6.0, hop_ms=1.0, norm_points=5,
             estimator="multitaper")
-        assert set(tracks) == {"COG", "SD", "skew", "kurt"}
+        assert set(tracks) == {"COG", "SD", "skew", "kurt", "bandratio"}
 
     def test_segment_too_short_returns_none(self):
         snd = _chirp(2000.0, 6000.0, dur=0.05)

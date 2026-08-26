@@ -75,6 +75,20 @@ MIN_SPECTRAL_WINDOW_MS = 5.0        # hard floor — shorter is unreliable
 MAX_SPECTRAL_WINDOW_MS = 50.0       # ceiling — wider blurs short segments
 DEFAULT_SPECTRAL_HIGHPASS_HZ = 0.0  # 0 = off; ~300 Hz removes voicing bleed
 SPECTRAL_MOMENT_POWER = 2.0         # Praat default power for all moments
+
+# The band the moments are taken over. A moment is a weighted sum across
+# frequency, so this decides what it is a moment OF — without it the ceiling
+# is the file's Nyquist, and a 16 kHz recording is not comparable with a
+# 44.1 kHz one. Stated rather than inferred, and recorded in the sidecar.
+DEFAULT_BAND_LOW_HZ = 0.0
+DEFAULT_BAND_HIGH_HZ = 8000.0
+
+# Bands for the energy ratio: power above over power below, in dB. Cruder
+# than a moment and blind to spectral shape, which is the point — it just
+# indexes whether there is frication energy up there.
+DEFAULT_RATIO_LOW_BAND = (0.0, 2000.0)
+DEFAULT_RATIO_HIGH_BAND = (2000.0, 8000.0)
+RATIO_EPSILON = 1e-20               # keeps a silent window finite
 # Proportional windowing: window width as a fraction of segment duration,
 # clamped to [floor, ceiling]. Removes the confound between window artefacts
 # and segment duration that a fixed-ms window introduces.
@@ -97,6 +111,11 @@ DEFAULT_SPECTRAL_MT_K = 7           # number of DPSS tapers
 # time-normalised and reduced to DCT coefficients. Captures how the spectrum
 # evolves through a release rather than three static snapshots.
 SPECTRAL_MOMENT_NAMES = ("COG", "SD", "skew", "kurt")
+
+# The ratio rides alongside the moments everywhere they are tracked: same
+# windows, same clamps, same provenance.
+BAND_RATIO_NAME = "bandratio"
+SPECTRAL_TRACK_NAMES = SPECTRAL_MOMENT_NAMES + (BAND_RATIO_NAME,)
 DEFAULT_TRAJ_WIN_MS = 6.0           # sliding-window width (ms)
 DEFAULT_TRAJ_HOP_MS = 1.0           # sliding-window hop (ms)
 DEFAULT_TRAJ_NORM_POINTS = 11       # samples per time-normalised track
@@ -792,6 +811,79 @@ def highpass_sound(sound, cutoff_hz, smoothing_hz=100.0):
                       float(cutoff_hz), 0.0, float(smoothing_hz))
 
 
+def spectrum_of(sound, t0, t1, window_shape=None, estimator="single_taper",
+                mt_nw=DEFAULT_SPECTRAL_MT_NW, mt_k=DEFAULT_SPECTRAL_MT_K):
+    """Power spectrum over [*t0*, *t1*] as ``(freqs_hz, power)``.
+
+    Both estimators return the same shape of thing, so everything downstream —
+    moments, band limits, energy ratios — works from one array rather than
+    each estimator carrying its own arithmetic.
+
+    Returns ``(None, None)`` when the region is too short to analyse.
+    """
+    if t1 <= t0:
+        return None, None
+    try:
+        if estimator == "multitaper":
+            from scipy.signal.windows import dpss
+            part = sound.extract_part(
+                t0, t1, parselmouth.WindowShape.RECTANGULAR, 1.0, False)
+            x = np.asarray(part.values[0], dtype=float)
+            k_eff = int(min(mt_k, x.size - 1))
+            if x.size < 8 or k_eff < 1:
+                return None, None
+            freqs = np.fft.rfftfreq(x.size, d=1.0 / sound.sampling_frequency)
+            psd = np.zeros(freqs.size, dtype=float)
+            for taper in dpss(x.size, mt_nw, k_eff):
+                spec = np.fft.rfft(x * taper)
+                psd += spec.real ** 2 + spec.imag ** 2
+            return freqs, psd / k_eff
+
+        shape = window_shape or parselmouth.WindowShape.HAMMING
+        part = sound.extract_part(t0, t1, shape, 1.0, False)
+        x = np.asarray(part.values[0], dtype=float)
+        if x.size < 4:
+            return None, None
+        freqs = np.fft.rfftfreq(x.size, d=1.0 / sound.sampling_frequency)
+        spec = np.fft.rfft(x)
+        return freqs, spec.real ** 2 + spec.imag ** 2
+    except Exception:
+        return None, None
+
+
+def band_mask(freqs, band_low, band_high):
+    """Which bins of *freqs* fall inside the analysis band."""
+    if freqs is None:
+        return None
+    m = np.ones(freqs.shape, dtype=bool)
+    if band_low:
+        m &= freqs >= band_low
+    if band_high:
+        m &= freqs <= band_high
+    return m
+
+
+def band_energy_ratio(freqs, power, low_band, high_band):
+    """Power in *high_band* over power in *low_band*, in dB.
+
+    Deliberately blunt: it says whether there is energy up there without
+    caring how the spectrum is shaped, which makes it far steadier than a
+    moment on short or noisy segments. In dB because raw ratios are bounded
+    below by zero and badly skewed, which makes their means misleading.
+    """
+    if freqs is None or power is None:
+        return np.nan
+    lo = band_mask(freqs, *low_band)
+    hi = band_mask(freqs, *high_band)
+    if lo is None or not lo.any() or not hi.any():
+        return np.nan
+    p_lo = float(np.asarray(power)[lo].sum())
+    p_hi = float(np.asarray(power)[hi].sum())
+    if not np.isfinite(p_lo) or not np.isfinite(p_hi) or p_hi <= 0:
+        return np.nan
+    return 10.0 * math.log10(p_hi / max(p_lo, RATIO_EPSILON))
+
+
 def compute_spectral_moments(sound, t0, t1, window_shape, power=SPECTRAL_MOMENT_POWER):
     """Compute the four spectral moments over [*t0*, *t1*] of *sound*.
 
@@ -875,6 +967,38 @@ def compute_spectral_moments_multitaper(sound, t0, t1, nw, k,
         return nan4
 
 
+def measure_window(sound, t0, t1, *, window_shape=None,
+                   estimator=DEFAULT_SPECTRAL_ESTIMATOR,
+                   mt_nw=DEFAULT_SPECTRAL_MT_NW, mt_k=DEFAULT_SPECTRAL_MT_K,
+                   band_low=DEFAULT_BAND_LOW_HZ,
+                   band_high=DEFAULT_BAND_HIGH_HZ,
+                   ratio_low=DEFAULT_RATIO_LOW_BAND,
+                   ratio_high=DEFAULT_RATIO_HIGH_BAND,
+                   power=SPECTRAL_MOMENT_POWER):
+    """The four moments and the band-energy ratio over one window.
+
+    Both estimators reach the same arithmetic here, differing only in how the
+    spectrum was estimated, so a moment means the same thing whichever is
+    chosen. The moments are taken over [*band_low*, *band_high*] rather than
+    to the file's Nyquist, which would otherwise make recordings of different
+    sample rates incomparable.
+
+    Returns ``(cog, sd, skewness, kurtosis, band_ratio_db)``, NaN where a
+    quantity could not be measured.
+    """
+    nan5 = (np.nan,) * 5
+    freqs, power_spec = spectrum_of(sound, t0, t1, window_shape,
+                                    estimator, mt_nw, mt_k)
+    if freqs is None:
+        return nan5
+    ratio = band_energy_ratio(freqs, power_spec, ratio_low, ratio_high)
+    m = band_mask(freqs, band_low, band_high)
+    if m is None or not m.any():
+        return (np.nan, np.nan, np.nan, np.nan, ratio)
+    cog, sd, skew, kurt = _moments_from_power(freqs[m], power_spec[m], power)
+    return (cog, sd, skew, kurt, ratio)
+
+
 def compute_spectral_trajectory(sound, seg_xmin, seg_xmax, *,
                                 win_ms=DEFAULT_TRAJ_WIN_MS,
                                 hop_ms=DEFAULT_TRAJ_HOP_MS,
@@ -882,7 +1006,11 @@ def compute_spectral_trajectory(sound, seg_xmin, seg_xmax, *,
                                 estimator=DEFAULT_SPECTRAL_ESTIMATOR,
                                 window_shape=None,
                                 mt_nw=DEFAULT_SPECTRAL_MT_NW,
-                                mt_k=DEFAULT_SPECTRAL_MT_K):
+                                mt_k=DEFAULT_SPECTRAL_MT_K,
+                                band_low=DEFAULT_BAND_LOW_HZ,
+                                band_high=DEFAULT_BAND_HIGH_HZ,
+                                ratio_low=DEFAULT_RATIO_LOW_BAND,
+                                ratio_high=DEFAULT_RATIO_HIGH_BAND):
     """Time-normalised moment tracks across [*seg_xmin*, *seg_xmax*].
 
     Slides a narrow window (*win_ms*) by *hop_ms* across the segment, keeping
@@ -908,15 +1036,14 @@ def compute_spectral_trajectory(sound, seg_xmin, seg_xmax, *,
         return None
 
     centres = first + np.arange(n_frames) * hop_s
-    tracks = {m: np.full(n_frames, np.nan) for m in SPECTRAL_MOMENT_NAMES}
+    tracks = {m: np.full(n_frames, np.nan) for m in SPECTRAL_TRACK_NAMES}
     for i, centre in enumerate(centres):
         t0, t1 = centre - win_s / 2.0, centre + win_s / 2.0
-        if estimator == "multitaper":
-            vals = compute_spectral_moments_multitaper(
-                sound, t0, t1, mt_nw, mt_k)
-        else:
-            vals = compute_spectral_moments(sound, t0, t1, window_shape)
-        for name, val in zip(SPECTRAL_MOMENT_NAMES, vals):
+        vals = measure_window(
+            sound, t0, t1, window_shape=window_shape, estimator=estimator,
+            mt_nw=mt_nw, mt_k=mt_k, band_low=band_low, band_high=band_high,
+            ratio_low=ratio_low, ratio_high=ratio_high)
+        for name, val in zip(SPECTRAL_TRACK_NAMES, vals):
             tracks[name][i] = val
 
     src_tau = np.linspace(0.0, 1.0, n_frames)
@@ -1144,6 +1271,10 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     spectral_mt_nw=DEFAULT_SPECTRAL_MT_NW,
                     spectral_mt_k=DEFAULT_SPECTRAL_MT_K,
                     extract_trajectory=False,
+                    band_low_hz=DEFAULT_BAND_LOW_HZ,
+                    band_high_hz=DEFAULT_BAND_HIGH_HZ,
+                    ratio_low_band=DEFAULT_RATIO_LOW_BAND,
+                    ratio_high_band=DEFAULT_RATIO_HIGH_BAND,
                     traj_moments=None,
                     traj_win_ms=DEFAULT_TRAJ_WIN_MS,
                     traj_hop_ms=DEFAULT_TRAJ_HOP_MS,
@@ -1212,7 +1343,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     if traj_moments is None:
         traj_moments = list(DEFAULT_TRAJ_MOMENTS)
     # Keep a stable, canonical order regardless of how they were supplied
-    traj_moments = [m for m in SPECTRAL_MOMENT_NAMES if m in set(traj_moments)]
+    traj_moments = [m for m in SPECTRAL_TRACK_NAMES if m in set(traj_moments)]
 
     # Discover audio files
     audio_exts = {".wav", ".aiff", ".mp3"}
@@ -1549,6 +1680,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 pct_s = f"{pct:g}"
                 headers.extend([f"COG{sfx}_{pct_s}%", f"SD{sfx}_{pct_s}%",
                                 f"skew{sfx}_{pct_s}%", f"kurt{sfx}_{pct_s}%",
+                                f"{BAND_RATIO_NAME}{sfx}_{pct_s}%",
                                 f"winms{sfx}_{pct_s}%",
                                 f"winsource{sfx}_{pct_s}%",
                                 f"nsamples{sfx}_{pct_s}%"])
@@ -1846,7 +1978,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             cols = []
             seg = iv
             if seg is None:
-                return [""] * (7 * len(spectral_markers))
+                return [""] * (8 * len(spectral_markers))   # + band ratio
             seg_min, seg_max = seg.xmin, seg.xmax
             dur = seg_max - seg_min
             sr = (spectral_sound.sampling_frequency
@@ -1863,21 +1995,22 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     win_min_s=spectral_min_window_ms / 1000.0,
                     win_max_s=spectral_win_max_ms / 1000.0)
                 if win_source == "too_short":
-                    cols.extend(["", "", "", "", "", "too_short", ""])
+                    cols.extend(["", "", "", "", "", "", "too_short", ""])
                     continue
                 actual_ms = (t1 - t0) * 1000.0
                 nsamples = int(round((t1 - t0) * sr))
-                if spectral_estimator == "multitaper":
-                    cog, sd, sk, ku = compute_spectral_moments_multitaper(
-                        spectral_sound, t0, t1, spectral_mt_nw, spectral_mt_k)
-                else:
-                    cog, sd, sk, ku = compute_spectral_moments(
-                        spectral_sound, t0, t1, spectral_shape)
+                cog, sd, sk, ku, ratio = measure_window(
+                    spectral_sound, t0, t1, window_shape=spectral_shape,
+                    estimator=spectral_estimator,
+                    mt_nw=spectral_mt_nw, mt_k=spectral_mt_k,
+                    band_low=band_low_hz, band_high=band_high_hz,
+                    ratio_low=ratio_low_band, ratio_high=ratio_high_band)
                 cols.extend([
                     f"{cog:.1f}" if not np.isnan(cog) else "",
                     f"{sd:.1f}" if not np.isnan(sd) else "",
                     f"{sk:.4f}" if not np.isnan(sk) else "",
                     f"{ku:.4f}" if not np.isnan(ku) else "",
+                    f"{ratio:.3f}" if not np.isnan(ratio) else "",
                     f"{actual_ms:.1f}", win_source, str(nsamples),
                 ])
             return cols
@@ -1901,7 +2034,9 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 win_ms=traj_win_ms, hop_ms=traj_hop_ms,
                 norm_points=traj_norm_points,
                 estimator=spectral_estimator, window_shape=spectral_shape,
-                mt_nw=spectral_mt_nw, mt_k=spectral_mt_k)
+                mt_nw=spectral_mt_nw, mt_k=spectral_mt_k,
+                band_low=band_low_hz, band_high=band_high_hz,
+                ratio_low=ratio_low_band, ratio_high=ratio_high_band)
             if tracks is None:
                 return blank
             cols = []
@@ -1990,7 +2125,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         # --- Row generation: exactly one row per primary-tier unit ---
         for unit in units:
             lc = _label_cols(unit)
-            row = [audio_file] + lc
+            row = [os.path.splitext(audio_file)[0]] + lc
             if reconcile_allophone_tier:
                 row.append(unit.alignment or "")
 
@@ -4488,7 +4623,7 @@ class ControlPanel(QWidget):
         freq_row = QHBoxLayout()
         freq_row.addWidget(QLabel("Max Freq (Hz):"))
         self.max_freq_spin = QDoubleSpinBox()
-        self.max_freq_spin.setRange(1000, 12000)
+        self.max_freq_spin.setRange(1000, 20000)
         self.max_freq_spin.setValue(DEFAULT_SPEC_MAX_FREQ)
         self.max_freq_spin.setSingleStep(500)
         freq_row.addWidget(self.max_freq_spin)
@@ -5562,6 +5697,55 @@ class _DataOptionsPage(QWizardPage):
         data_layout.addLayout(hp_row)
         self._spectral_hp_cb.toggled.connect(self._spectral_hp_spin.setEnabled)
 
+        # The band the moments are taken over. Distinct from the filter above:
+        # a filter attenuates, a band decides which frequencies enter the sum
+        # at all. Left unstated the ceiling is the file's Nyquist, so a 16 kHz
+        # recording is not comparable with a 44.1 kHz one.
+        band_row = QHBoxLayout()
+        band_row.addWidget(QLabel("Analysis band (Hz):"))
+        self._band_lo_spin = QDoubleSpinBox()
+        self._band_lo_spin.setRange(0.0, 20000.0)
+        self._band_lo_spin.setSingleStep(100.0)
+        self._band_lo_spin.setValue(DEFAULT_BAND_LOW_HZ)
+        self._band_hi_spin = QDoubleSpinBox()
+        self._band_hi_spin.setRange(1000.0, 48000.0)
+        self._band_hi_spin.setSingleStep(1000.0)
+        self._band_hi_spin.setValue(DEFAULT_BAND_HIGH_HZ)
+        for w in (self._band_lo_spin, QLabel("to"), self._band_hi_spin):
+            band_row.addWidget(w)
+        band_row.addStretch()
+        band_tip = ("The frequencies the moments are computed over. Fixing it "
+                    "keeps recordings of different sample rates comparable, "
+                    "and it is recorded alongside the results.")
+        self._band_lo_spin.setToolTip(band_tip)
+        self._band_hi_spin.setToolTip(band_tip)
+        data_layout.addLayout(band_row)
+
+        # A blunter measure than a moment, and steadier for it: energy up
+        # there over energy down here, which just indexes whether there is
+        # frication rather than describing the spectrum's shape.
+        ratio_row = QHBoxLayout()
+        ratio_row.addWidget(QLabel("Band ratio (Hz): low"))
+        self._ratio_lo_spin = QDoubleSpinBox()
+        self._ratio_lo_spin.setRange(0.0, 20000.0)
+        self._ratio_lo_spin.setSingleStep(500.0)
+        self._ratio_lo_spin.setValue(DEFAULT_RATIO_LOW_BAND[1])
+        self._ratio_hi_spin = QDoubleSpinBox()
+        self._ratio_hi_spin.setRange(1000.0, 48000.0)
+        self._ratio_hi_spin.setSingleStep(1000.0)
+        self._ratio_hi_spin.setValue(DEFAULT_RATIO_HIGH_BAND[1])
+        ratio_row.addWidget(QLabel("0 to"))
+        ratio_row.addWidget(self._ratio_lo_spin)
+        ratio_row.addWidget(QLabel("  over  that to"))
+        ratio_row.addWidget(self._ratio_hi_spin)
+        ratio_row.addStretch()
+        ratio_tip = ("Reported in dB as power in the high band over power in "
+                     "the low band. The high band runs from the low band's "
+                     "edge up to this ceiling.")
+        self._ratio_lo_spin.setToolTip(ratio_tip)
+        self._ratio_hi_spin.setToolTip(ratio_tip)
+        data_layout.addLayout(ratio_row)
+
         # Sub-analysis 1 — moments at percentage markers
         self._spectral_cb = QCheckBox(
             "Spectral moments (COG, SD, skewness, kurtosis)")
@@ -6129,6 +6313,16 @@ class _DataOptionsPage(QWizardPage):
             wiz.spectral_highpass_hz = (
                 self._spectral_hp_spin.value()
                 if self._spectral_hp_cb.isChecked() else 0.0)
+            wiz.band_low_hz = self._band_lo_spin.value()
+            wiz.band_high_hz = self._band_hi_spin.value()
+            wiz.ratio_low_band = (0.0, self._ratio_lo_spin.value())
+            wiz.ratio_high_band = (self._ratio_lo_spin.value(),
+                                   self._ratio_hi_spin.value())
+            if wiz.band_high_hz <= wiz.band_low_hz:
+                QMessageBox.warning(
+                    self, "Analysis Band",
+                    "The band's upper edge must be above its lower edge.")
+                return False
         else:
             wiz.spectral_tier_name = None
             wiz.spectral_window_type = "Hamming"
@@ -6136,6 +6330,10 @@ class _DataOptionsPage(QWizardPage):
             wiz.spectral_mt_nw = DEFAULT_SPECTRAL_MT_NW
             wiz.spectral_mt_k = DEFAULT_SPECTRAL_MT_K
             wiz.spectral_highpass_hz = 0.0
+            wiz.band_low_hz = DEFAULT_BAND_LOW_HZ
+            wiz.band_high_hz = DEFAULT_BAND_HIGH_HZ
+            wiz.ratio_low_band = DEFAULT_RATIO_LOW_BAND
+            wiz.ratio_high_band = DEFAULT_RATIO_HIGH_BAND
 
         if wiz.extract_spectral:
             raw = self._spectral_markers_edit.text().strip()
@@ -6879,6 +7077,10 @@ class BuildCSVWizard(QWizard):
         self.spectral_mt_nw = DEFAULT_SPECTRAL_MT_NW
         self.spectral_mt_k = DEFAULT_SPECTRAL_MT_K
         self.spectral_highpass_hz = 0.0
+        self.band_low_hz = DEFAULT_BAND_LOW_HZ
+        self.band_high_hz = DEFAULT_BAND_HIGH_HZ
+        self.ratio_low_band = DEFAULT_RATIO_LOW_BAND
+        self.ratio_high_band = DEFAULT_RATIO_HIGH_BAND
 
         # Trajectory / DCT state (Page 3)
         self.extract_trajectory = False
@@ -7950,6 +8152,10 @@ class MainWindow(QMainWindow):
                 traj_dct_coeffs=wizard.traj_dct_coeffs,
                 traj_include_track=wizard.traj_include_track,
                 spectral_highpass_hz=wizard.spectral_highpass_hz,
+                band_low_hz=wizard.band_low_hz,
+                band_high_hz=wizard.band_high_hz,
+                ratio_low_band=wizard.ratio_low_band,
+                ratio_high_band=wizard.ratio_high_band,
                 categorise=wizard.categorise,
                 cat_chart=cat_chart,
                 cat_notation=wizard.cat_notation,
@@ -8184,6 +8390,14 @@ class MainWindow(QMainWindow):
                     "mt_nw": wizard.spectral_mt_nw,
                     "mt_k": wizard.spectral_mt_k,
                     "highpass_hz": wizard.spectral_highpass_hz,
+                    "analysis_band_hz": [wizard.band_low_hz,
+                                         wizard.band_high_hz],
+                    "band_ratio_low_hz": list(wizard.ratio_low_band),
+                    "band_ratio_high_hz": list(wizard.ratio_high_band),
+                    "band_ratio_units": "dB, 10*log10(P_high / P_low)",
+                    # Neither spectral estimator applies any spectral tilt;
+                    # pre-emphasis belongs to the formant analysis alone.
+                    "pre_emphasis": "none",
                     "moment_power": SPECTRAL_MOMENT_POWER,
                     "kurtosis": "excess (Gaussian = 0)",
                 } if wizard.extract_spectral else None,
