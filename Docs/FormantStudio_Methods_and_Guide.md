@@ -352,6 +352,23 @@ Either can be used on its own, or both together. They measure the same audio on 
 with the same estimator, but with deliberately different windows: wide and stable for the point
 moments, narrow and time-local for the trajectory.
 
+**Which tier the spectra are measured on.** The segment tier starts on the *primary* tier — the
+one that defines a row — which measures each row across the whole primary interval and names the
+columns plainly (`COG_20%`). Point it at a **finer** tier instead, one whose intervals subdivide
+the primary ones (an `acoustic_segments` tier splitting a `/t/` into `closure` and `release`), and
+each part gets its own block of columns named after the label that fills it (`COG_closure_20%`,
+`COG_release_20%`).
+
+Because the primary tier is the *default*, that choice is easy to make by accident, so the wizard
+checks: if you leave the spectral page with the segment tier on the primary tier while a selected
+tier would have subdivided it, a warning names that tier and its labels and offers **Continue** or
+**Go back**. It is a warning, not a block — measuring the whole interval is a legitimate choice,
+and the check only asks that it be a deliberate one. It exists because nothing in the finished CSV
+gives the mistake away: duration columns are ticked per tier separately, so `closure_dur` and
+`release_dur` still come out correctly per part while every spectral number quietly spans both.
+The wizard reads the first few TextGrids in the directory rather than the whole corpus — enough to
+see a subdividing tier without stalling the page.
+
 ### 5.0 The four moments
 
 ### 5.1 What it measures
@@ -380,6 +397,13 @@ default). Kurtosis is **excess** (a Gaussian spectrum yields 0), matching Praat.
   (verified to reproduce parselmouth's own moment functions), so the two estimators are directly
   comparable — only the spectral *estimate* changes. In testing, multitaper cut the COG scatter
   on 5 ms windows by roughly a third. See Thomson (1982); Reidy (2015); Shadle et al.
+
+  Deriving the DPSS tapers means solving an eigenproblem, and it costs far more than the
+  transforms that follow — around 90% of the work of one multitaper spectrum. The tapers depend
+  only on the window's sample count, `NW` and `K`, so they are computed once per distinct window
+  length and reused. A trajectory slides one fixed-width window along a segment, so in practice
+  the whole pass solves it once and reuses that result for every frame in the corpus. This is a
+  speed optimisation only: the numbers are bit-for-bit what the uncached path produced.
 
 _Method provenance:_ Forrest, Weismer, Milenkovic & Dougall (1988) established spectral moments
 for obstruents; COG/SD are the most robust, with skew/kurtosis noisier — which is why the
@@ -441,6 +465,9 @@ three local snapshots with gaps, which is the intended trade for long segments.
 Per percentage marker `p`, the CSV carries:
 
 - `COG_p%`, `SD_p%`, `skew_p%`, `kurt_p%` — the four moments (blank when unmeasurable).
+- `bandratio_p%` — energy in the high ratio band over energy in the low one, in dB
+  (`10*log10(P_high / P_low)`). Blunter than a moment and far steadier on short or noisy
+  segments: it says whether there is energy up there without describing the shape.
 - `winms_p%` — the **effective** window width actually used (ms), so you can see what was
   measured (blank when `too_short`).
 - `winsource_p%` — which rule set the width: `proportional`, `clamped_max`, `fixed`,
@@ -450,6 +477,11 @@ Per percentage marker `p`, the CSV carries:
 These transparency columns are FRED-friendly: you can **filter or group** on `winsource`
 (e.g. keep only `proportional`, or drop `clamped_min`/`too_short` before analysing skewness) or
 threshold on `nsamples`, without any of them affecting the moments themselves.
+
+When the segment tier subdivides the primary tier, every column above is repeated per
+sub-segment with the label in its name — `COG_closure_20%`, `nsamples_release_50%` — in the order
+the labels occur in the sound. With the segment tier on the primary tier there is one block and no
+region name, and the columns read `COG_20%` as shown.
 
 ### 5.6 Spectral trajectory (DCT) — capturing dynamics
 
@@ -517,10 +549,59 @@ The CSV builder is deliberately generic: it imposes no fixed tier names or hiera
 - **Spectral trajectory (optional):** §5.6, wide `<moment>_k*` DCT coefficients and
   `<moment>_t*` normalised-track columns on the same segment tier.
 - **Categorisation (optional):** IPA/SAMPA property columns (place, manner, height, etc.)
-  derived from labels via the built-in chart.
+  derived from labels via the built-in chart — for the main segments, the flanking ones, or
+  both (§6.1).
 - **Missing-value convention:** empty cell throughout, for every measure.
 - **Unmatched files:** an audio file with no matching TextGrid is reported (not silently blank);
   TextGrids must share the audio file's exact base name.
+
+### 6.1 Categorising the flanking segments
+
+Categorisation asks the chart what a label *is* — vowel or consonant, its place, manner, height,
+and so on — and writes the answer into columns named after the label column it classified:
+
+| Label column | Columns it yields |
+|---|---|
+| `MAU` | `MAU_type`, `MAU_V_height`, `MAU_C_place`, `MAU_aspirated`, … |
+| `MAU_prev` | `MAU_prev_type`, `MAU_prev_V_height`, `MAU_prev_C_place`, … |
+| `MAU_next` | `MAU_next_type`, `MAU_next_V_height`, `MAU_next_C_place`, … |
+
+The naming rule is the same one in all three rows — *label column, then property* — so anything
+that already finds `MAU_C_place` finds `MAU_prev_C_place` by the same search.
+
+**Choosing it.** On the categorisation page, *Tier labels to categorise* picks the main segments.
+It starts on a single tier — the produced/allophone tier when reconciliation named one, otherwise
+the primary tier — because that is the tier whose labels are phonetic symbols. Tick another only
+when its labels are symbols too: pointing the classifier at an orthographic or word tier yields
+nothing but a long unmatched-label report. *Also categorise labels from …* adds the preceding
+and/or following segment independently. The two flanking options are only available once the
+matching `<tier>_prev` / `<tier>_next` label column has been turned on (tier page, *Segment
+context*) — there is nothing to classify otherwise, so an unticked context column leaves its
+option off the page, and an untouched *Segment context* hides the section altogether.
+
+**Which tier they describe.** The flanking labels come from the *context* tier — whatever
+*Read context from* is set to, which defaults to the primary tier. So the columns are named after
+that tier, not after the tiers on the *Tier labels to categorise* list. If you read context from
+`allophone` while categorising `MAU`, you get `MAU_*` alongside `allophone_prev_*`.
+
+**When you would want it.** Coarticulation is the usual reason: what a segment looks like
+acoustically depends heavily on what surrounds it. Having the neighbour's *label* lets you group
+by environment; having its *category* lets you group by phonetic class, which is what most
+analyses actually want and what a mixed-effects model can take as a factor. Concretely:
+
+- Filter or facet vowel formants by whether the following consonant is `velar` vs `alveolar`,
+  without writing out every label that falls into each class.
+- Test whether fricative COG shifts before rounded vs unrounded vowels, using
+  `<tier>_next_V_rounding` directly as a predictor.
+- Separate a stop's release by following vowel height without hand-coding the vowel inventory.
+
+Left blank where the neighbour is missing or unclassifiable: at a recording edge, next to a
+pause, or when the label is not in the chart for the notation you chose. An unclassifiable
+flanking label is reported once against the tier it came from, not once per flanking column.
+
+Diacritic and diphthong handling matches the main columns, including the diphthong review
+dialog — if you reject a candidate there, it is reclassified as `vowel-combination` in the
+flanking columns too, so the same label never reads two different ways in one row.
 
 See `FormantStudio_Specification.md` §2.7 for the full column catalogue and ordering rules.
 
@@ -536,7 +617,7 @@ See `FormantStudio_Specification.md` §2.7 for the full column catalogue and ord
 - Spectral: window mode (proportional/fixed), width (% or ms), min window, max window,
   window shape (Hamming/Hann), high-pass on/off + cutoff, percentage markers, segment tier.
 - Build CSV: primary tier, tier inclusion, formant sampling mode/markers, duration & bounds
-  per tier, categorisation options.
+  per tier, categorisation options (including whether to categorise the flanking segments).
 
 **Fixed by design (with reason):**
 
@@ -570,7 +651,16 @@ clamps, multitaper estimation, flanking segment context, and the trajectory/DCT 
 A **provenance sidecar** is already written: every exported CSV gets a companion
 `<name>.provenance.json` recording the resolved run configuration (primary tier, selected tiers,
 and the exact formant/duration/spectral settings including estimator and its parameters), so a
-run is reproducible from its record.
+run is reproducible from its record. `spectral.segment_tier` is worth reading first — compared
+with `primary_tier` it says at a glance whether the spectra were measured per sub-segment or
+across the whole primary interval.
+
+The sidecar is written **beside the CSV**, at the path you chose in the save dialog, and the
+status bar names it when the export finishes. The two files belong together: copy or move a CSV
+on its own and it arrives with no record of how it was made. If the sidecar cannot be written the
+export still stands — the rows are the expensive part and they are already saved — but you are
+told, because a reader that finds no sidecar cannot tell a failed write from a run that predates
+the feature.
 
 ---
 

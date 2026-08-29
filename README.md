@@ -48,8 +48,10 @@ Praat's automatic formant tracking is excellent but not infallible — particula
 - **Build CSV wizard** (Tools > Build CSV) for batch extraction of formant values across multiple files
 - **Two extraction modes**: percentage-based (e.g. 25%, 50%, 75% of each interval) or absolute time points
 - **Point tier support**: Extract labels and times from TextTier point tiers
-- **Phonetic categorisation**: Optionally classify labels by manner, place, voicing, height, backness, and rounding using an IPA/SAMPA chart
+- **Phonetic categorisation**: Optionally classify labels by manner, place, voicing, height, backness, and rounding using an IPA/SAMPA chart — for the main segments, the preceding/following ones, or both
 - **Diphthong handling**: Automatic detection and classification of diphthongs and vowel combinations
+- **Spectral segment-tier check**: Spectral measurements default to the row tier, which spans the whole interval; if a finer tier is selected that would have split them (a `closure`/`release` tier under a stop), the wizard says so before the run instead of after
+- **Provenance sidecar**: Every exported CSV is written with a companion `<name>.provenance.json` recording the settings that produced it — keep the two together, and if it cannot be written you are told rather than left guessing
 
 ### IPA/SAMPA Reference
 - **Built-in IPA/SAMPA chart** (View menu) — quick reference panel for phonetic symbols

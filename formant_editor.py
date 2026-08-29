@@ -20,6 +20,7 @@ import json
 import csv
 import errno
 import math
+import functools
 import time as _time
 import numpy as np
 import parselmouth
@@ -811,6 +812,23 @@ def highpass_sound(sound, cutoff_hz, smoothing_hz=100.0):
                       float(cutoff_hz), 0.0, float(smoothing_hz))
 
 
+@functools.lru_cache(maxsize=128)
+def _dpss_tapers(n, nw, k):
+    """The *k* DPSS tapers of length *n* for time-bandwidth product *nw*.
+
+    Solving the tridiagonal eigenproblem behind these tapers dominates a
+    multitaper spectrum -- around 90% of the cost at the window lengths we
+    analyse -- while a trajectory slides one fixed-width window along a
+    segment, so every frame asks for the identical taper set.  Caching turns
+    that into one solve per distinct window length.  The array is returned
+    read-only: callers share the cached copy and must not write to it.
+    """
+    from scipy.signal.windows import dpss
+    tapers = dpss(n, nw, k)
+    tapers.flags.writeable = False
+    return tapers
+
+
 def spectrum_of(sound, t0, t1, window_shape=None, estimator="single_taper",
                 mt_nw=DEFAULT_SPECTRAL_MT_NW, mt_k=DEFAULT_SPECTRAL_MT_K):
     """Power spectrum over [*t0*, *t1*] as ``(freqs_hz, power)``.
@@ -825,7 +843,6 @@ def spectrum_of(sound, t0, t1, window_shape=None, estimator="single_taper",
         return None, None
     try:
         if estimator == "multitaper":
-            from scipy.signal.windows import dpss
             part = sound.extract_part(
                 t0, t1, parselmouth.WindowShape.RECTANGULAR, 1.0, False)
             x = np.asarray(part.values[0], dtype=float)
@@ -833,10 +850,9 @@ def spectrum_of(sound, t0, t1, window_shape=None, estimator="single_taper",
             if x.size < 8 or k_eff < 1:
                 return None, None
             freqs = np.fft.rfftfreq(x.size, d=1.0 / sound.sampling_frequency)
-            psd = np.zeros(freqs.size, dtype=float)
-            for taper in dpss(x.size, mt_nw, k_eff):
-                spec = np.fft.rfft(x * taper)
-                psd += spec.real ** 2 + spec.imag ** 2
+            tapers = _dpss_tapers(x.size, float(mt_nw), k_eff)
+            spec = np.fft.rfft(x * tapers, axis=1)
+            psd = (spec.real ** 2 + spec.imag ** 2).sum(axis=0)
             return freqs, psd / k_eff
 
         shape = window_shape or parselmouth.WindowShape.HAMMING
@@ -1251,6 +1267,170 @@ def _classify_label(label, chart_lookup, notation, known_vowels):
     return {}, modifiers, False
 
 
+def _units_for(primary_tier):
+    """Row units for a primary tier: labelled intervals, or all points.
+
+    Each unit carries the label of its immediately adjacent neighbour on
+    the primary tier (by time) — the previous/next interval (Praat tiers
+    tile, so an empty neighbour is a real pause and reads as "") or the
+    previous/next point.  Edges have "" for the missing side.
+    """
+    if primary_tier.tier_class == "IntervalTier":
+        ivs = primary_tier.intervals
+        units = []
+        for i, iv in enumerate(ivs):
+            if is_empty_label(iv.text):
+                continue
+            prev = ivs[i - 1].text if i > 0 else ""
+            nxt = ivs[i + 1].text if i + 1 < len(ivs) else ""
+            units.append(_RowUnit(iv.xmin, iv.xmax, iv.text, False,
+                                  prev, nxt))
+        return units
+    pts = primary_tier.points
+    return [_RowUnit(p.time, p.time, p.mark, True,
+                     pts[i - 1].mark if i > 0 else "",
+                     pts[i + 1].mark if i + 1 < len(pts) else "")
+            for i, p in enumerate(pts)]
+
+
+def _labelled_within(unit, tier):
+    """Labelled intervals of *tier* lying inside *unit*.
+
+    A tier finer than the row unit subdivides it — a stop's closure and
+    release inside its phoneme — and each of those parts is worth
+    reporting separately. Unlabelled stretches are skipped: they mark
+    where the tier has nothing to say.
+    """
+    if tier is None or tier.tier_class != "IntervalTier":
+        return []
+    return [iv for iv in tier.intervals
+            if not is_empty_label(iv.text)
+            and iv.xmin >= unit.xmin - TIME_EPS
+            and iv.xmax <= unit.xmax + TIME_EPS]
+
+
+def _subdividing_labels(tier_name, tmap_units):
+    """Distinct labels of *tier_name* where it subdivides a row unit.
+
+    Empty when the tier matches the row unit one for one, or is coarser:
+    that is a correspondence rather than a subdivision, and splitting on
+    it would give a column for every label in the inventory.
+    """
+    labels = []
+    for tmap, units in tmap_units:
+        tier = tmap.get(tier_name)
+        for u in units:
+            inside = _labelled_within(u, tier)
+            if len(inside) < 2:
+                continue
+            for iv in inside:
+                lab = iv.text.strip()
+                if lab not in labels:
+                    labels.append(lab)
+    return labels
+
+
+def _scan_row_units(textgrid_dir, primary_tier_name, max_files=5):
+    """(tier map, row units) pairs read from the first few TextGrids.
+
+    The pairs are what ``_subdividing_labels`` consumes. Only *max_files*
+    grids are read: this runs from a wizard page's validation, where a walk
+    over a whole corpus would stall the UI, and a tier that subdivides the
+    primary one does so in every file that carries it — a handful is ample
+    to see it. Files without the primary tier, or with it as a point tier,
+    are skipped; so is anything that will not parse.
+    """
+    scanned = []
+    try:
+        names = sorted(os.listdir(textgrid_dir))
+    except OSError:
+        return scanned
+    for fn in names:
+        if not fn.lower().endswith(".textgrid"):
+            continue
+        try:
+            tg = TextGrid.from_file(os.path.join(textgrid_dir, fn))
+        except Exception:
+            continue
+        tmap = {t.name: t for t in tg.tiers}
+        pri = tmap.get(primary_tier_name)
+        if pri is None or pri.tier_class != "IntervalTier":
+            continue
+        scanned.append((tmap, _units_for(pri)))
+        if len(scanned) >= max_files:
+            break
+    return scanned
+
+
+def _tiers_subdividing_primary(textgrid_dir, primary_tier_name, tier_names,
+                               max_files=5):
+    """Which of *tier_names* cut the primary tier's intervals into parts.
+
+    The same test the export itself applies when it decides whether a tier
+    earns a column per sub-segment, so the answer here and the answer there
+    agree. Returns the names in the order given, each paired with the labels
+    it would produce: ``[("acoustic_segments", ["closure", "release"])]``.
+    """
+    others = [n for n in tier_names if n and n != primary_tier_name]
+    if not others:
+        return []
+    scanned = _scan_row_units(textgrid_dir, primary_tier_name, max_files)
+    if not scanned:
+        return []
+    found = []
+    for name in others:
+        labels = _subdividing_labels(name, scanned)
+        if labels:
+            found.append((name, labels))
+    return found
+
+
+def _cat_label_columns(headers, cat_tier_names, context_name,
+                       cat_prev_segment, cat_next_segment):
+    """Which column holds the label behind each block of categorisation columns.
+
+    Returns ``[(prefix, label column index), ...]``, in the order the blocks
+    were built. A categorised tier's label sits in its own label column; a
+    flanking prefix *is* the name of the column it classified. Both are found
+    by name, so a pass over the finished rows can reach the label behind any
+    ``<prefix>_*`` block without re-deriving the header layout.
+    """
+    sources = list(cat_tier_names)
+    if cat_prev_segment:
+        sources.append(f"{context_name}_prev")
+    if cat_next_segment:
+        sources.append(f"{context_name}_next")
+    return [(name, headers.index(name)) for name in sources if name in headers]
+
+
+def _reclassify_rejected_diphthongs(headers, rows, cat_label_cols, rejected):
+    """Rewrite the classification of labels rejected as diphthongs.
+
+    A rejected candidate is a vowel combination rather than a diphthong, so
+    its ``_type`` reads "vowel", its ``_V_subtype`` "vowel-combination", and
+    the vowel/consonant detail columns are emptied. Diacritic columns describe
+    the label itself and stand. Driven from *cat_label_cols*, so a label
+    rejected once reads the same way in the flanking columns as in the main
+    ones rather than "diphthong" in one and not the other.
+    """
+    for row in rows:
+        for prefix, label_idx in cat_label_cols:
+            label_text = row[label_idx] if label_idx < len(row) else ""
+            lbl = label_text.split(";")[0].strip() if label_text else ""
+            if lbl not in rejected:
+                continue
+            for hi, h in enumerate(headers):
+                if hi >= len(row):
+                    continue
+                if h == f"{prefix}_type":
+                    row[hi] = "vowel"
+                elif h == f"{prefix}_V_subtype":
+                    row[hi] = "vowel-combination"
+                elif (h.startswith(f"{prefix}_V_")
+                      or h.startswith(f"{prefix}_C_")):
+                    row[hi] = ""
+
+
 def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     selected_tiers, extract_formants, formant_mode,
                     point_tier_name, segment_tier_name,
@@ -1288,6 +1468,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     context_tier_name=None,
                     categorise=False, cat_chart=None,
                     cat_notation="ipa", cat_tier_names=None,
+                    cat_prev_segment=False, cat_next_segment=False,
                     cat_vowel_props=None, cat_consonant_props=None,
                     auto_diphthong_candidates=None,
                     unmatched_labels=None,
@@ -1320,6 +1501,10 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     When *time_step_ms* is set, segment formant columns use fixed time offsets
     (ms from onset) instead of percentage markers.
     When *categorise* is True, classification columns are appended.
+    *cat_prev_segment*/*cat_next_segment* extend that classification to the
+    flanking labels, adding ``<context>_prev_*`` / ``<context>_next_*``
+    columns alongside the ``<tier>_*`` ones.  Each needs its matching
+    *include_prev_segment*/*include_next_segment* column to read from.
     *auto_diphthong_candidates* and *unmatched_labels* are mutable sets
     that collect data for post-processing. *skipped_files* is a mutable
     list collecting (filename, reason) for audio files that produced no
@@ -1365,69 +1550,6 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         t.name == primary_tier_name and t.tier_class == "TextTier"
         for t in selected_tiers)
 
-    def _units_for(primary_tier):
-        """Row units for a primary tier: labelled intervals, or all points.
-
-        Each unit carries the label of its immediately adjacent neighbour on
-        the primary tier (by time) — the previous/next interval (Praat tiers
-        tile, so an empty neighbour is a real pause and reads as "") or the
-        previous/next point.  Edges have "" for the missing side.
-        """
-        if primary_tier.tier_class == "IntervalTier":
-            ivs = primary_tier.intervals
-            units = []
-            for i, iv in enumerate(ivs):
-                if is_empty_label(iv.text):
-                    continue
-                prev = ivs[i - 1].text if i > 0 else ""
-                nxt = ivs[i + 1].text if i + 1 < len(ivs) else ""
-                units.append(_RowUnit(iv.xmin, iv.xmax, iv.text, False,
-                                      prev, nxt))
-            return units
-        pts = primary_tier.points
-        return [_RowUnit(p.time, p.time, p.mark, True,
-                         pts[i - 1].mark if i > 0 else "",
-                         pts[i + 1].mark if i + 1 < len(pts) else "")
-                for i, p in enumerate(pts)]
-
-    # Pre-scan TextGrids for corpus-dependent column counts: the longest
-    # segment (time-step sampling columns) and the most target points in any
-    # one row unit (wide FN_<tier>N at-point columns).
-    def _labelled_within(unit, tier):
-        """Labelled intervals of *tier* lying inside *unit*.
-
-        A tier finer than the row unit subdivides it — a stop's closure and
-        release inside its phoneme — and each of those parts is worth
-        reporting separately. Unlabelled stretches are skipped: they mark
-        where the tier has nothing to say.
-        """
-        if tier is None or tier.tier_class != "IntervalTier":
-            return []
-        return [iv for iv in tier.intervals
-                if not is_empty_label(iv.text)
-                and iv.xmin >= unit.xmin - TIME_EPS
-                and iv.xmax <= unit.xmax + TIME_EPS]
-
-    def _subdividing_labels(tier_name, tmap_units):
-        """Distinct labels of *tier_name* where it subdivides a row unit.
-
-        Empty when the tier matches the row unit one for one, or is coarser:
-        that is a correspondence rather than a subdivision, and splitting on
-        it would give a column for every label in the inventory.
-        """
-        labels = []
-        for tmap, units in tmap_units:
-            tier = tmap.get(tier_name)
-            for u in units:
-                inside = _labelled_within(u, tier)
-                if len(inside) < 2:
-                    continue
-                for iv in inside:
-                    lab = iv.text.strip()
-                    if lab not in labels:
-                        labels.append(lab)
-        return labels
-
     def _spectral_segments(unit, tmap):
         """Labelled intervals on the spectral tier that lie inside *unit*.
 
@@ -1452,6 +1574,9 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 t, (unit.xmin + unit.xmax) / 2)
         return [] if civ is None or is_empty_label(civ.text) else [civ]
 
+    # Pre-scan TextGrids for corpus-dependent column counts: the longest
+    # segment (time-step sampling columns) and the most target points in any
+    # one row unit (wide FN_<tier>N at-point columns).
     time_offsets_ms = []
     max_targets = 0
     target_marks = []
@@ -1699,12 +1824,23 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
 
     # Categorisation columns
     cat_col_start = len(headers)
-    cat_col_info = []  # [(header_name, tier_name, col_type, prop_name), ...]
+    # [(header_name, source, col_type, prop_name), ...] where *source* is a
+    # tier name for a main column, or the "<context>_prev"/"<context>_next"
+    # flanking column the label is read from.
+    cat_col_info = []
     known_vowels_set = None
     if categorise and cat_chart:
         lookup = cat_chart[cat_notation]
         known_vowels_set = _build_known_vowels(lookup)
-        for tn in cat_tier_names:
+        # A flanking label only exists if its label column was asked for,
+        # and there is one flanking pair (from the context tier), not one
+        # per categorised tier.
+        cat_sources = list(cat_tier_names)
+        if cat_prev_segment and include_prev_segment:
+            cat_sources.append(f"{context_name}_prev")
+        if cat_next_segment and include_next_segment:
+            cat_sources.append(f"{context_name}_next")
+        for tn in cat_sources:
             # Type column (always)
             cat_col_info.append((f"{tn}_type", tn, "type", "type"))
             # Vowel property columns
@@ -2054,17 +2190,31 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             return cols
 
         # Helper: categorisation columns for a row (given label_cols already built)
-        def _cat_cols(label_cols_list):
-            """Return list of categorisation cell values."""
+        def _cat_cols(label_cols_list, prev_label="", next_label=""):
+            """Return list of categorisation cell values.
+
+            *prev_label*/*next_label* are the flanking labels already worked
+            out for this row; a flanking column classifies one of those
+            rather than a tier label read out of the row.
+            """
             if not categorise or not cat_col_info:
                 return []
+            flanking = {f"{context_name}_prev": prev_label,
+                        f"{context_name}_next": next_label}
             cols = []
             for _hdr, tn, col_type, prop in cat_col_info:
-                # Find the label for this tier from the already-built row
+                # Find the label for this source from the already-built row
                 # Tier label is at index: interval_tier_names.index(tn) or
                 # point_tier_names offset
                 label_text = ""
-                if tn in interval_tier_names:
+                # A flanking label came off the context tier, so report an
+                # unclassifiable one against that tier rather than naming
+                # the same label once per flanking column.
+                source_tier = tn
+                if tn in flanking:
+                    label_text = flanking[tn]
+                    source_tier = context_name
+                elif tn in interval_tier_names:
                     idx = interval_tier_names.index(tn)
                     if idx < len(label_cols_list):
                         label_text = label_cols_list[idx]
@@ -2092,7 +2242,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
 
                 if not matched:
                     if unmatched_labels is not None:
-                        unmatched_labels.add((tn, lbl))
+                        unmatched_labels.add((source_tier, lbl))
                     cols.append("")
                     continue
 
@@ -2129,6 +2279,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             if reconcile_allophone_tier:
                 row.append(unit.alignment or "")
 
+            prev = nxt = ""
             if include_prev_segment or include_next_segment:
                 ctier = tier_map.get(context_name)
                 if ctier is not None and ctier.tier_class == "IntervalTier":
@@ -2197,7 +2348,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 for seg in ordered:
                     row.extend(_trajectory_cols(seg))
 
-            row.extend(_cat_cols(lc))
+            row.extend(_cat_cols(lc, prev, nxt))
 
             rows.append(row)
 
@@ -6130,6 +6281,42 @@ class _DataOptionsPage(QWizardPage):
         self._spectral_winmax_label.setVisible(proportional)
         self._spectral_winmax_spin.setVisible(proportional)
 
+    def _confirm_whole_interval_spectra(self, primary, finer):
+        """Warn that spectra will span the whole primary interval.
+
+        Returns True to go on with the export, False to return to the page.
+        *finer* is what ``_tiers_subdividing_primary`` gave back: (tier name,
+        labels) pairs for the tiers that cut the primary tier into parts.
+        """
+        detail = "\n".join(
+            "    {} \u2014 {}{}".format(
+                name, ", ".join(labels[:6]),
+                " ..." if len(labels) > 6 else "")
+            for name, labels in finer)
+        example = finer[0][1][0] if finer[0][1] else "part"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Spectral Segment Tier")
+        box.setText("Spectral measurements will span the whole "
+                    f"'{primary}' interval.")
+        box.setInformativeText(
+            f"The spectral segment tier is '{primary}' \u2014 the tier that "
+            "defines a row \u2014 so each row gets one set of spectral "
+            f"columns measured across all of '{primary}'.\n\n"
+            "These tiers subdivide it, and are not being used:\n"
+            f"{detail}\n\n"
+            "Choose one of them as the spectral segment tier to measure each "
+            f"part on its own (COG_{example}_20%, \u2026). Left as it is, the "
+            "columns carry no region name (COG_20%) and every measurement "
+            "mixes the parts together.\n\n"
+            "Duration columns come from their own tick boxes and stay "
+            "per-part either way, so the CSV can look right when it is not.")
+        cont = box.addButton("Continue", QMessageBox.ButtonRole.AcceptRole)
+        back = box.addButton("Go back", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(back)
+        box.exec()
+        return box.clickedButton() is cont
+
     def validatePage(self):
         wiz = self.wizard()
 
@@ -6343,6 +6530,24 @@ class _DataOptionsPage(QWizardPage):
                         self, "Band Ratio",
                         f"The {name} band's upper edge must be above its "
                         "lower edge.")
+                    return False
+
+            # A spectral tier that IS the primary tier measures each row over
+            # the whole primary interval: no split into parts, and no region
+            # name on the columns. That is a legitimate choice, but it is also
+            # the default, so it is easy to make by accident — warn when a
+            # finer tier is sitting there that would have split the
+            # measurements. Duration columns come from their own per-tier tick
+            # boxes and stay per-part either way, which is what makes the
+            # mistake so hard to spot in the finished CSV.
+            if (wiz.spectral_tier_name == wiz.primary_tier_name
+                    and (wiz.extract_spectral or wiz.extract_trajectory)):
+                finer = _tiers_subdividing_primary(
+                    wiz.textgrid_dir, wiz.primary_tier_name,
+                    [n for n, tc in wiz.selected_tier_info
+                     if tc == "IntervalTier"])
+                if finer and not self._confirm_whole_interval_spectra(
+                        wiz.primary_tier_name, finer):
                     return False
         else:
             wiz.spectral_tier_name = None
@@ -6977,12 +7182,41 @@ class _CategorisationPage(QWizardPage):
         notation_row.addStretch()
         opts_layout.addLayout(notation_row)
 
-        # Tier selection
-        opts_layout.addWidget(QLabel("Tiers to categorise:"))
+        # Tier selection. One phonetic tier is selected by default, while
+        # every included tier remains available for an intentional opt-in.
+        self._tier_group = QGroupBox("Tier labels to categorise")
+        tier_layout = QVBoxLayout(self._tier_group)
+        self._tier_summary = QLabel()
+        self._tier_summary.setWordWrap(True)
+        self._tier_summary.setStyleSheet(
+            "font-weight: bold; color: #2a6fb0;")
+        tier_layout.addWidget(self._tier_summary)
+        self._tier_note = QLabel(
+            "Tick another tier only when its labels are phonetic symbols "
+            "that should also be classified.")
+        self._tier_note.setWordWrap(True)
+        self._tier_note.setStyleSheet("color: #888; font-size: 11px;")
+        tier_layout.addWidget(self._tier_note)
         self._tier_container = QVBoxLayout()
-        self._tier_container.setContentsMargins(10, 0, 0, 0)
+        self._tier_container.setContentsMargins(10, 2, 0, 0)
         self._tier_cbs = []
-        opts_layout.addLayout(self._tier_container)
+        tier_layout.addLayout(self._tier_container)
+        opts_layout.addWidget(self._tier_group)
+
+        # Only show flanking choices backed by label columns selected on the
+        # previous page. Hiding unavailable sides avoids a large, misleading
+        # dead section and makes the source tier visible in the checkbox text.
+        self._flank_group = QGroupBox("Neighbouring segment labels")
+        self._flank_container = QVBoxLayout(self._flank_group)
+        self._cat_prev_cb = QCheckBox()
+        self._cat_next_cb = QCheckBox()
+        self._flank_container.addWidget(self._cat_prev_cb)
+        self._flank_container.addWidget(self._cat_next_cb)
+        self._flank_note = QLabel("")
+        self._flank_note.setWordWrap(True)
+        self._flank_note.setStyleSheet("color: #888; font-size: 11px;")
+        self._flank_container.addWidget(self._flank_note)
+        opts_layout.addWidget(self._flank_group)
 
         # Vowel columns multi-select dropdown
         self._vowel_dropdown = _MultiSelectDropdown(
@@ -6994,7 +7228,6 @@ class _CategorisationPage(QWizardPage):
             "Consonant columns:", self._CONSONANT_ITEMS)
         opts_layout.addWidget(self._consonant_dropdown)
 
-        opts_layout.addStretch()
         layout.addWidget(self._options_widget)
         layout.addStretch()
 
@@ -7004,6 +7237,16 @@ class _CategorisationPage(QWizardPage):
 
     def initializePage(self):
         """Populate tier checkboxes from wizard state."""
+        # Preserve an explicit choice if the user goes back and returns to
+        # this page. On first entry, use the produced/allophone tier chosen
+        # for reconciliation; without one, the row-defining primary tier is
+        # the best available phonetic default.
+        had_tier_controls = bool(self._tier_cbs)
+        previous_tiers = {
+            cb.property("tier_name") for cb in self._tier_cbs
+            if cb.isChecked()
+        }
+
         # Clear old tier checkboxes
         for cb in self._tier_cbs:
             self._tier_container.removeWidget(cb)
@@ -7011,18 +7254,82 @@ class _CategorisationPage(QWizardPage):
         self._tier_cbs = []
 
         wiz = self.wizard()
+        available = [name for name, _tier_class in wiz.selected_tier_info]
+        preferred = wiz.reconcile_allophone_tier or wiz.primary_tier_name
+        if had_tier_controls:
+            selected = previous_tiers
+        elif wiz.categorise and wiz.cat_tier_names:
+            selected = set(wiz.cat_tier_names)
+        elif preferred in available:
+            selected = {preferred}
+        elif wiz.primary_tier_name in available:
+            selected = {wiz.primary_tier_name}
+        else:
+            selected = set(available[:1])
+
         for name, tier_class in wiz.selected_tier_info:
             cb = QCheckBox(f"{name}  ({tier_class})")
-            cb.setChecked(tier_class == "IntervalTier")
+            cb.setChecked(name in selected)
             cb.setProperty("tier_name", name)
+            cb.toggled.connect(self._update_tier_summary)
             self._tier_cbs.append(cb)
             self._tier_container.addWidget(cb)
+
+        self._update_tier_summary()
+
+        if preferred in available and not had_tier_controls:
+            role = ("selected produced/allophone tier"
+                    if wiz.reconcile_allophone_tier else "selected primary tier")
+            self._tier_note.setText(
+                f"{preferred} is selected by default because it is the {role}. "
+                "Tick another tier only if its labels are also phonetic "
+                "symbols that should be classified.")
+        else:
+            self._tier_note.setText(
+                "Tick another tier only when its labels are phonetic symbols "
+                "that should also be classified.")
+
+        # There is nothing to classify unless the matching flanking label was
+        # included, so do not offer a checkbox for a side that is absent.
+        ctx = wiz.context_tier_name or wiz.primary_tier_name or "tier"
+        flank_info = (
+            (self._cat_prev_cb, wiz.include_prev_segment, "Preceding", "prev"),
+            (self._cat_next_cb, wiz.include_next_segment, "Following", "next"),
+        )
+        for cb, on, label, side in flank_info:
+            cb.setText(f"{label} segment - {ctx}_{side}")
+            cb.setToolTip(
+                f"Classify the {ctx}_{side} label, adding {ctx}_{side}_type, "
+                f"{ctx}_{side}_V_* and {ctx}_{side}_C_* columns.")
+            cb.setVisible(on)
+            cb.setEnabled(on)
+            if not on:
+                cb.setChecked(False)
+        any_ctx = wiz.include_prev_segment or wiz.include_next_segment
+        self._flank_group.setVisible(any_ctx)
+        self._flank_group.setTitle(f"Also categorise labels from {ctx}")
+        self._flank_note.setText(
+            "Only neighbouring label columns included on the previous page "
+            "are offered here.")
+
+    def _update_tier_summary(self):
+        """Name the tier labels that the classifier will actually inspect."""
+        names = [cb.property("tier_name") for cb in self._tier_cbs
+                 if cb.isChecked()]
+        if names:
+            self._tier_summary.setText(
+                "Categorising tier{}: {}".format(
+                    "s" if len(names) != 1 else "", ", ".join(names)))
+        else:
+            self._tier_summary.setText("No tier selected for categorisation")
 
     def validatePage(self):
         wiz = self.wizard()
 
         if not self._enable_cb.isChecked():
             wiz.categorise = False
+            wiz.cat_prev_segment = False
+            wiz.cat_next_segment = False
             return True
 
         # Collect selected tiers
@@ -7049,6 +7356,10 @@ class _CategorisationPage(QWizardPage):
         wiz.cat_tier_names = cat_tiers
         wiz.cat_vowel_props = v_props
         wiz.cat_consonant_props = c_props
+        wiz.cat_prev_segment = (self._cat_prev_cb.isChecked()
+                                and wiz.include_prev_segment)
+        wiz.cat_next_segment = (self._cat_next_cb.isChecked()
+                                and wiz.include_next_segment)
         return True
 
 
@@ -7116,6 +7427,8 @@ class BuildCSVWizard(QWizard):
         self.categorise = False
         self.cat_notation = "ipa"
         self.cat_tier_names = []
+        self.cat_prev_segment = False
+        self.cat_next_segment = False
         self.cat_vowel_props = []
         self.cat_consonant_props = []
 
@@ -8181,6 +8494,8 @@ class MainWindow(QMainWindow):
                 cat_chart=cat_chart,
                 cat_notation=wizard.cat_notation,
                 cat_tier_names=wizard.cat_tier_names,
+                cat_prev_segment=wizard.cat_prev_segment,
+                cat_next_segment=wizard.cat_next_segment,
                 cat_vowel_props=wizard.cat_vowel_props,
                 cat_consonant_props=wizard.cat_consonant_props,
                 auto_diphthong_candidates=auto_diphthong_candidates,
@@ -8216,6 +8531,17 @@ class MainWindow(QMainWindow):
                     "CSV export produced no rows — all files skipped")
                 return
 
+        # Which column-name prefixes the categorisation produced, and which
+        # column holds the label each one classified. Main tiers read their
+        # own label column; a flanking prefix IS its label column's name.
+        cat_label_cols = _cat_label_columns(
+            headers, wizard.cat_tier_names,
+            wizard.context_tier_name or wizard.primary_tier_name,
+            wizard.cat_prev_segment, wizard.cat_next_segment)
+        cat_prefixes = list(wizard.cat_tier_names) + [
+            pfx for pfx, _ in cat_label_cols
+            if pfx not in wizard.cat_tier_names]
+
         # Diphthong review dialog
         if auto_diphthong_candidates:
             dlg = _DiphthongReviewDialog(auto_diphthong_candidates, self)
@@ -8224,40 +8550,8 @@ class MainWindow(QMainWindow):
                 # Rejected diphthong labels → mark their cells as unmatched
                 rejected = set(auto_diphthong_candidates) - confirmed
                 if rejected:
-                    # Find cat column indices for type/subtype
-                    # Clear cells for rejected diphthongs
-                    n_labels = len([t for t in selected_tiers
-                                    if t.tier_class == "IntervalTier"])
-                    n_labels += len([t for t in selected_tiers
-                                     if t.tier_class == "TextTier"])
-                    for row in rows:
-                        for tn in wizard.cat_tier_names:
-                            # Find the label for this tier
-                            label_text = ""
-                            all_tnames = ([t.name for t in selected_tiers
-                                           if t.tier_class == "IntervalTier"] +
-                                          [t.name for t in selected_tiers
-                                           if t.tier_class == "TextTier"])
-                            if tn in all_tnames:
-                                li = 1 + all_tnames.index(tn)
-                                if li < len(row):
-                                    label_text = row[li]
-                            lbl = label_text.split(";")[0].strip() if label_text else ""
-                            if lbl in rejected:
-                                # Reclassify as vowel-combination
-                                for hi, h in enumerate(headers):
-                                    if hi >= len(row):
-                                        continue
-                                    if h == f"{tn}_type":
-                                        row[hi] = "vowel"
-                                    elif h == f"{tn}_V_subtype":
-                                        row[hi] = "vowel-combination"
-                                    elif h.startswith(f"{tn}_V_") or h.startswith(f"{tn}_C_"):
-                                        # Clear vowel/consonant detail cols
-                                        row[hi] = ""
-                                    elif h.startswith(f"{tn}_"):
-                                        # Keep diacritic modifier cols as-is
-                                        pass
+                    _reclassify_rejected_diphthongs(
+                        headers, rows, cat_label_cols, rejected)
 
         # Filter empty columns (categorisation columns only)
         if wizard.categorise and rows:
@@ -8265,7 +8559,7 @@ class MainWindow(QMainWindow):
             # Always keep non-categorisation columns
             cat_start = None
             for i, h in enumerate(headers):
-                for tn in wizard.cat_tier_names:
+                for tn in cat_prefixes:
                     if h.startswith(f"{tn}_"):
                         if cat_start is None:
                             cat_start = i
@@ -8354,18 +8648,28 @@ class MainWindow(QMainWindow):
                 default_name = save_path
                 continue
 
-            self._write_provenance_sidecar(save_path, wizard, len(rows))
+            # Name the sidecar in the status line: it lands beside the
+            # CSV, and saying so is what tells the user to carry the two
+            # files together.
+            side_path = self._write_provenance_sidecar(
+                save_path, wizard, len(rows))
+            side_note = (f" + {os.path.basename(side_path)}"
+                         if side_path else "")
             self.status.showMessage(
                 f"CSV exported: {len(rows)} rows, {len(headers)} columns → "
-                f"{os.path.basename(save_path)}")
+                f"{os.path.basename(save_path)}{side_note}")
             return
 
     def _write_provenance_sidecar(self, csv_path, wizard, n_rows):
         """Write a JSON sidecar recording the resolved run configuration.
 
         Reproducibility record next to every CSV: which tiers drove the
-        extraction and the exact spectral/formant settings used. Best-effort
-        — a failure here must not fail the CSV export.
+        extraction and the exact spectral/formant settings used. Written
+        beside the CSV, as ``<name>.provenance.json`` — so a CSV copied
+        or moved on its own leaves its provenance behind.
+
+        Returns the sidecar path, or None if it could not be written; a
+        failure is reported to the user but never fails the export.
         """
         try:
             side = {
@@ -8398,6 +8702,12 @@ class MainWindow(QMainWindow):
                     "preceding": wizard.include_prev_segment,
                     "following": wizard.include_next_segment,
                 },
+                "categorisation": {
+                    "notation": wizard.cat_notation,
+                    "tiers": list(wizard.cat_tier_names),
+                    "preceding": wizard.cat_prev_segment,
+                    "following": wizard.cat_next_segment,
+                } if wizard.categorise else None,
                 "spectral": {
                     "segment_tier": wizard.spectral_tier_name,
                     "markers_pct": wizard.spectral_markers,
@@ -8436,8 +8746,21 @@ class MainWindow(QMainWindow):
             side_path = os.path.splitext(csv_path)[0] + ".provenance.json"
             with open(side_path, "w", encoding="utf-8") as fh:
                 json.dump(side, fh, indent=2)
-        except Exception:
-            pass
+        except Exception as e:
+            # Never abort the export over the sidecar: the rows are the
+            # expensive part and they are already on disk. But do not
+            # fail in silence either — a reader that finds no sidecar
+            # cannot tell a run that predates the feature from one whose
+            # write broke, so the loss is said out loud while the run is
+            # still in front of the person who made it.
+            QMessageBox.warning(
+                self, "Provenance Sidecar Not Written",
+                "The CSV was saved, but the provenance record could not "
+                f"be written beside it:\n{e}\n\nThe CSV itself is "
+                "complete — nothing reads the sidecar during an export. "
+                "Re-running the export writes it again.")
+            return None
+        return side_path
 
     def _setup_tier_checkboxes(self, preserve_hidden=False):
         """Populate tier visibility checkboxes for the current TextGrid.

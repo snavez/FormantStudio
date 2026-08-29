@@ -20,6 +20,8 @@ from formant_editor import (
     TextGrid,
     Tier,
     _build_csv_data,
+    _load_ipa_chart,
+    _IPA_CHART_PATH,
 )
 
 
@@ -322,3 +324,124 @@ class TestRowTierMissing:
         assert rows == []
         assert len(skipped) == 1
         assert "primary tier" in skipped[0][1]
+
+
+class TestFlankingCategorisation:
+    """Categorisation applied to the flanking labels as well as the main ones.
+
+    Columns follow the same rule as the main ones -- the label column's name
+    plus the property -- so "phones_prev" yields "phones_prev_type" the way
+    "phones" yields "phones_type".
+    """
+
+    @pytest.fixture
+    def chart(self):
+        return _load_ipa_chart(_IPA_CHART_PATH)
+
+    def _cat(self, corpus, chart, **over):
+        kw = dict(
+            primary_tier_name="phones",
+            extract_formants=False, formant_mode=None,
+            categorise=True, cat_chart=chart, cat_notation="ipa",
+            cat_tier_names=["phones"],
+            cat_vowel_props=["height", "fronting"],
+            cat_consonant_props=["place", "manner"],
+        )
+        kw.update(over)
+        return _run(corpus, ["words", "phones"], **kw)
+
+    def test_main_only_by_default(self, corpus, chart):
+        """Without asking, nothing changes: no flanking cat columns."""
+        headers, _ = self._cat(corpus, chart,
+                               include_prev_segment=True,
+                               include_next_segment=True)
+        assert "phones_type" in headers
+        assert "phones_prev_type" not in headers
+        assert "phones_next_type" not in headers
+
+    def test_preceding_columns_follow_the_naming_convention(self, corpus,
+                                                            chart):
+        headers, rows = self._cat(corpus, chart,
+                                  include_prev_segment=True,
+                                  cat_prev_segment=True)
+        assert "phones_prev_type" in headers
+        assert "phones_prev_C_place" in headers
+        assert "phones_prev_V_height" in headers
+        # 'a' is preceded by 't' -> the prev columns describe /t/
+        r_a = rows[1]
+        assert r_a[headers.index("phones_prev")] == "t"
+        assert r_a[headers.index("phones_prev_type")] == "consonant"
+        assert r_a[headers.index("phones_prev_C_place")] == "alveolar"
+
+    def test_following_columns_describe_the_next_sound(self, corpus, chart):
+        headers, rows = self._cat(corpus, chart,
+                                  include_next_segment=True,
+                                  cat_next_segment=True)
+        # 't' is followed by 'a' -> the next columns describe /a/
+        r_t = rows[0]
+        assert r_t[headers.index("phones_next")] == "a"
+        assert r_t[headers.index("phones_next_type")] == "vowel"
+        assert r_t[headers.index("phones_next_V_height")] == "low"
+
+    def test_main_and_flanking_are_independent(self, corpus, chart):
+        """Either side can be asked for on its own, or both together."""
+        headers, _ = self._cat(corpus, chart,
+                               include_prev_segment=True,
+                               include_next_segment=True,
+                               cat_next_segment=True)
+        assert "phones_next_type" in headers
+        assert "phones_prev_type" not in headers
+
+        headers, _ = self._cat(corpus, chart,
+                               include_prev_segment=True,
+                               include_next_segment=True,
+                               cat_prev_segment=True, cat_next_segment=True)
+        assert "phones_prev_type" in headers
+        assert "phones_next_type" in headers
+
+    def test_needs_the_label_column_to_read_from(self, corpus, chart):
+        """No flanking label column means there is nothing to classify."""
+        headers, _ = self._cat(corpus, chart, cat_prev_segment=True,
+                               cat_next_segment=True)
+        assert "phones_prev_type" not in headers
+        assert "phones_next_type" not in headers
+
+    def test_edge_of_corpus_leaves_the_cells_empty(self, corpus, chart):
+        """The first row has no preceding sound, so its prev cells stay blank."""
+        headers, rows = self._cat(corpus, chart,
+                                  include_prev_segment=True,
+                                  cat_prev_segment=True)
+        r_t = rows[0]
+        assert r_t[headers.index("phones_prev")] == ""
+        assert r_t[headers.index("phones_prev_type")] == ""
+
+    def test_unmatched_flanking_labels_report_against_their_tier(self, corpus,
+                                                                 chart):
+        """One report per tier and label, not one per flanking column."""
+        unmatched = set()
+        self._cat(corpus, chart,
+                  cat_tier_names=["words", "phones"],
+                  include_prev_segment=True, include_next_segment=True,
+                  cat_prev_segment=True, cat_next_segment=True,
+                  unmatched_labels=unmatched)
+        # "tata" is not a phone, so it cannot be classified
+        assert ("words", "tata") in unmatched
+        # The flanking columns read the phones tier, so nothing is filed
+        # under a column name.
+        assert not [tn for tn, _ in unmatched if tn.endswith(("_prev",
+                                                              "_next"))]
+
+    def test_flanking_context_can_come_from_another_tier(self, corpus, chart):
+        """The context tier supplies the labels, so it names the columns."""
+        headers, rows = _run(
+            corpus, ["words", "phones", "allophone"],
+            primary_tier_name="phones",
+            extract_formants=False, formant_mode=None,
+            context_tier_name="allophone",
+            include_next_segment=True,
+            categorise=True, cat_chart=chart, cat_notation="ipa",
+            cat_tier_names=["phones"],
+            cat_vowel_props=["height"], cat_consonant_props=["place"],
+            cat_next_segment=True)
+        assert "allophone_next_type" in headers
+        assert "phones_next_type" not in headers

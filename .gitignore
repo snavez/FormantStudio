@@ -13,7 +13,7 @@ dist/
 # bundled aligner model, so a build from a fresh clone depends on it.
 *.spec
 !FormantStudio.spec
-FormantStudio.exe
+FormantStudio*.exe
 
 # Misc
 nul

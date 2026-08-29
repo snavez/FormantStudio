@@ -16,6 +16,7 @@ from formant_editor import (
     resolve_spectral_window, highpass_sound, compute_spectral_moments,
     compute_spectral_moments_multitaper, _moments_from_power,
     _spectral_window_shape, SPECTRAL_WINDOW_SHAPES,
+    _dpss_tapers, spectrum_of,
 )
 
 
@@ -595,3 +596,79 @@ class TestFormantSegmentTierResolution:
         # Phone midpoints: 't' → 0.15 s, 'a' → 0.35 s
         assert f1s[0] == pytest.approx(150.0, abs=6.0)
         assert f1s[1] == pytest.approx(350.0, abs=6.0)
+
+
+class TestTaperCache:
+    """The DPSS taper cache: one solve per distinct window, shared safely."""
+
+    def _noise(self, dur=0.05, sr=44100):
+        rng = np.random.default_rng(7)
+        return parselmouth.Sound(rng.standard_normal(int(dur * sr)) * 0.1,
+                                 sampling_frequency=sr)
+
+    def test_tapers_match_scipy(self):
+        from scipy.signal.windows import dpss
+        got = _dpss_tapers(264, 4.0, 7)
+        assert np.array_equal(got, dpss(264, 4.0, 7))
+
+    def test_solves_once_per_distinct_window_length(self):
+        """A sliding window re-solves only when its sample count changes.
+
+        Rounding a window onto sample boundaries can shift N by one, so the
+        contract is one solve per distinct length -- not one solve overall.
+        """
+        _dpss_tapers.cache_clear()
+        snd = self._noise()
+        lengths = set()
+        for i in range(20):
+            t0 = 0.001 * i
+            part = snd.extract_part(
+                t0, t0 + 0.006, parselmouth.WindowShape.RECTANGULAR,
+                1.0, False)
+            lengths.add(np.asarray(part.values[0]).size)
+            spectrum_of(snd, t0, t0 + 0.006, estimator="multitaper")
+        info = _dpss_tapers.cache_info()
+        assert info.misses == len(lengths)
+        assert info.hits == 20 - len(lengths)
+        # The point of the cache: far fewer solves than frames
+        assert info.misses <= 2
+
+    def test_distinct_lengths_are_separate_entries(self):
+        _dpss_tapers.cache_clear()
+        _dpss_tapers(200, 4.0, 7)
+        _dpss_tapers(300, 4.0, 7)
+        _dpss_tapers(200, 4.0, 7)
+        info = _dpss_tapers.cache_info()
+        assert (info.misses, info.hits) == (2, 1)
+
+    def test_cached_array_is_read_only(self):
+        """Callers share one copy, so writing to it would corrupt the cache."""
+        tapers = _dpss_tapers(128, 4.0, 5)
+        assert tapers.flags.writeable is False
+        with pytest.raises(ValueError):
+            tapers[0, 0] = 0.0
+
+    def test_caching_does_not_change_the_spectrum(self):
+        """A cache hit must give what a fresh solve gives, bit for bit."""
+        snd = self._noise()
+        _dpss_tapers.cache_clear()
+        _, first = spectrum_of(snd, 0.01, 0.016, estimator="multitaper")
+        _, cached = spectrum_of(snd, 0.01, 0.016, estimator="multitaper")
+        assert np.array_equal(first, cached)
+
+    def test_matches_an_unbatched_per_taper_sum(self):
+        """The batched rfft must agree with summing one taper at a time."""
+        from scipy.signal.windows import dpss
+        snd = self._noise()
+        t0, t1 = 0.01, 0.016
+        part = snd.extract_part(t0, t1, parselmouth.WindowShape.RECTANGULAR,
+                                1.0, False)
+        x = np.asarray(part.values[0], dtype=float)
+        k = 7
+        reference = np.zeros(x.size // 2 + 1)
+        for taper in dpss(x.size, 4.0, k):
+            spec = np.fft.rfft(x * taper)
+            reference += spec.real ** 2 + spec.imag ** 2
+        reference /= k
+        _, power = spectrum_of(snd, t0, t1, estimator="multitaper")
+        assert power == pytest.approx(reference, rel=1e-12)
