@@ -119,6 +119,8 @@ While edit mode is active, right-click dragging across the spectrogram reverts f
 
 All formant editing operations (draw strokes, erase strokes, resets, interpolation) are undoable. The undo stack holds up to 100 entries. Each entry stores per-frame diffs (old/new value and mask). Ctrl+Z undoes, Ctrl+Y redoes.
 
+**The history belongs to the track, not to the session.** An entry addresses frames by index, which means something only against the array it was recorded from, so installing a new formant track — opening another audio file, loading a `.formants`, re-running the analysis — discards both stacks. Editing a track happens in place and never replaces it, so ordinary strokes, erases and resets keep their history. Without this, Ctrl+Z after opening a second file replayed the first file's diffs into it, silently corrupting frames that happened to exist and raising an `IndexError` where they did not.
+
 #### 2.3.2c Interpolate Between Edited Points
 
 The "Interpolate Between Points" button in the control panel finds consecutive pairs of edited points for the active formant and fills intermediate frames with linear interpolation. If a time selection is active, only points within the selection are considered. The operation is undoable.
@@ -256,6 +258,8 @@ An animated playback cursor sweeps across the spectrogram during playback to ind
 | Zoom out | Ctrl+O or scroll wheel down (cursor-centred) |
 | Zoom to selection | Ctrl+N |
 | Zoom to fit all | Ctrl+A |
+| Previous / next segment on the active tier | Ctrl+← / Ctrl+→ (scrolls the view to follow) |
+| Tier above / below | Ctrl+↑ / Ctrl+↓ (selects the segment at the same moment) |
 | Scroll/pan | Scrollbar with ◀/▶ arrow buttons (2/3 window overlap) |
 | Time selection | Click-drag on spectrogram (when not in edit mode) |
 | Crosshair cursor | Displays time/frequency/RMS in the status bar |
@@ -403,7 +407,8 @@ FormantStudio tracks whether formant edits or TextGrid modifications have been m
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Undo/redo (Ctrl+Z / Ctrl+Y) | ✅ | Command-based, per-frame diffs, 100-entry stack |
+| Undo/redo (Ctrl+Z / Ctrl+Y) | ✅ | Command-based, per-frame diffs, 100-entry stack, reset per track |
+| Keyboard segment navigation | ✅ | Ctrl+arrows step along a tier and between tiers, carrying the selection; the label is left selected for retyping |
 | Frame interpolation during drawing | ✅ | Fills skipped frames with linear interpolation |
 | Eraser tool (right-click drag) | ✅ | Reverts to original Praat values, grey feedback |
 | Interpolate between edited points | ✅ | Button in control panel, respects selection range |

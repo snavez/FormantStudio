@@ -115,9 +115,13 @@ enough editing to prepare extraction targets:
   existing one by clicking it will not nudge the original.
 - **Snapping**: an optional snap-to-nearest-boundary aids cross-tier time alignment.
 - **Labels**: click an interval/point to edit its label inline.
-- **Keyboard**: `←` and `→` step through the intervals of the active tier, scrolling the view
-  when the next one is off-screen; `↑` and `↓` move between tiers. The arrows are left to the
-  text while a label is being edited.
+- **Keyboard**: `Ctrl+←` and `Ctrl+→` step through the intervals of the active tier, scrolling
+  the view when the next one is off-screen; `Ctrl+↑` and `Ctrl+↓` move between tiers, carrying
+  the selection with them — the segment covering the same moment on the new tier is selected, so
+  stepping up and down a stack follows one point through the annotation. Every move leaves the
+  label selected in the editor, so the loop is `Ctrl+→`, type the correction, `Ctrl+→` — a tier
+  can be relabelled without touching the mouse. The bare arrows belong to the label text: the
+  editor keeps focus for the whole pass, which is exactly why navigation is on Ctrl.
 - **Tiers**: add, delete, **rename** (click the tier's name in the left margin), and
   **duplicate** (File → Duplicate Tier) — the last is for seeding a tier that mostly mirrors
   another (e.g. an allophone tier from the phoneme tier) so you edit only the differences.

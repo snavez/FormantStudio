@@ -2415,6 +2415,15 @@ class LabelEdit(QLineEdit):
             self.clearFocus()
             event.ignore()
             return
+        # Ctrl+arrows navigate the annotation, not the text. The editor keeps
+        # focus for a whole relabelling pass, so these have to travel up to
+        # the main window; a QLineEdit would otherwise eat Ctrl+Left/Right as
+        # word jumps, which are worth nothing in a one-token label.
+        if (key in (Qt.Key.Key_Left, Qt.Key.Key_Right,
+                    Qt.Key.Key_Up, Qt.Key.Key_Down)
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            event.ignore()
+            return
         super().keyPressEvent(event)
 
 
@@ -2528,7 +2537,9 @@ class SpectrogramCanvas(QWidget):
         self._spec_db = None        # cached 10*log10(spectrogram_data)
         self.spec_times = None
         self.spec_freqs = None
-        self.formant_data = None
+        # Backing field: the property setter drops the edit history, and
+        # there is none to drop before the stacks below exist.
+        self._formant_data = None
         self.textgrid_data = None   # TextGrid object or None
         self.hidden_tiers = set()   # indices of tiers to hide
         self.tier_axes = []         # kept for API compat (list, same length as _tier_plots)
@@ -2876,6 +2887,29 @@ class SpectrogramCanvas(QWidget):
                          ).astype(np.float32)
         self.spec_freqs = np.array(spec_obj.ys())
         self.spec_times = np.array(spec_obj.xs())
+
+    @property
+    def formant_data(self):
+        """The formant track on display, or None."""
+        return self._formant_data
+
+    @formant_data.setter
+    def formant_data(self, data):
+        """Install a track, dropping the edit history describing the old one.
+
+        An undo entry holds ``(formant, frame index, old value)`` triples that
+        mean something only against the array they were recorded from. Once the
+        track is replaced -- another file, a loaded .formants, a re-analysis --
+        they describe frames that are no longer there, and replaying one would
+        write the previous file's values into the new file's tracks, or run off
+        the end of a shorter one.
+
+        Editing a track edits it in place and never comes through here, so an
+        ordinary stroke, erase or reset keeps its history.
+        """
+        self._formant_data = data
+        self._undo_stack = []
+        self._redo_stack = []
 
     @property
     def view_width(self):
@@ -3738,7 +3772,16 @@ class SpectrogramCanvas(QWidget):
                 if i not in self.hidden_tiers]
 
     def step_active_tier(self, delta):
-        """Move the active tier *delta* places through the visible tiers."""
+        """Move the active tier *delta* places through the visible tiers.
+
+        The selection travels with it: the segment on the new tier covering
+        the same moment is selected, so stepping up and down a stack follows
+        one point through the annotation instead of starting over. The moment
+        is the middle of the current selection, or the centre of the view when
+        nothing is selected -- the anchor ``step_selection`` already uses. A
+        tier with nothing there (a point tier between its points) becomes
+        active with no selection.
+        """
         visible = self.visible_tier_indices()
         if not visible:
             return None
@@ -3747,8 +3790,14 @@ class SpectrogramCanvas(QWidget):
             pos = max(0, min(len(visible) - 1, pos))
         else:
             pos = 0
+        if (self._selection_start is not None
+                and self._selection_end is not None):
+            anchor = (self._selection_start + self._selection_end) / 2.0
+        else:
+            anchor = (self.view_start + self.view_end) / 2.0
         self._active_tier = visible[pos]
         self._clear_selection()
+        self._select_interval(self._active_tier, anchor)
         self.render()
         return self.textgrid_data.tiers[self._active_tier].name
 
@@ -3832,6 +3881,23 @@ class SpectrogramCanvas(QWidget):
                 self._push_selection_status()
                 return True
         return False
+
+    def focus_label_for_selection(self, tier_idx):
+        """Put the caret in the label editor for the selection on *tier_idx*.
+
+        An interval's label is selected whole, so the next keystroke replaces
+        it; a point's caret goes to the end instead, where Delete removes the
+        point rather than a character of its mark.
+        """
+        if self._label_edit is None or self.textgrid_data is None:
+            return
+        self._label_edit.setFocus()
+        tier = self.textgrid_data.tiers[tier_idx]
+        if tier.tier_class == "TextTier":
+            self._label_edit.deselect()
+            self._label_edit.setCursorPosition(len(self._label_edit.text()))
+        else:
+            self._label_edit.selectAll()
 
     def _clear_selection(self):
         """Clear interval/boundary/time selection."""
@@ -3953,17 +4019,7 @@ class SpectrogramCanvas(QWidget):
             old_active = self._active_tier
             self._active_tier = tier_idx
             self._select_interval(tier_idx, time)
-            if self._label_edit is not None:
-                self._label_edit.setFocus()
-                # For point tiers, place cursor at end so Delete key
-                # can remove the point; for intervals, select all for
-                # easy text replacement.
-                tier = self.textgrid_data.tiers[tier_idx]
-                if tier.tier_class == "TextTier":
-                    self._label_edit.deselect()
-                    self._label_edit.setCursorPosition(len(self._label_edit.text()))
-                else:
-                    self._label_edit.selectAll()
+            self.focus_label_for_selection(tier_idx)
             if old_active != tier_idx:
                 self.render()
             else:
@@ -7504,7 +7560,7 @@ class MainWindow(QMainWindow):
         # Inline label editor
         self.label_edit = LabelEdit()
         self.label_edit._play_callback = self._play_selection
-        self.label_edit.textChanged.connect(self._on_label_text_changed)
+        self.label_edit.textEdited.connect(self._on_label_text_changed)
         self.label_edit.escape_pressed.connect(self._on_label_escape)
         self.canvas._label_edit = self.label_edit
 
@@ -7808,7 +7864,14 @@ class MainWindow(QMainWindow):
         self.status.showMessage(f"Playing {start:.2f}s \u2013 {end:.2f}s")
 
     def _on_label_text_changed(self, text):
-        """Live-update the label in the data model on every keystroke."""
+        """Live-update the label in the data model on every keystroke.
+
+        Wired to ``textEdited`` rather than ``textChanged`` so it hears only
+        what the user typed. ``setText`` fires ``textChanged`` too, and the
+        editor is refilled every time the selection moves -- which would mark
+        the TextGrid unsaved for merely looking through it, and ask to save on
+        the way out of a file nothing had been done to.
+        """
         sel = self.canvas._selected_interval
         if sel is None or self.canvas.textgrid_data is None:
             return
@@ -7925,18 +7988,20 @@ class MainWindow(QMainWindow):
                 event.accept()
                 return
 
-        # Arrow keys — step between intervals and between tiers. Skipped while
-        # the label editor has focus, where the arrows belong to the text.
-        if (key in (Qt.Key.Key_Left, Qt.Key.Key_Right,
-                    Qt.Key.Key_Up, Qt.Key.Key_Down)
-                and not self.label_edit.hasFocus()
-                and not event.modifiers()
+        # Ctrl+arrows navigate the annotation: left/right step along the
+        # active tier, up/down move between tiers carrying the selection.
+        # Ctrl rather than the bare arrows because selecting a segment focuses
+        # the label editor, and there the bare arrows belong to the text --
+        # which is what left the older bare-arrow binding unreachable.
+        if (ctrl and key in (Qt.Key.Key_Left, Qt.Key.Key_Right,
+                             Qt.Key.Key_Up, Qt.Key.Key_Down)
                 and self.canvas.textgrid_data is not None):
             c = self.canvas
             if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
                 name = c.step_active_tier(-1 if key == Qt.Key.Key_Up else 1)
                 if name is not None:
                     self._update_scrollbar()
+                    c.focus_label_for_selection(c._active_tier)
                     self.status.showMessage(f"Active tier: {name}")
                     event.accept()
                     return
@@ -7944,6 +8009,7 @@ class MainWindow(QMainWindow):
                 iv = c.step_selection(-1 if key == Qt.Key.Key_Left else 1)
                 if iv is not None:
                     self._update_scrollbar()
+                    c.focus_label_for_selection(c._active_tier)
                     label = iv.text.strip() or "(empty)"
                     self.status.showMessage(
                         f"{label}    {iv.xmin:.3f}–{iv.xmax:.3f} s "
