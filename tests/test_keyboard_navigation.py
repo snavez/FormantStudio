@@ -346,3 +346,112 @@ class TestNavigationDoesNotDirtyTheTextGrid:
         QTest.keyClicks(window.label_edit, "tS")
         assert window._textgrid_dirty is True
         assert window.canvas.textgrid_data.tiers[1].intervals[0].text == "tS"
+
+
+# A canvas needs a spectrogram before render() will apply a view range --
+# without one it draws empty axes and returns early. Synthesising the sound
+# in memory keeps these tests independent of any wav file on disk.
+def _sounded_canvas(seconds=6.0, seg=0.1):
+    import numpy as np
+    import parselmouth
+    sr = 16000
+    snd = parselmouth.Sound(
+        np.random.default_rng(0).standard_normal(int(sr * seconds)) * 0.05,
+        sampling_frequency=sr)
+    c = SpectrogramCanvas()
+    c.sound = snd
+    c.total_duration = snd.duration
+    c.view_start, c.view_end = 0.0, snd.duration
+    c._compute_spectrogram()
+    c._setup_axes()
+    n = int(snd.duration / seg)
+    c.textgrid_data = TextGrid(0, snd.duration, [
+        Tier("phones", "IntervalTier", 0, snd.duration,
+             intervals=[Interval(i * seg, (i + 1) * seg, f"s{i}")
+                        for i in range(n)])])
+    c._active_tier = 0
+    c.set_view(0.0, 1.0)                      # 1 s window over 0.1 s segments
+    c.render()
+    c._select_interval(0, 0.05)               # s0
+    return c
+
+
+class TestSteppingKeepsTheSelectionOnScreen:
+    """A step that leaves the window has to move the window.
+
+    The view range only reaches the plot through ``render()``, so stepping
+    used to scroll the model and redraw nothing: the selection walked off the
+    edge and stayed there, which is invisible in the data and obvious on
+    screen.
+    """
+
+    @pytest.fixture
+    def canvas(self, qapp):
+        return _sounded_canvas()
+
+    def _plot_range(self, canvas):
+        return canvas._spec_plot.getViewBox().viewRange()[0]
+
+    def _selected(self, canvas):
+        idx = canvas._selected_interval[1]
+        return canvas.textgrid_data.tiers[0].intervals[idx]
+
+    def _centred(self, canvas):
+        iv = self._selected(canvas)
+        lo, hi = self._plot_range(canvas)
+        return (lo + hi) / 2 == pytest.approx((iv.xmin + iv.xmax) / 2, abs=0.02)
+
+    def test_every_step_re_centres_the_window(self, canvas):
+        """Not only the ones that would leave it: context matters at the edge.
+
+        Checked from half a window in, past the point where centring is
+        clamped by the start of the recording.
+        """
+        for _ in range(6):                # clear of the start-of-file clamp
+            canvas.step_selection(1)
+        for n in range(1, 15):
+            canvas.step_selection(1)
+            canvas._render_timer.stop()
+            canvas.render()               # flush the debounced repaint
+            assert self._centred(canvas), f"step {n} left the selection off-centre"
+
+    def test_the_first_segment_sits_off_centre_at_the_start(self, canvas):
+        """Centring stops at the recording's edge rather than showing nothing."""
+        for _ in range(20):
+            canvas.step_selection(-1)     # back past the beginning
+        canvas._render_timer.stop()
+        canvas.render()
+        lo, hi = self._plot_range(canvas)
+        assert lo == pytest.approx(0.0, abs=0.02)
+        assert not self._centred(canvas)
+
+    def test_forty_steps_forward_stay_visible(self, canvas):
+        for n in range(40):
+            canvas.step_selection(1)
+            canvas._render_timer.stop()
+            canvas.render()
+            iv = self._selected(canvas)
+            lo, hi = self._plot_range(canvas)
+            assert lo <= iv.xmin and iv.xmax <= hi, f"step {n} went off screen"
+
+    def test_forty_steps_back_stay_visible(self, canvas):
+        for _ in range(40):
+            canvas.step_selection(1)
+        for n in range(40):
+            canvas.step_selection(-1)
+            canvas._render_timer.stop()
+            canvas.render()
+            iv = self._selected(canvas)
+            lo, hi = self._plot_range(canvas)
+            assert lo <= iv.xmin and iv.xmax <= hi, f"back step {n} off screen"
+
+    def test_the_window_keeps_its_width(self, canvas):
+        """Following the selection scrolls; it must not zoom."""
+        lo, hi = self._plot_range(canvas)
+        width = hi - lo
+        for _ in range(25):
+            canvas.step_selection(1)
+        canvas._render_timer.stop()
+        canvas.render()
+        lo, hi = self._plot_range(canvas)
+        assert hi - lo == pytest.approx(width, abs=1e-6)

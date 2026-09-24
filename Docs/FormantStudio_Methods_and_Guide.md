@@ -115,13 +115,17 @@ enough editing to prepare extraction targets:
   existing one by clicking it will not nudge the original.
 - **Snapping**: an optional snap-to-nearest-boundary aids cross-tier time alignment.
 - **Labels**: click an interval/point to edit its label inline.
-- **Keyboard**: `Ctrl+←` and `Ctrl+→` step through the intervals of the active tier, scrolling
-  the view when the next one is off-screen; `Ctrl+↑` and `Ctrl+↓` move between tiers, carrying
-  the selection with them — the segment covering the same moment on the new tier is selected, so
-  stepping up and down a stack follows one point through the annotation. Every move leaves the
-  label selected in the editor, so the loop is `Ctrl+→`, type the correction, `Ctrl+→` — a tier
-  can be relabelled without touching the mouse. The bare arrows belong to the label text: the
-  editor keeps focus for the whole pass, which is exactly why navigation is on Ctrl.
+- **Keyboard**: `Ctrl+←` and `Ctrl+→` step through the intervals of the active tier. Every step
+  re-centres the view on the new segment at the same zoom, so there is always as much context on
+  one side as the other — a segment reached at the edge of the window is one you cannot see the
+  surroundings of, which is usually the reason for looking. The view stops centring at either end
+  of the recording, so the first and last segments sit off-centre. `Ctrl+↑` and
+  `Ctrl+↓` move between tiers, carrying the selection with them — the segment covering the same
+  moment on the new tier is selected, so stepping up and down a stack follows one point through
+  the annotation. Every move leaves the label selected in the editor, so the loop is `Ctrl+→`,
+  type the correction, `Ctrl+→` — a tier can be relabelled without touching the mouse. The bare
+  arrows belong to the label text: the editor keeps focus for the whole pass, which is exactly
+  why navigation is on Ctrl.
 - **Tiers**: add, delete, **rename** (click the tier's name in the left margin), and
   **duplicate** (File → Duplicate Tier) — the last is for seeding a tier that mostly mirrors
   another (e.g. an allophone tier from the phoneme tier) so you edit only the differences.
@@ -478,6 +482,35 @@ Per percentage marker `p`, the CSV carries:
   `clamped_min`, or `too_short`.
 - `nsamples_p%` — signal samples in the window, for hard reliability thresholds.
 
+And once per file, beside the filename:
+
+- `hf_cutoff_hz` — the recording's upper frequency limit: the highest frequency at which the
+  file still carries signal rather than its own noise floor. It is a property of the
+  **recording**, not the token, so every row a file contributed repeats the same value.
+
+A recording chain that removed the top octave — a phone mic, a lossy codec, an earlier
+resample — drags COG down regardless of how the speaker actually produced the sound, which
+would otherwise contaminate a between-group comparison. `hf_cutoff_hz` is there to **identify
+and exclude** those files; it does not correct anything.
+
+The estimate is self-calibrating, so recordings of different gain are comparable:
+
+1. A long-term average spectrum (Welch: 2048-sample Hann frames, 50% overlap, to Nyquist),
+   restricted to **speech-active frames** — those within 30 dB of the loudest. Silence
+   contributes only noise floor and would make a recording look narrower than it is.
+2. Converted to dB and smoothed with a ~100 Hz moving average to remove ripple.
+3. The file's own noise floor: the minimum of the smoothed LTAS above 1 kHz.
+4. Scanning down from Nyquist, the highest frequency clearing that floor by 6 dB.
+
+It is measured on the **unfiltered** signal, before the spectral high-pass, so it describes
+the recording rather than what we did to it downstream. What it finds is the chain's rolloff
+edge: an untouched file returns a value just under Nyquist (its ADC's anti-alias filter), a
+lowpassed one returns its actual cutoff. Deliberately not the highest frequency holding *any*
+energy — that is always Nyquist, since the noise floor spans the whole spectrum — and not a
+cumulative-energy percentile, which is confounded with voice quality (a bassy speaker would
+score low on a perfectly good recording). Blank when a file is too short to analyse or holds
+no signal above its own floor.
+
 These transparency columns are FRED-friendly: you can **filter or group** on `winsource`
 (e.g. keep only `proportional`, or drop `clamped_min`/`too_short` before analysing skewness) or
 threshold on `nsamples`, without any of them affecting the moments themselves.
@@ -610,6 +643,74 @@ flanking columns too, so the same label never reads two different ways in one ro
 See `FormantStudio_Specification.md` §2.7 for the full column catalogue and ordering rules.
 
 ---
+
+## 6.2 Check Label Files — the pre-flight check
+
+`Tools -> Check Label Files...` runs three integrity checks over a whole folder of TextGrids. It
+exists because each fault it looks for corrupts an export **quietly** rather than loudly: an
+unlabelled interval contributes an empty row, a mistyped symbol splits one phone into two
+categories, and a boundary that missed its neighbour by three milliseconds yields a segment that
+is measured slightly wrong everywhere it appears. Run it before Build CSV.
+
+Nothing is written until you tick a proposed fix and press Apply, so running the check is always
+safe.
+
+### Unlabelled segments and points
+
+Flags **blank intervals lying inside the tier's annotated stretch** — from its first interval
+carrying any text to its last. Silence before the speaker started and after they finished is not
+an omission, and is ignored. Neither is a pause the annotator deliberately marked `-`: that
+distinction between "left empty on purpose" and "not filled in yet" is what makes the check usable
+at all, since Praat interval tiers tile and most of a corpus is legitimately blank.
+
+The proposed fix is `-`. Accepting it says "this really was silence"; declining it leaves the
+interval for you, because no tool can know which phone you meant to type. A blank point mark is
+reported with no proposal for the same reason.
+
+### Mislabelled segments and points
+
+Flags labels that are not valid symbols. Two modes:
+
+- **With an inventory** — type the symbols this corpus is allowed to use (space- or
+  comma-separated, e.g. `p t k m n ŋ f h r w a e i o u`). Anything outside it is flagged. This
+  catches labels that are perfectly good IPA but impossible for the language, which the chart
+  never can.
+- **Without one** — falls back to the built-in chart for the chosen notation (IPA, SAMPA or
+  X-SAMPA), accepting diacritics and auto-detected diphthongs exactly as the categorisation pass
+  does.
+
+The proposed fix is the nearest valid symbol by edit distance, or nothing at all when no candidate
+is close enough — the honest answer for a label that is simply wrong rather than mistyped. Blanks,
+the pause marker and the divergence arrows `<` and `>` are annotation syntax and are never
+validated.
+
+### Boundaries that nearly align
+
+Flags boundaries **close to one on the reference tier but not on it** — the signature of a
+dragged boundary. You nominate the reference tier, and any number of other tiers are measured
+against it.
+
+Only near misses are reported. A boundary sitting exactly on a reference time is already aligned.
+One further away than the tolerance (default 20 ms) is a genuine subdivision — an allophone tier
+splitting a phone into a closure and a release — and is left alone. The band between those two is
+where a slip hides.
+
+The proposed fix snaps the boundary onto the reference time, moving both sides of the seam so the
+tier stays contiguous. Where snapping would invert or cross a neighbouring interval the drift is
+still reported, but with no fix offered: that is a real fault, and not one to repair
+automatically.
+
+### Applying the fixes
+
+Ticked fixes are written back per file. **The previous contents of each file are kept beside it as
+`<name>.TextGrid.bak`** before it is overwritten, and an existing backup is never replaced — the
+first one holds the annotator's own work, which is the version worth being able to return to. A
+file with nothing ticked is never opened, let alone rewritten.
+
+Each boundary move is re-validated at the moment it is applied, not trusted from the report: an
+earlier fix may have moved the neighbour a later one was measured against. Fixes that have gone
+stale are skipped and counted rather than applied blind. The check re-runs automatically
+afterwards, so the table shows what the files now contain.
 
 ## 7. Parameter reference — tweakable vs fixed
 

@@ -27,6 +27,7 @@ import parselmouth
 from parselmouth import praat
 
 import divergence
+import label_check
 import phone_aligner
 
 from PyQt6.QtWidgets import (
@@ -36,7 +37,8 @@ from PyQt6.QtWidgets import (
     QMessageBox, QSizePolicy, QScrollBar, QLineEdit, QDialog,
     QDialogButtonBox, QFormLayout, QGridLayout,
     QWizard, QWizardPage, QProgressDialog, QListWidget, QListWidgetItem,
-    QRadioButton, QButtonGroup, QTabWidget, QScrollArea, QInputDialog
+    QRadioButton, QButtonGroup, QTabWidget, QScrollArea, QInputDialog,
+    QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QEvent, QObject, pyqtSignal, QByteArray, QBuffer, QIODevice,
@@ -90,6 +92,20 @@ DEFAULT_BAND_HIGH_HZ = 8000.0
 DEFAULT_RATIO_LOW_BAND = (0.0, 2000.0)
 DEFAULT_RATIO_HIGH_BAND = (2000.0, 8000.0)
 RATIO_EPSILON = 1e-20               # keeps a silent window finite
+
+# Recording bandwidth. A file whose top octave the recording chain removed —
+# a phone mic, a lossy codec, an earlier resample — yields an artificially
+# low COG however the speaker actually produced the sound, so each file
+# reports the highest frequency at which it still carries signal rather than
+# its own noise floor. Self-calibrating: a lowpassed file returns its actual
+# cutoff, a full-bandwidth one a value near Nyquist.
+HF_LTAS_WINDOW = 2048               # LTAS frame length (samples), 50% overlap
+HF_SMOOTH_HZ = 100.0                # moving average over the LTAS, in dB
+HF_NOISE_FLOOR_FROM_HZ = 1000.0     # the floor is the minimum above this
+HF_CUTOFF_MARGIN_DB = 6.0           # signal must clear the floor by this much
+HF_SPEECH_ACTIVE_DB = 30.0          # frames this far under the loudest are silence
+HF_MIN_ACTIVE_FRAMES = 4            # too few to average — use every frame
+HF_LTAS_BLOCK = 512                 # frames transformed at a time
 # Proportional windowing: window width as a fraction of segment duration,
 # clamped to [floor, ceiling]. Removes the confound between window artefacts
 # and segment duration that a fixed-ms window introduces.
@@ -900,6 +916,109 @@ def band_energy_ratio(freqs, power, low_band, high_band):
     return 10.0 * math.log10(p_hi / max(p_lo, RATIO_EPSILON))
 
 
+def long_term_average_spectrum(sound, window=HF_LTAS_WINDOW,
+                               active_db=HF_SPEECH_ACTIVE_DB):
+    """Welch LTAS of the whole *sound*, as ``(freqs_hz, power_db)``.
+
+    Hann-tapered frames of *window* samples at 50% overlap, averaged over the
+    speech-active ones — those within *active_db* of the loudest frame.
+    Silence carries nothing but the noise floor, and averaging it in would
+    make a recording look narrower than it is; when too few frames are active
+    to average, every frame is used instead.
+
+    Returns ``(None, None)`` for a sound shorter than one frame.
+    """
+    try:
+        x = np.asarray(sound.values[0], dtype=float)
+        sr = float(sound.sampling_frequency)
+    except Exception:
+        return None, None
+    n = int(window)
+    if x.size < n or n < 8 or sr <= 0:
+        return None, None
+
+    taper = np.hanning(n)
+    frames = np.lib.stride_tricks.sliding_window_view(x, n)[::n // 2]
+
+    # Frames are tapered in blocks throughout. A long recording runs to tens
+    # of thousands of them, and materialising every spectrum at once would
+    # cost hundreds of megabytes for a number that is only an average.
+    energy = np.empty(frames.shape[0])
+    for lo in range(0, frames.shape[0], HF_LTAS_BLOCK):
+        block = frames[lo:lo + HF_LTAS_BLOCK] * taper
+        energy[lo:lo + HF_LTAS_BLOCK] = (block ** 2).sum(axis=1)
+
+    energy_db = 10.0 * np.log10(np.maximum(energy, RATIO_EPSILON))
+    active = np.nonzero(energy_db >= energy_db.max() - active_db)[0]
+    if active.size < HF_MIN_ACTIVE_FRAMES:
+        active = np.arange(frames.shape[0])
+
+    # Energy came from the time domain, so only the frames that survive the
+    # gate are ever transformed.
+    total = np.zeros(n // 2 + 1)
+    for lo in range(0, active.size, HF_LTAS_BLOCK):
+        block = frames[active[lo:lo + HF_LTAS_BLOCK]] * taper
+        spec = np.fft.rfft(block, axis=1)
+        total += (spec.real ** 2 + spec.imag ** 2).sum(axis=0)
+
+    freqs = np.fft.rfftfreq(n, d=1.0 / sr)
+    return freqs, 10.0 * np.log10(
+        np.maximum(total / active.size, RATIO_EPSILON))
+
+
+def _smooth_db(db, freqs, span_hz=HF_SMOOTH_HZ):
+    """Moving average of *db* over a *span_hz* window, edges included.
+
+    Dividing by the number of contributing bins rather than the kernel width
+    keeps the first and last bins at their own level instead of dragging them
+    toward zero, which would otherwise fake a rolloff at Nyquist.
+    """
+    if freqs.size < 2:
+        return db
+    bin_hz = float(freqs[1] - freqs[0])
+    width = max(1, int(round(span_hz / bin_hz)))
+    if width <= 1:
+        return db
+    kernel = np.ones(width)
+    return (np.convolve(db, kernel, mode="same")
+            / np.convolve(np.ones_like(db), kernel, mode="same"))
+
+
+def estimate_hf_cutoff(sound, margin_db=HF_CUTOFF_MARGIN_DB,
+                       floor_from_hz=HF_NOISE_FLOOR_FROM_HZ,
+                       smooth_hz=HF_SMOOTH_HZ):
+    """The highest frequency (Hz) at which *sound* still carries signal.
+
+    The file's own noise floor is the minimum of its smoothed LTAS above
+    *floor_from_hz*; the cutoff is the highest frequency clearing that floor
+    by *margin_db*. Calibrating against the file itself rather than an
+    absolute level is what makes the answer comparable across recordings of
+    different gain — and why it is not simply the highest frequency holding
+    any energy, which is always Nyquist since the noise floor spans the whole
+    spectrum.
+
+    What it locates is the recording's rolloff edge, which every digitised
+    file has: the anti-alias filter of the chain that produced it, sitting
+    just under Nyquist on a full-bandwidth file and wherever the lowpassing
+    happened on a degraded one. A spectrum still at full level at Nyquist has
+    no edge to find and the answer will be low — but no ADC produces one.
+
+    Returns NaN when the sound is too short to analyse or holds no signal.
+    """
+    freqs, db = long_term_average_spectrum(sound)
+    if freqs is None:
+        return np.nan
+    smoothed = _smooth_db(db, freqs, smooth_hz)
+    above = freqs >= floor_from_hz
+    if not above.any():
+        return np.nan
+    floor = float(smoothed[above].min())
+    clears = np.nonzero(smoothed >= floor + margin_db)[0]
+    if clears.size == 0:
+        return np.nan
+    return float(freqs[clears[-1]])
+
+
 def compute_spectral_moments(sound, t0, t1, window_shape, power=SPECTRAL_MOMENT_POWER):
     """Compute the four spectral moments over [*t0*, *t1*] of *sound*.
 
@@ -1505,6 +1624,10 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     flanking labels, adding ``<context>_prev_*`` / ``<context>_next_*``
     columns alongside the ``<tier>_*`` ones.  Each needs its matching
     *include_prev_segment*/*include_next_segment* column to read from.
+    Spectral extraction also adds one ``hf_cutoff_hz`` column beside the
+    filename: the recording's own upper frequency limit (see
+    ``estimate_hf_cutoff``), constant for every row a file contributed.
+
     *auto_diphthong_candidates* and *unmatched_labels* are mutable sets
     that collect data for post-processing. *skipped_files* is a mutable
     list collecting (filename, reason) for audio files that produced no
@@ -1728,6 +1851,12 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     # --- Build header ---
     headers = ["filename"]
 
+    # Recording bandwidth: a property of the file, repeated on every row it
+    # contributed, so a lowpassed recording can be excluded before its
+    # artificially low COGs contaminate a between-group comparison.
+    if extract_spectral or extract_trajectory:
+        headers.append("hf_cutoff_hz")
+
     # Tier label columns — interval tiers in hierarchy order
     interval_tier_names = [t.name for t in selected_tiers
                            if t.tier_class == "IntervalTier"]
@@ -1915,10 +2044,14 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         # Load the raw sound for spectral analysis (high-pass filtered once
         # per file if requested — cheaper and avoids per-window edge effects)
         spectral_sound = None
+        hf_cutoff = np.nan
         if extract_spectral or extract_trajectory:
             audio_path = os.path.join(audio_dir, audio_file)
             try:
                 spectral_sound = parselmouth.Sound(audio_path)
+                # Measured before the high-pass filter: the cutoff describes
+                # the recording, not what we did to it downstream.
+                hf_cutoff = estimate_hf_cutoff(spectral_sound)
                 spectral_sound = highpass_sound(
                     spectral_sound, spectral_highpass_hz)
             except Exception:
@@ -2275,7 +2408,11 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         # --- Row generation: exactly one row per primary-tier unit ---
         for unit in units:
             lc = _label_cols(unit)
-            row = [os.path.splitext(audio_file)[0]] + lc
+            row = [os.path.splitext(audio_file)[0]]
+            if extract_spectral or extract_trajectory:
+                row.append("" if not np.isfinite(hf_cutoff)
+                           else f"{hf_cutoff:.0f}")
+            row += lc
             if reconcile_allophone_tier:
                 row.append(unit.alignment or "")
 
@@ -2497,6 +2634,7 @@ class SpectrogramCanvas(QWidget):
         self._tier_point_scatters = {}  # tier plot → ScatterPlotItem
         self._tier_text_pools = {}    # tier plot → [TextItem, ...]
         self._tier_style_cache = {}   # tier plot → (name, is_active)
+        self._axes_layout = None      # layout key the current plots were built for
         self._wave_fill = None        # pg.FillBetweenItem for envelope
 
         # Cached pens/fonts shared across renders.  The spectrogram/waveform
@@ -2644,7 +2782,7 @@ class SpectrogramCanvas(QWidget):
     def _setup_empty_axes(self):
         """Show an empty canvas with a message."""
         self._glw.clear()
-        self._spec_plot = self._glw.addPlot(row=0, col=0)
+        self._spec_plot = self._glw.addPlot(row=0, col=0, enableMenu=False)
         self._spec_plot.setMouseEnabled(x=False, y=False)
         self._spec_plot.hideButtons()
         self._spec_plot.setMenuEnabled(False)
@@ -2672,8 +2810,35 @@ class SpectrogramCanvas(QWidget):
         self._tier_style_cache = {}
         self._wave_fill = None
 
-    def _setup_axes(self):
-        """Recreate plot layout based on loaded data."""
+    def _axes_layout_key(self):
+        """What the plot layout is a function of.
+
+        A row per visible tier, a waveform row when there is audio, and a left
+        axis sized to the widest tier name. Nothing else about the data
+        reaches the layout: the contents of the tiers are drawn on every
+        render.
+        """
+        tg = self.textgrid_data
+        names = ([t.name for i, t in enumerate(tg.tiers)
+                  if i not in self.hidden_tiers]
+                 if tg is not None else [])
+        return (self.sound is not None, tuple(names))
+
+    def _setup_axes(self, force=False):
+        """Recreate the plot layout, unless the layout is already right.
+
+        Rebuilding tears down every plot and builds nine fresh ones, which
+        costs more than everything else a TextGrid load does put together.
+        The render items all update in place, so a layout that already
+        matches the data can simply be drawn into -- and stepping from one
+        file to the next through a corpus asks for the same layout every
+        time. Pass *force* to rebuild regardless.
+        """
+        key = self._axes_layout_key()
+        if (not force and self._spec_plot is not None
+                and key == self._axes_layout):
+            return
+        self._axes_layout = key
         self._glw.clear()
         self._tier_plots = []
         self._tier_plot_indices = []
@@ -2706,7 +2871,7 @@ class SpectrogramCanvas(QWidget):
         has_tiers = tg is not None and len(tg.tiers) > 0
 
         if not has_wave and not has_tiers:
-            self._spec_plot = self._glw.addPlot(row=0, col=0)
+            self._spec_plot = self._glw.addPlot(row=0, col=0, enableMenu=False)
             self._configure_plot(self._spec_plot, '#1a1a2e')
             return
 
@@ -2720,7 +2885,7 @@ class SpectrogramCanvas(QWidget):
 
         if has_wave:
             # Waveform on top
-            self._wave_plot = self._glw.addPlot(row=row, col=0)
+            self._wave_plot = self._glw.addPlot(row=row, col=0, enableMenu=False)
             self._configure_plot(self._wave_plot, '#1a1a2e')
             self._wave_plot.getAxis('left').setWidth(axis_width)
             self._wave_plot.getAxis('bottom').setStyle(showValues=False)
@@ -2737,7 +2902,7 @@ class SpectrogramCanvas(QWidget):
             spec_stretch = 45
         else:
             spec_stretch = 75 if has_wave else 100
-        self._spec_plot = self._glw.addPlot(row=row, col=0)
+        self._spec_plot = self._glw.addPlot(row=row, col=0, enableMenu=False)
         self._configure_plot(self._spec_plot, '#1a1a2e')
         self._spec_plot.setLabel('left', 'Frequency (Hz)', **{'font-size': '9pt', 'color': '#eeeeee'})
         self._spec_plot.getAxis('left').setWidth(axis_width)
@@ -2754,7 +2919,7 @@ class SpectrogramCanvas(QWidget):
             if n_visible > 0:
                 tier_share = max(3, 30 // n_visible)
                 for vi, tier_i in enumerate(visible_indices):
-                    tp = self._glw.addPlot(row=row + vi, col=0)
+                    tp = self._glw.addPlot(row=row + vi, col=0, enableMenu=False)
                     self._configure_plot(tp, '#ffffff')
                     tp.setXLink(self._spec_plot)
                     tp.setYRange(0, 1, padding=0)
@@ -3831,17 +3996,33 @@ class SpectrogramCanvas(QWidget):
         index = max(0, min(len(tier.intervals) - 1, index))
         iv = tier.intervals[index]
         self._select_interval(self._active_tier, (iv.xmin + iv.xmax) / 2.0)
-        self.scroll_into_view(iv.xmin, iv.xmax)
+        # The highlight is cheap and wanted immediately; the view range only
+        # reaches the plot through a render, so ask for one when the window
+        # actually moved. request_render coalesces a held-down arrow key
+        # rather than queueing a full redraw per repeat.
+        moved = self.centre_view_on(iv.xmin, iv.xmax)
         self._draw_selection_overlay()
+        if moved:
+            self.request_render()
         return iv
 
-    def scroll_into_view(self, xmin, xmax):
-        """Shift the view so [xmin, xmax] is visible, keeping its width."""
-        if xmin >= self.view_start and xmax <= self.view_end:
-            return False
+    def centre_view_on(self, xmin, xmax):
+        """Centre the view on [*xmin*, *xmax*], keeping its width.
+
+        Centring on every step rather than only when the segment falls off
+        the edge: a segment reached at the edge of the window is one you
+        cannot see the context of, and context is the whole reason for
+        looking. The view stops centring where it would run past either end
+        of the recording, so the first and last segments sit off-centre.
+
+        Returns whether the view actually moved, so a caller can skip a
+        redraw that would show the same thing.
+        """
         width = self.view_end - self.view_start
         centre = (xmin + xmax) / 2.0
         start = max(0.0, min(self.total_duration - width, centre - width / 2.0))
+        if start == self.view_start:
+            return False
         self.set_view(start, start + width)
         return True
 
@@ -6755,6 +6936,14 @@ class _CheckablePopup(QWidget):
         self._checkboxes.append(cb)
         return cb
 
+    def set_items(self, items):
+        """Replace every item with *items*, a list of (key, display) pairs."""
+        for cb in self._checkboxes:
+            self._layout.removeWidget(cb)
+            cb.deleteLater()
+        self._checkboxes = []
+        return [self.add_item(key, display) for key, display in items]
+
     def checked_keys(self):
         return [cb.property("item_key") for cb in self._checkboxes
                 if cb.isChecked()]
@@ -6815,6 +7004,12 @@ class _MultiSelectDropdown(QWidget):
             self._button.setText("None selected  \u25BC")
         else:
             self._button.setText(f"{len(checked)} of {total} selected  \u25BC")
+
+    def set_items(self, items):
+        """Repopulate the dropdown; everything starts selected, as on build."""
+        for cb in self._popup.set_items(items):
+            cb.toggled.connect(self._update_button_text)
+        self._update_button_text()
 
     def selected_keys(self):
         return self._popup.checked_keys()
@@ -7186,6 +7381,468 @@ class _IPAChartDialog(QDialog):
                 btn.setText(disp)
             else:
                 btn.setText(btn.property("ipa" if is_ipa else "sampa"))
+
+
+class _LabelCheckDialog(QDialog):
+    """Batch integrity check over a directory of TextGrids.
+
+    Run before an export: each fault it looks for corrupts a CSV quietly
+    rather than loudly, and finding them one file at a time in the editor is
+    how they get missed.  Nothing is written until the user ticks a proposed
+    fix and presses Apply, so running the check itself is always safe.
+    """
+
+    ISSUE_LABELS = {
+        label_check.UNLABELLED: "Unlabelled",
+        label_check.UNKNOWN_SYMBOL: "Unknown symbol",
+        label_check.NOT_IN_INVENTORY: "Not in inventory",
+        label_check.BOUNDARY_DRIFT: "Boundary drift",
+    }
+    COLUMNS = ["Fix?", "File", "Tier", "Time", "Issue", "Current",
+               "Proposed", "Detail"]
+
+    def __init__(self, textgrid_dir="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Check Label Files")
+        self.resize(1040, 700)
+        self._issues = []
+
+        layout = QVBoxLayout(self)
+
+        # --- Where ---
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(QLabel("TextGrid folder:"))
+        self._dir_edit = QLineEdit(textgrid_dir)
+        self._dir_edit.setPlaceholderText("Folder of .TextGrid files to check")
+        self._dir_edit.editingFinished.connect(self._rescan_tiers)
+        dir_row.addWidget(self._dir_edit, 1)
+        browse = QPushButton("Browse...")
+        browse.clicked.connect(self._browse)
+        dir_row.addWidget(browse)
+        layout.addLayout(dir_row)
+
+        # --- What to check ---
+        self._unlabelled_cb = QCheckBox("Unlabelled segments and points")
+        self._unlabelled_cb.setToolTip(
+            "Blank intervals lying inside the annotated stretch of a tier. "
+            "Silence before the first label and after the last is ignored, "
+            "and so is a pause the annotator marked '-' deliberately.")
+        self._unlabelled_tiers = _MultiSelectDropdown("Tiers:", [])
+        layout.addWidget(self._unlabelled_cb)
+        layout.addWidget(self._indent(self._unlabelled_tiers))
+
+        self._symbol_cb = QCheckBox("Mislabelled segments and points")
+        self._symbol_cb.setToolTip(
+            "Labels that are not valid symbols. With an inventory supplied "
+            "the check is against that; without one it falls back to the "
+            "built-in chart for the chosen notation.")
+        self._symbol_tiers = _MultiSelectDropdown("Tiers:", [])
+        layout.addWidget(self._symbol_cb)
+        layout.addWidget(self._indent(self._symbol_tiers))
+
+        sym_row = QHBoxLayout()
+        sym_row.addSpacing(20)
+        sym_row.addWidget(QLabel("Notation:"))
+        self._notation_combo = QComboBox()
+        self._notation_combo.addItems(["IPA", "SAMPA", "X-SAMPA"])
+        sym_row.addWidget(self._notation_combo)
+        sym_row.addWidget(QLabel("Inventory:"))
+        self._inventory_edit = QLineEdit()
+        self._inventory_edit.setPlaceholderText(
+            "optional — e.g.  p t k m n ŋ f h r w a e i o u")
+        self._inventory_edit.setToolTip(
+            "The symbols this corpus is allowed to use, separated by spaces "
+            "or commas. Catches labels that are valid IPA but impossible for "
+            "the language. Left empty, the built-in chart is used instead.")
+        sym_row.addWidget(self._inventory_edit, 1)
+        layout.addLayout(sym_row)
+
+        self._boundary_cb = QCheckBox("Boundaries that nearly align")
+        self._boundary_cb.setToolTip(
+            "Boundaries close to one on the reference tier but not on it — "
+            "the signature of a dragged boundary. Anything further away than "
+            "the tolerance is treated as a real subdivision and left alone.")
+        self._boundary_tiers = _MultiSelectDropdown("Tiers to check:", [])
+        layout.addWidget(self._boundary_cb)
+        layout.addWidget(self._indent(self._boundary_tiers))
+
+        bnd_row = QHBoxLayout()
+        bnd_row.addSpacing(20)
+        bnd_row.addWidget(QLabel("Reference tier:"))
+        self._ref_combo = QComboBox()
+        self._ref_combo.setToolTip(
+            "The tier whose boundaries are taken as correct. Every other "
+            "checked tier is measured against it, and snaps to it.")
+        self._ref_combo.setMinimumWidth(180)
+        bnd_row.addWidget(self._ref_combo)
+        bnd_row.addWidget(QLabel("Tolerance:"))
+        self._tolerance_spin = QDoubleSpinBox()
+        self._tolerance_spin.setRange(0.1, 200.0)
+        self._tolerance_spin.setValue(20.0)
+        self._tolerance_spin.setSuffix(" ms")
+        self._tolerance_spin.setDecimals(1)
+        bnd_row.addWidget(self._tolerance_spin)
+        bnd_row.addStretch(1)
+        layout.addLayout(bnd_row)
+
+        for cb, governed in (
+                (self._unlabelled_cb, [self._unlabelled_tiers]),
+                (self._symbol_cb, [self._symbol_tiers, self._notation_combo,
+                                   self._inventory_edit]),
+                (self._boundary_cb, [self._boundary_tiers, self._ref_combo,
+                                     self._tolerance_spin])):
+            cb.setChecked(True)
+            for w in governed:
+                cb.toggled.connect(w.setEnabled)
+
+        run_row = QHBoxLayout()
+        self._run_btn = QPushButton("Run Check")
+        self._run_btn.clicked.connect(self._run)
+        run_row.addWidget(self._run_btn)
+        self._summary = QLabel("")
+        run_row.addWidget(self._summary, 1)
+        layout.addLayout(run_row)
+
+        # --- Results ---
+        self._table = QTableWidget(0, len(self.COLUMNS))
+        self._table.setHorizontalHeaderLabels(self.COLUMNS)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setAlternatingRowColors(True)
+        self._table.horizontalHeader().setSectionResizeMode(
+            len(self.COLUMNS) - 1, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self._table, 1)
+
+        tick_row = QHBoxLayout()
+        for text, fn in (("Tick all fixable", lambda: self._set_all(True)),
+                         ("Untick all", lambda: self._set_all(False))):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            tick_row.addWidget(b)
+        tick_row.addWidget(QLabel("Tick all of type:"))
+        self._kind_combo = QComboBox()
+        self._kind_combo.setMinimumWidth(160)
+        tick_row.addWidget(self._kind_combo)
+        tick_kind = QPushButton("Tick")
+        tick_kind.clicked.connect(self._tick_kind)
+        tick_row.addWidget(tick_kind)
+        tick_row.addStretch(1)
+        layout.addLayout(tick_row)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        self._apply_btn = QPushButton("Apply Ticked Fixes")
+        self._apply_btn.setEnabled(False)
+        self._apply_btn.clicked.connect(self._apply)
+        btn_row.addWidget(self._apply_btn)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        if textgrid_dir:
+            self._rescan_tiers()
+
+    # ------------------------------------------------------------------
+    # Configuration
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _indent(widget):
+        """Wrap *widget* so it sits under the checkbox that governs it."""
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(20, 0, 0, 0)
+        row.addWidget(widget)
+        return holder
+
+    def _browse(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "Folder of TextGrid files", self._dir_edit.text())
+        if d:
+            self._dir_edit.setText(d)
+            self._rescan_tiers()
+
+    def _rescan_tiers(self):
+        """Offer the tiers this corpus actually has.
+
+        Unioned across the folder rather than read from the first file, since
+        a tier missing from one grid should still be checkable in the rest.
+        """
+        directory = self._dir_edit.text().strip()
+        if not directory or not os.path.isdir(directory):
+            return
+        try:
+            found = label_check.tier_names_in(
+                directory, TextGrid.from_file, max_files=20)
+        except OSError as e:
+            QMessageBox.warning(self, "Cannot Read Folder", str(e))
+            return
+        items = [(n, f"{n}  ({'points' if c == 'TextTier' else 'intervals'})")
+                 for n, c in found]
+        for dd in (self._unlabelled_tiers, self._symbol_tiers,
+                   self._boundary_tiers):
+            dd.set_items(items)
+        previous = self._ref_combo.currentText()
+        self._ref_combo.clear()
+        self._ref_combo.addItems([n for n, _ in found])
+        if previous:
+            self._ref_combo.setCurrentText(previous)
+
+    def _inventory_symbols(self):
+        """The inventory as a set, empty when the user supplied none."""
+        raw = self._inventory_edit.text().replace(",", " ").split()
+        return frozenset(s for s in (t.strip() for t in raw) if s)
+
+    def _symbol_policy(self):
+        """``(accept, candidates)`` for the symbol check, inventory first.
+
+        An inventory says what this corpus may contain, which the chart never
+        can — it accepts any symbol some language uses.  Without one the
+        chart is the only standard available, so it is the fallback rather
+        than a peer.
+        """
+        inventory = self._inventory_symbols()
+        if inventory:
+            return inventory.__contains__, inventory
+        chart = _load_ipa_chart(_IPA_CHART_PATH)
+        notation = self._notation_combo.currentText().lower().replace("-", "")
+        lookup = chart[notation]
+        vowels = _build_known_vowels(lookup)
+        return (lambda label: _classify_label(label, lookup, notation,
+                                              vowels)[2],
+                set(lookup))
+
+    def options(self):
+        """The enabled checks, as a :class:`label_check.CheckOptions`."""
+        return label_check.CheckOptions(
+            unlabelled_tiers=(tuple(self._unlabelled_tiers.selected_keys())
+                              if self._unlabelled_cb.isChecked() else ()),
+            symbol_tiers=(tuple(self._symbol_tiers.selected_keys())
+                          if self._symbol_cb.isChecked() else ()),
+            boundary_tiers=(tuple(self._boundary_tiers.selected_keys())
+                            if self._boundary_cb.isChecked() else ()),
+            reference_tier=(self._ref_combo.currentText()
+                            if self._boundary_cb.isChecked() else ""),
+            tolerance_s=self._tolerance_spin.value() / 1000.0,
+            notation=self._notation_combo.currentText().lower().replace(
+                "-", ""),
+            inventory=self._inventory_symbols(),
+        )
+
+    # ------------------------------------------------------------------
+    # Running
+    # ------------------------------------------------------------------
+
+    def _run(self):
+        """Check every grid in the folder and fill the table with the faults."""
+        directory = self._dir_edit.text().strip()
+        if not directory or not os.path.isdir(directory):
+            QMessageBox.warning(self, "No Folder",
+                                "Choose a folder of TextGrid files first.")
+            return
+        options = self.options()
+        if not (options.unlabelled_tiers or options.symbol_tiers
+                or options.boundary_tiers):
+            QMessageBox.information(
+                self, "Nothing to Check",
+                "Tick at least one check, and at least one tier for it.")
+            return
+
+        accept = candidates = None
+        if options.symbol_tiers:
+            try:
+                accept, candidates = self._symbol_policy()
+            except Exception as e:
+                QMessageBox.critical(self, "Cannot Load Symbol Chart", str(e))
+                return
+
+        progress = QProgressDialog("Checking label files...", "Cancel", 0, 1,
+                                   self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        cancelled = False
+
+        def on_progress(current, total, name):
+            nonlocal cancelled
+            progress.setMaximum(total)
+            progress.setValue(current)
+            progress.setLabelText(f"Checking {current + 1}/{total}: {name}")
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                cancelled = True
+
+        try:
+            issues, unreadable = label_check.check_directory(
+                directory, options, TextGrid.from_file,
+                accept=accept, candidates=candidates or (),
+                progress=on_progress)
+        except OSError as e:
+            progress.close()
+            QMessageBox.critical(self, "Cannot Read Folder", str(e))
+            return
+        progress.close()
+        if cancelled:
+            self._summary.setText("Cancelled — results are incomplete.")
+
+        self._populate(issues)
+        note = f"{len(issues)} issue(s) in {len({i.file for i in issues})} file(s)"
+        if unreadable:
+            note += f"; {len(unreadable)} file(s) could not be read"
+        if not issues and not unreadable:
+            note = "No problems found."
+        if not cancelled:
+            self._summary.setText(note)
+
+        if unreadable:
+            shown = "\n".join(f"  • {f}: {why}" for f, why in unreadable[:10])
+            if len(unreadable) > 10:
+                shown += f"\n  … and {len(unreadable) - 10} more"
+            QMessageBox.warning(
+                self, "Some Files Could Not Be Read",
+                "These were skipped, so any faults in them are unreported:\n\n"
+                + shown)
+
+    def _populate(self, issues):
+        """Fill the table from *issues*, ticking nothing by default.
+
+        Every fix is a change to the user's annotation, so each one is opted
+        into rather than out of; rows carrying no proposal are reported but
+        cannot be ticked at all.
+        """
+        self._issues = list(issues)
+        self._table.setSortingEnabled(False)
+        self._table.setRowCount(len(self._issues))
+        for row, issue in enumerate(self._issues):
+            tick = QTableWidgetItem()
+            if issue.fixable:
+                tick.setFlags(Qt.ItemFlag.ItemIsUserCheckable
+                              | Qt.ItemFlag.ItemIsEnabled)
+                tick.setCheckState(Qt.CheckState.Unchecked)
+            else:
+                tick.setFlags(Qt.ItemFlag.NoItemFlags)
+            tick.setData(Qt.ItemDataRole.UserRole, row)
+            self._table.setItem(row, 0, tick)
+
+            cells = [issue.file, issue.tier, f"{issue.time:.4f}",
+                     self.ISSUE_LABELS.get(issue.kind, issue.kind),
+                     issue.current or "(blank)",
+                     issue.proposed or "—", issue.detail]
+            for col, text in enumerate(cells, start=1):
+                item = QTableWidgetItem(text)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled
+                              | Qt.ItemFlag.ItemIsSelectable)
+                self._table.setItem(row, col, item)
+        self._table.setSortingEnabled(True)
+        self._table.resizeColumnsToContents()
+
+        kinds = []
+        for issue in self._issues:
+            label = self.ISSUE_LABELS.get(issue.kind, issue.kind)
+            if label not in kinds:
+                kinds.append(label)
+        self._kind_combo.clear()
+        self._kind_combo.addItems(kinds)
+        self._apply_btn.setEnabled(any(i.fixable for i in self._issues))
+
+    # ------------------------------------------------------------------
+    # Ticking
+    # ------------------------------------------------------------------
+
+    def _rows(self):
+        """``(row_index, issue, tick_item)`` for every row that can be ticked."""
+        for row in range(self._table.rowCount()):
+            item = self._table.item(row, 0)
+            if item is None or not (item.flags()
+                                    & Qt.ItemFlag.ItemIsUserCheckable):
+                continue
+            yield row, self._issues[item.data(Qt.ItemDataRole.UserRole)], item
+
+    def _set_all(self, ticked):
+        state = (Qt.CheckState.Checked if ticked else Qt.CheckState.Unchecked)
+        for _, _, item in self._rows():
+            item.setCheckState(state)
+
+    def _tick_kind(self):
+        wanted = self._kind_combo.currentText()
+        for _, issue, item in self._rows():
+            if self.ISSUE_LABELS.get(issue.kind, issue.kind) == wanted:
+                item.setCheckState(Qt.CheckState.Checked)
+
+    def accepted_issues(self):
+        """The issues the user has ticked, in table order."""
+        return [issue for _, issue, item in self._rows()
+                if item.checkState() == Qt.CheckState.Checked]
+    # ------------------------------------------------------------------
+    # Applying
+    # ------------------------------------------------------------------
+
+    def _apply(self):
+        """Write the ticked fixes back to disk, keeping a backup of each file.
+
+        Files with nothing ticked are never opened, let alone rewritten, so a
+        run that fixes one grid leaves the rest of the corpus byte-identical.
+        """
+        accepted = self.accepted_issues()
+        if not accepted:
+            QMessageBox.information(
+                self, "Nothing Ticked",
+                "Tick the fixes you want applied first.")
+            return
+
+        by_file = {}
+        for issue in accepted:
+            by_file.setdefault(issue.file, []).append(issue)
+
+        if QMessageBox.question(
+                self, "Apply Fixes",
+                f"Apply {len(accepted)} fix(es) across {len(by_file)} "
+                f"file(s)?\n\nEach file's current contents are kept beside it "
+                f"as .TextGrid{label_check.BACKUP_SUFFIX} before it is "
+                f"overwritten.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        paths = label_check.paths_by_name(self._dir_edit.text().strip())
+        applied = skipped = 0
+        changed, failures = [], []
+        for name, issues in sorted(by_file.items()):
+            path = paths.get(name)
+            if path is None:
+                failures.append((name, "the file is no longer in the folder"))
+                continue
+            try:
+                tg = TextGrid.from_file(path)
+                did, missed = label_check.apply_fixes(tg, issues)
+                if did:
+                    label_check.save_with_backup(tg, path)
+                    changed.append(name)
+                applied += did
+                skipped += missed
+            except Exception as e:
+                failures.append((name, str(e)))
+
+        lines = [f"Applied {applied} fix(es) to {len(changed)} file(s)."]
+        if skipped:
+            lines.append(
+                f"{skipped} were no longer valid once earlier fixes had "
+                "moved their neighbours, and were left alone.")
+        if failures:
+            lines.append("")
+            lines.append("These files could not be written:")
+            lines += [f"  • {n}: {why}" for n, why in failures]
+
+        report = "\n".join(lines)
+        if failures:
+            QMessageBox.warning(self, "Fixes Partly Applied", report)
+        else:
+            QMessageBox.information(self, "Fixes Applied", report)
+        self._summary.setText(lines[0])
+
+        # Re-check, so the table shows what the files now contain rather than
+        # what they contained before the fixes landed.
+        self._run()
 
 
 class _CategorisationPage(QWizardPage):
@@ -7780,6 +8437,12 @@ class MainWindow(QMainWindow):
         build_csv_action = QAction("&Build CSV...", self)
         build_csv_action.triggered.connect(self._build_csv)
         tools_menu.addAction(build_csv_action)
+        check_files_action = QAction("Check &Label Files...", self)
+        check_files_action.setStatusTip(
+            "Check a folder of TextGrids for unlabelled segments, unknown "
+            "symbols and near-miss boundaries before exporting")
+        check_files_action.triggered.connect(self._check_label_files)
+        tools_menu.addAction(check_files_action)
         symbol_chart_action = QAction("&IPA Symbol Chart", self)
         symbol_chart_action.triggered.connect(self._show_symbol_chart)
         tools_menu.addAction(symbol_chart_action)
@@ -8808,6 +9471,22 @@ class MainWindow(QMainWindow):
                     "include_track": wizard.traj_include_track,
                     "frame_inset": "window_ms / 2 at each segment edge",
                 } if wizard.extract_trajectory else None,
+                "hf_cutoff": {
+                    "column": "hf_cutoff_hz",
+                    "scope": "one value per audio file, repeated per row",
+                    "ltas": f"Welch, {HF_LTAS_WINDOW}-sample Hann frames, "
+                            "50% overlap",
+                    "frames": "speech-active only — frames within "
+                              f"{HF_SPEECH_ACTIVE_DB:g} dB of the loudest",
+                    "smoothing_hz": HF_SMOOTH_HZ,
+                    "noise_floor": "minimum of the smoothed LTAS above "
+                                   f"{HF_NOISE_FLOOR_FROM_HZ:g} Hz",
+                    "criterion": "highest frequency clearing that floor by "
+                                 f"{HF_CUTOFF_MARGIN_DB:g} dB",
+                    "measured_on": "the unfiltered signal, before any "
+                                   "spectral high-pass",
+                } if (wizard.extract_spectral
+                      or wizard.extract_trajectory) else None,
             }
             side_path = os.path.splitext(csv_path)[0] + ".provenance.json"
             with open(side_path, "w", encoding="utf-8") as fh:
@@ -9010,6 +9689,16 @@ class MainWindow(QMainWindow):
         self.status.showMessage(
             "Annotation check: no problems — "
             + ", ".join(f"{k} {counts[k]}" for k in order if counts.get(k)))
+
+    def _check_label_files(self):
+        """Check a whole folder of TextGrids, rather than the open one.
+
+        Opens on the folder of the loaded TextGrid when there is one, since
+        that is almost always the corpus about to be exported.
+        """
+        start = (os.path.dirname(self._textgrid_path)
+                 if self._textgrid_path else "")
+        _LabelCheckDialog(start, parent=self).exec()
 
     def _align_template(self, template, tier_name, duration):
         """Warp *template* onto the open recording using its acoustics.
