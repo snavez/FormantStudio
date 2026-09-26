@@ -77,6 +77,7 @@ DEFAULT_SPECTRAL_WINDOW_MS = 25.0   # fixed-mode analysis window length (ms)
 MIN_SPECTRAL_WINDOW_MS = 5.0        # hard floor — shorter is unreliable
 MAX_SPECTRAL_WINDOW_MS = 50.0       # ceiling — wider blurs short segments
 DEFAULT_SPECTRAL_HIGHPASS_HZ = 0.0  # 0 = off; ~300 Hz removes voicing bleed
+DEFAULT_SPECTRAL_PREEMPH_HZ = 0.0   # 0 = off; Praat's formant default is 50
 SPECTRAL_MOMENT_POWER = 2.0         # Praat default power for all moments
 
 # The band the moments are taken over. A moment is a weighted sum across
@@ -106,6 +107,13 @@ HF_CUTOFF_MARGIN_DB = 6.0           # signal must clear the floor by this much
 HF_SPEECH_ACTIVE_DB = 30.0          # frames this far under the loudest are silence
 HF_MIN_ACTIVE_FRAMES = 4            # too few to average — use every frame
 HF_LTAS_BLOCK = 512                 # frames transformed at a time
+
+# Clipping: a flat top at the file's own peak, on either polarity. Measured
+# against the peak rather than digital full scale so a file normalised after
+# it clipped is still caught; a run of samples is required because a clean
+# waveform touches its peak once, not several times in a row.
+CLIP_PEAK_TOLERANCE = 0.9999        # within 0.01% of the peak counts as at it
+CLIP_MIN_RUN = 3                    # consecutive samples that make a flat top
 # Proportional windowing: window width as a fraction of segment duration,
 # clamped to [floor, ceiling]. Removes the confound between window artefacts
 # and segment duration that a fixed-ms window introduces.
@@ -129,10 +137,24 @@ DEFAULT_SPECTRAL_MT_K = 7           # number of DPSS tapers
 # evolves through a release rather than three static snapshots.
 SPECTRAL_MOMENT_NAMES = ("COG", "SD", "skew", "kurt")
 
-# The ratio rides alongside the moments everywhere they are tracked: same
-# windows, same clamps, same provenance.
+# The ratio, the flatness and the high-band level ride alongside the moments
+# everywhere they are tracked: same windows, same clamps, same provenance.
 BAND_RATIO_NAME = "bandratio"
-SPECTRAL_TRACK_NAMES = SPECTRAL_MOMENT_NAMES + (BAND_RATIO_NAME,)
+FLATNESS_NAME = "flatness"
+HB_LEVEL_NAME = "hblevel"
+SPECTRAL_TRACK_NAMES = SPECTRAL_MOMENT_NAMES + (
+    BAND_RATIO_NAME, FLATNESS_NAME, HB_LEVEL_NAME)
+# Relative high-band level: the token's high band against its file's speech
+# level, so recording gain drops out of it.
+HB_RELATIVE_NAME = "hbrel"
+# Every column a spectral marker contributes, in order; headers and cells are
+# both built from this, so the two cannot disagree on how many there are.
+SPECTRAL_MARKER_COLUMNS = SPECTRAL_TRACK_NAMES + (
+    HB_RELATIVE_NAME, "winms", "winsource", "nsamples")
+# Levels are dB SPL by Praat's convention: samples are pascals, referenced to
+# 20 µPa. Meaningful as absolutes only for a calibrated recording; within a
+# file, and against the file's own speech level, they always compare.
+P_REF_PA = 2e-5
 DEFAULT_TRAJ_WIN_MS = 6.0           # sliding-window width (ms)
 DEFAULT_TRAJ_HOP_MS = 1.0           # sliding-window hop (ms)
 DEFAULT_TRAJ_NORM_POINTS = 11       # samples per time-normalised track
@@ -776,42 +798,57 @@ def _spectral_window_shape(name):
     return getattr(parselmouth.WindowShape, attr)
 
 
+# Per-file columns beside the filename whenever spectra are extracted.
+FILE_SIGNAL_COLUMNS = ("hf_cutoff_hz", "pre_emphasis_alpha",
+                       "speech_level_db", "clipped_pct")
+
+# How each measured spectral cell is written.
+SPECTRAL_CELL_FORMATS = {
+    "COG": "{:.1f}", "SD": "{:.1f}", "skew": "{:.4f}", "kurt": "{:.4f}",
+    BAND_RATIO_NAME: "{:.3f}", FLATNESS_NAME: "{:.4f}",
+    HB_LEVEL_NAME: "{:.1f}", HB_RELATIVE_NAME: "{:.1f}",
+}
+
+
+def _fmt(value, fmt):
+    """*value* written with *fmt*, or blank when it is missing or not finite."""
+    if value is None or not np.isfinite(value):
+        return ""
+    return fmt.format(value)
+
+
 def resolve_spectral_window(t_center, seg_xmin, seg_xmax, *, mode,
                             w_prop, fixed_s, win_min_s, win_max_s):
     """Resolve a spectral analysis window, symmetric about *t_center*.
 
     The centre is never moved and the window is never one-sidedly truncated
-    against a boundary: a window that will not fit symmetrically falls back
-    to the ``win_min_s`` floor, and if even that will not fit the point is
-    unmeasurable.  Returns ``(t0, t1, win_source)`` where *win_source* is one
-    of ``proportional``, ``clamped_max``, ``fixed``, ``clamped_min`` or
-    ``too_short`` (the last with ``t0 == t1``).
+    against a boundary.  Returns ``(t0, t1, win_source)`` where *win_source*
+    is one of ``proportional``, ``clamped_max``, ``fixed``, ``clamped_min``
+    or ``too_short`` (the last with ``t0 == t1``).
 
     *mode* is ``"proportional"`` (width = ``w_prop`` × segment duration,
-    capped at ``win_max_s``) or ``"fixed"`` (width = ``fixed_s``).
+    capped at ``win_max_s``; a window that will not fit symmetrically falls
+    back to the ``win_min_s`` floor) or ``"fixed"`` (width = ``fixed_s``
+    exactly, or ``too_short`` — every measured window in a fixed column is
+    the same width, which is the reason to choose fixed).
     """
     duration = seg_xmax - seg_xmin
     # Largest window that stays centred on t_center inside the segment
     max_centred = 2.0 * min(t_center - seg_xmin, seg_xmax - t_center)
 
-    if mode == "proportional":
+    if mode == "fixed":
+        w, src = fixed_s, "fixed"
+    else:
         w_req = w_prop * duration
         w = min(w_req, win_max_s)
-        if w >= win_min_s and w <= max_centred:
-            src = "clamped_max" if w_req > win_max_s else "proportional"
-            half = w / 2.0
-            return t_center - half, t_center + half, src
-    else:  # fixed
-        if fixed_s <= max_centred and fixed_s >= win_min_s:
-            half = fixed_s / 2.0
-            return t_center - half, t_center + half, "fixed"
+        src = "clamped_max" if w_req > win_max_s else "proportional"
+        if w < win_min_s or w > max_centred:
+            w, src = win_min_s, "clamped_min"
 
-    # Fall back to the minimum window, still centred
-    if win_min_s <= max_centred:
-        half = win_min_s / 2.0
-        return t_center - half, t_center + half, "clamped_min"
-
-    return t_center, t_center, "too_short"
+    if w > max_centred:
+        return t_center, t_center, "too_short"
+    half = w / 2.0
+    return t_center - half, t_center + half, src
 
 
 def highpass_sound(sound, cutoff_hz, smoothing_hz=100.0):
@@ -826,6 +863,36 @@ def highpass_sound(sound, cutoff_hz, smoothing_hz=100.0):
     # Praat "Filter (pass Hann band)...": to-frequency 0 means Nyquist.
     return praat.call(sound, "Filter (pass Hann band)...",
                       float(cutoff_hz), 0.0, float(smoothing_hz))
+
+
+def pre_emphasis_alpha(from_hz, sampling_hz):
+    """First-difference coefficient for pre-emphasis above *from_hz*.
+
+    ``α = exp(−2π·from_hz / sampling_hz)``, Praat's definition, so a corner
+    frequency means the same thing at every sampling rate.  0 when off, which
+    is also the coefficient of an identity filter.
+    """
+    if not from_hz or from_hz <= 0:
+        return 0.0
+    return math.exp(-2.0 * math.pi * from_hz / sampling_hz)
+
+
+def pre_emphasize(sound, from_hz):
+    """Return *sound* pre-emphasised above *from_hz*: ``y[n] = x[n] − α·x[n−1]``.
+
+    Tilts the spectrum up by 6 dB/octave above the corner, so a weak high
+    band is not swamped by the low one.  Praat's own filter rescales its
+    output to a 0.99 peak; this one does not, so levels survive it.  A
+    corner <= 0 returns the sound unchanged.
+    """
+    alpha = pre_emphasis_alpha(from_hz, sound.sampling_frequency)
+    if alpha == 0.0:
+        return sound
+    x = sound.values
+    y = x.copy()
+    y[:, 1:] -= alpha * x[:, :-1]
+    return parselmouth.Sound(y, sampling_frequency=sound.sampling_frequency,
+                             start_time=sound.xmin)
 
 
 @functools.lru_cache(maxsize=128)
@@ -845,13 +912,25 @@ def _dpss_tapers(n, nw, k):
     return tapers
 
 
+# Mean of w² for Praat's tapers: the single-taper spectrum is divided by the
+# taper's energy so its bins sum to the window's mean square. The textbook
+# shapes match Praat's own to within 0.6% per sample, well under 0.05 dB.
+_TAPER_MEAN_SQUARE = {
+    parselmouth.WindowShape.HAMMING: 0.54 ** 2 + 0.46 ** 2 / 2.0,
+    parselmouth.WindowShape.HANNING: 0.375,
+}
+
+
 def spectrum_of(sound, t0, t1, window_shape=None, estimator="single_taper",
                 mt_nw=DEFAULT_SPECTRAL_MT_NW, mt_k=DEFAULT_SPECTRAL_MT_K):
-    """Power spectrum over [*t0*, *t1*] as ``(freqs_hz, power)``.
+    """One-sided power spectrum over [*t0*, *t1*] as ``(freqs_hz, power)``.
 
     Both estimators return the same shape of thing, so everything downstream —
-    moments, band limits, energy ratios — works from one array rather than
-    each estimator carrying its own arithmetic.
+    moments, band limits, energy ratios, levels — works from one array rather
+    than each estimator carrying its own arithmetic. Power is calibrated: each
+    bin holds its share of the window's mean square (Pa²), so a band's bins
+    sum to that band's mean square. The scale is a single factor per window,
+    so moments and ratios do not depend on it.
 
     Returns ``(None, None)`` when the region is too short to analyse.
     """
@@ -869,7 +948,8 @@ def spectrum_of(sound, t0, t1, window_shape=None, estimator="single_taper",
             tapers = _dpss_tapers(x.size, float(mt_nw), k_eff)
             spec = np.fft.rfft(x * tapers, axis=1)
             psd = (spec.real ** 2 + spec.imag ** 2).sum(axis=0)
-            return freqs, psd / k_eff
+            # DPSS tapers carry unit energy
+            return freqs, psd * (2.0 / (x.size * k_eff))
 
         shape = window_shape or parselmouth.WindowShape.HAMMING
         part = sound.extract_part(t0, t1, shape, 1.0, False)
@@ -878,7 +958,9 @@ def spectrum_of(sound, t0, t1, window_shape=None, estimator="single_taper",
             return None, None
         freqs = np.fft.rfftfreq(x.size, d=1.0 / sound.sampling_frequency)
         spec = np.fft.rfft(x)
-        return freqs, spec.real ** 2 + spec.imag ** 2
+        taper_energy = x.size * _TAPER_MEAN_SQUARE.get(shape, 1.0)
+        return freqs, (spec.real ** 2 + spec.imag ** 2) * (
+            2.0 / (x.size * taper_energy))
     except Exception:
         return None, None
 
@@ -928,30 +1010,11 @@ def long_term_average_spectrum(sound, window=HF_LTAS_WINDOW,
 
     Returns ``(None, None)`` for a sound shorter than one frame.
     """
-    try:
-        x = np.asarray(sound.values[0], dtype=float)
-        sr = float(sound.sampling_frequency)
-    except Exception:
+    gated = _speech_active_frames(sound, window, active_db)
+    if gated is None:
         return None, None
-    n = int(window)
-    if x.size < n or n < 8 or sr <= 0:
-        return None, None
-
-    taper = np.hanning(n)
-    frames = np.lib.stride_tricks.sliding_window_view(x, n)[::n // 2]
-
-    # Frames are tapered in blocks throughout. A long recording runs to tens
-    # of thousands of them, and materialising every spectrum at once would
-    # cost hundreds of megabytes for a number that is only an average.
-    energy = np.empty(frames.shape[0])
-    for lo in range(0, frames.shape[0], HF_LTAS_BLOCK):
-        block = frames[lo:lo + HF_LTAS_BLOCK] * taper
-        energy[lo:lo + HF_LTAS_BLOCK] = (block ** 2).sum(axis=1)
-
-    energy_db = 10.0 * np.log10(np.maximum(energy, RATIO_EPSILON))
-    active = np.nonzero(energy_db >= energy_db.max() - active_db)[0]
-    if active.size < HF_MIN_ACTIVE_FRAMES:
-        active = np.arange(frames.shape[0])
+    frames, taper, _, active = gated
+    n = taper.size
 
     # Energy came from the time domain, so only the frames that survive the
     # gate are ever transformed.
@@ -961,9 +1024,100 @@ def long_term_average_spectrum(sound, window=HF_LTAS_WINDOW,
         spec = np.fft.rfft(block, axis=1)
         total += (spec.real ** 2 + spec.imag ** 2).sum(axis=0)
 
-    freqs = np.fft.rfftfreq(n, d=1.0 / sr)
+    freqs = np.fft.rfftfreq(n, d=1.0 / float(sound.sampling_frequency))
     return freqs, 10.0 * np.log10(
         np.maximum(total / active.size, RATIO_EPSILON))
+
+
+def _speech_active_frames(sound, window=HF_LTAS_WINDOW,
+                          active_db=HF_SPEECH_ACTIVE_DB):
+    """Hann frames of *sound* and which of them carry speech.
+
+    Frames are *window* samples at 50% overlap; a frame is speech-active
+    when its energy is within *active_db* of the loudest, and when too few
+    are, every frame is. Returns ``(frames, taper, energy, active)`` —
+    *frames* untapered, *energy* the tapered energy of each, *active* the
+    indices of the speech-active ones — or None for a sound shorter than one
+    frame.
+    """
+    try:
+        x = np.asarray(sound.values[0], dtype=float)
+        sr = float(sound.sampling_frequency)
+    except Exception:
+        return None
+    n = int(window)
+    if x.size < n or n < 8 or sr <= 0:
+        return None
+
+    taper = np.hanning(n)
+    frames = np.lib.stride_tricks.sliding_window_view(x, n)[::n // 2]
+
+    # Frames are tapered in blocks throughout. A long recording runs to tens
+    # of thousands of them, and materialising every tapered frame at once
+    # would cost hundreds of megabytes for a number that is only an average.
+    energy = np.empty(frames.shape[0])
+    for lo in range(0, frames.shape[0], HF_LTAS_BLOCK):
+        block = frames[lo:lo + HF_LTAS_BLOCK] * taper
+        energy[lo:lo + HF_LTAS_BLOCK] = (block ** 2).sum(axis=1)
+
+    energy_db = 10.0 * np.log10(np.maximum(energy, RATIO_EPSILON))
+    active = np.nonzero(energy_db >= energy_db.max() - active_db)[0]
+    if active.size < HF_MIN_ACTIVE_FRAMES:
+        active = np.arange(frames.shape[0])
+    return frames, taper, energy, active
+
+
+def speech_level_db(sound, window=HF_LTAS_WINDOW,
+                    active_db=HF_SPEECH_ACTIVE_DB):
+    """The recording's speech level: mean power of its speech-active frames.
+
+    In dB SPL (re :data:`P_REF_PA`), gated exactly as the LTAS behind
+    :func:`estimate_hf_cutoff` is, so silence and pauses do not pull it down.
+    It is the file-level reference a token's level is compared against, and
+    removes recording gain from that comparison. NaN for a sound shorter than
+    one frame or holding no signal.
+    """
+    gated = _speech_active_frames(sound, window, active_db)
+    if gated is None:
+        return np.nan
+    _, taper, energy, active = gated
+    ms = float(energy[active].mean()) / float((taper ** 2).sum())
+    if not np.isfinite(ms) or ms <= 0:
+        return np.nan
+    return 10.0 * math.log10(ms / P_REF_PA ** 2)
+
+
+def clipped_percent(sound, tolerance=CLIP_PEAK_TOLERANCE,
+                    min_run=CLIP_MIN_RUN):
+    """Percentage of samples sitting in flat tops at the file's own peaks.
+
+    Each polarity is judged against its own peak, since a chain with a DC
+    offset clips one side before the other. A sample counts when it lies
+    within *tolerance* of that peak and belongs to a run of at least
+    *min_run* consecutive such samples — a clipped waveform, not a clean one
+    that brushes its peak. Every channel is checked. NaN for a silent or
+    unreadable sound.
+    """
+    try:
+        x = np.asarray(sound.values, dtype=float)
+    except Exception:
+        return np.nan
+    if x.size == 0:
+        return np.nan
+    if not np.all(np.isfinite(x)) or not np.abs(x).max() > 0:
+        return np.nan
+    clipped = 0
+    for sign in (1.0, -1.0):
+        peak = float((sign * x).max())
+        if peak <= 0:
+            continue
+        for channel in sign * x:
+            at_peak = np.concatenate(([0], (channel >= peak * tolerance)
+                                      .astype(np.int8), [0]))
+            edges = np.flatnonzero(np.diff(at_peak))
+            runs = edges[1::2] - edges[::2]
+            clipped += int(runs[runs >= min_run].sum())
+    return 100.0 * clipped / x.size
 
 
 def _smooth_db(db, freqs, span_hz=HF_SMOOTH_HZ):
@@ -1017,6 +1171,43 @@ def estimate_hf_cutoff(sound, margin_db=HF_CUTOFF_MARGIN_DB,
     if clears.size == 0:
         return np.nan
     return float(freqs[clears[-1]])
+
+
+def spectral_flatness(power):
+    """Wiener entropy of *power*: geometric over arithmetic mean, in [0, 1].
+
+    Near 1 for a flat, noise-like spectrum; near 0 for one dominated by peaks
+    or harmonics. Scale-free, so recording gain cancels. Bins with no power
+    are floored a long way under the loudest rather than dropped, so a
+    band-limited stretch still reads as peaked.
+    """
+    if power is None:
+        return np.nan
+    p = np.asarray(power, dtype=float)
+    if p.size == 0 or not np.all(np.isfinite(p)):
+        return np.nan
+    peak = p.max()
+    if peak <= 0:
+        return np.nan
+    p = np.maximum(p, peak * 1e-12)
+    return float(np.exp(np.log(p).mean()) / p.mean())
+
+
+def band_level_db(freqs, power, band):
+    """Level of the energy in *band*, in dB SPL (re :data:`P_REF_PA`).
+
+    *power* must be calibrated as :func:`spectrum_of` returns it, so the
+    band's bins sum to its mean square.
+    """
+    if freqs is None or power is None:
+        return np.nan
+    m = band_mask(freqs, *band)
+    if not m.any():
+        return np.nan
+    ms = float(np.asarray(power)[m].sum())
+    if not np.isfinite(ms) or ms <= 0:
+        return np.nan
+    return 10.0 * math.log10(ms / P_REF_PA ** 2)
 
 
 def compute_spectral_moments(sound, t0, t1, window_shape, power=SPECTRAL_MOMENT_POWER):
@@ -1110,28 +1301,30 @@ def measure_window(sound, t0, t1, *, window_shape=None,
                    ratio_low=DEFAULT_RATIO_LOW_BAND,
                    ratio_high=DEFAULT_RATIO_HIGH_BAND,
                    power=SPECTRAL_MOMENT_POWER):
-    """The four moments and the band-energy ratio over one window.
+    """Every per-window spectral measure, in :data:`SPECTRAL_TRACK_NAMES` order.
 
     Both estimators reach the same arithmetic here, differing only in how the
-    spectrum was estimated, so a moment means the same thing whichever is
-    chosen. The moments are taken over [*band_low*, *band_high*] rather than
-    to the file's Nyquist, which would otherwise make recordings of different
-    sample rates incomparable.
+    spectrum was estimated, so a measure means the same thing whichever is
+    chosen. The moments and the flatness are taken over [*band_low*,
+    *band_high*] rather than to the file's Nyquist, which would otherwise
+    make recordings of different sample rates incomparable. The high-band
+    level is the level of the ratio's high band — the numerator of the ratio.
 
-    Returns ``(cog, sd, skewness, kurtosis, band_ratio_db)``, NaN where a
-    quantity could not be measured.
+    Returns ``(cog, sd, skewness, kurtosis, band_ratio_db, flatness,
+    high_band_db)``, NaN where a quantity could not be measured.
     """
-    nan5 = (np.nan,) * 5
     freqs, power_spec = spectrum_of(sound, t0, t1, window_shape,
                                     estimator, mt_nw, mt_k)
     if freqs is None:
-        return nan5
+        return (np.nan,) * len(SPECTRAL_TRACK_NAMES)
     ratio = band_energy_ratio(freqs, power_spec, ratio_low, ratio_high)
+    hb_db = band_level_db(freqs, power_spec, ratio_high)
     m = band_mask(freqs, band_low, band_high)
     if m is None or not m.any():
-        return (np.nan, np.nan, np.nan, np.nan, ratio)
+        return (np.nan, np.nan, np.nan, np.nan, ratio, np.nan, hb_db)
     cog, sd, skew, kurt = _moments_from_power(freqs[m], power_spec[m], power)
-    return (cog, sd, skew, kurt, ratio)
+    flat = spectral_flatness(power_spec[m])
+    return (cog, sd, skew, kurt, ratio, flat, hb_db)
 
 
 def compute_spectral_trajectory(sound, seg_xmin, seg_xmax, *,
@@ -1146,10 +1339,11 @@ def compute_spectral_trajectory(sound, seg_xmin, seg_xmax, *,
                                 band_high=DEFAULT_BAND_HIGH_HZ,
                                 ratio_low=DEFAULT_RATIO_LOW_BAND,
                                 ratio_high=DEFAULT_RATIO_HIGH_BAND):
-    """Time-normalised moment tracks across [*seg_xmin*, *seg_xmax*].
+    """Time-normalised spectral tracks across [*seg_xmin*, *seg_xmax*].
 
     Slides a narrow window (*win_ms*) by *hop_ms* across the segment, keeping
-    every frame fully inside it, and computes the four moments per frame.
+    every frame fully inside it, and takes every :func:`measure_window`
+    measure per frame.
     Each raw track is then resampled to *norm_points* equally spaced samples
     over normalised time tau in [0, 1].
 
@@ -1581,6 +1775,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     traj_dct_coeffs=DEFAULT_TRAJ_DCT_COEFFS,
                     traj_include_track=True,
                     spectral_highpass_hz=DEFAULT_SPECTRAL_HIGHPASS_HZ,
+                    spectral_preemph_hz=DEFAULT_SPECTRAL_PREEMPH_HZ,
                     spectral_min_window_ms=MIN_SPECTRAL_WINDOW_MS,
                     spectral_win_max_ms=PROP_SPECTRAL_WIN_MAX_MS,
                     include_prev_segment=False, include_next_segment=False,
@@ -1624,9 +1819,15 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     flanking labels, adding ``<context>_prev_*`` / ``<context>_next_*``
     columns alongside the ``<tier>_*`` ones.  Each needs its matching
     *include_prev_segment*/*include_next_segment* column to read from.
-    Spectral extraction also adds one ``hf_cutoff_hz`` column beside the
-    filename: the recording's own upper frequency limit (see
-    ``estimate_hf_cutoff``), constant for every row a file contributed.
+    Spectral extraction also adds four columns beside the filename, constant
+    for every row a file contributed: ``hf_cutoff_hz``, the recording's own
+    upper frequency limit (see ``estimate_hf_cutoff``);
+    ``pre_emphasis_alpha``, the coefficient *spectral_preemph_hz* came to at
+    the file's sampling rate (0 when off); ``speech_level_db``, the level the
+    ``hbrel`` columns are relative to (see ``speech_level_db``); and
+    ``clipped_pct`` (see ``clipped_percent``).  Pre-emphasis and the high-pass
+    are applied once to the whole waveform, before any window or taper, and
+    are shared by the moments and the trajectories.
 
     *auto_diphthong_candidates* and *unmatched_labels* are mutable sets
     that collect data for post-processing. *skipped_files* is a mutable
@@ -1855,7 +2056,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     # contributed, so a lowpassed recording can be excluded before its
     # artificially low COGs contaminate a between-group comparison.
     if extract_spectral or extract_trajectory:
-        headers.append("hf_cutoff_hz")
+        headers.extend(FILE_SIGNAL_COLUMNS)
 
     # Tier label columns — interval tiers in hierarchy order
     interval_tier_names = [t.name for t in selected_tiers
@@ -1931,13 +2132,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     if extract_spectral:
         for sfx in seg_suffixes:
             for pct in spectral_markers:
-                pct_s = f"{pct:g}"
-                headers.extend([f"COG{sfx}_{pct_s}%", f"SD{sfx}_{pct_s}%",
-                                f"skew{sfx}_{pct_s}%", f"kurt{sfx}_{pct_s}%",
-                                f"{BAND_RATIO_NAME}{sfx}_{pct_s}%",
-                                f"winms{sfx}_{pct_s}%",
-                                f"winsource{sfx}_{pct_s}%",
-                                f"nsamples{sfx}_{pct_s}%"])
+                headers.extend(f"{col}{sfx}_{pct:g}%"
+                               for col in SPECTRAL_MARKER_COLUMNS)
 
     # Trajectory columns — wide: per moment, the DCT coefficients then the
     # time-normalised track (so a grapher can draw the arc without an
@@ -2045,15 +2241,23 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         # per file if requested — cheaper and avoids per-window edge effects)
         spectral_sound = None
         hf_cutoff = np.nan
+        preemph_alpha = np.nan
+        speech_db = np.nan
+        clipped = np.nan
         if extract_spectral or extract_trajectory:
             audio_path = os.path.join(audio_dir, audio_file)
             try:
                 spectral_sound = parselmouth.Sound(audio_path)
-                # Measured before the high-pass filter: the cutoff describes
-                # the recording, not what we did to it downstream.
+                # Measured before any filtering: the cutoff describes the
+                # recording, not what we did to it downstream.
                 hf_cutoff = estimate_hf_cutoff(spectral_sound)
-                spectral_sound = highpass_sound(
-                    spectral_sound, spectral_highpass_hz)
+                speech_db = speech_level_db(spectral_sound)
+                clipped = clipped_percent(spectral_sound)
+                preemph_alpha = pre_emphasis_alpha(
+                    spectral_preemph_hz, spectral_sound.sampling_frequency)
+                spectral_sound = pre_emphasize(
+                    highpass_sound(spectral_sound, spectral_highpass_hz),
+                    spectral_preemph_hz)
             except Exception:
                 spectral_sound = None
 
@@ -2235,27 +2439,25 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             return cols
 
         def _segment_spectral_cols(iv):
-            """Spectral-moment cells for one interval, 7 per marker.
+            """Spectral cells for one interval, one per marker column.
 
             Each window is symmetric about its percentage marker and never
             crosses a segment edge (see ``resolve_spectral_window``): it is a
-            proportion of the segment (or a fixed width), falling back to the
-            minimum window, or ``too_short`` when even that will not fit.
-            Emits COG/SD/skew/kurt, the effective window (ms), the window
-            source, and the sample count; unmeasurable moments are blank.
+            proportion of the segment falling back to the minimum window, or a
+            fixed width, and ``too_short`` when it will not fit.
+            Emits every ``SPECTRAL_MARKER_COLUMNS`` cell: the window's
+            measures, the high band relative to the file's speech level, the
+            effective window (ms), the window source, and the sample count;
+            unmeasurable values are blank.
             """
+            width = len(SPECTRAL_MARKER_COLUMNS)
+            if iv is None or spectral_sound is None:
+                return [""] * (width * len(spectral_markers))
             cols = []
-            seg = iv
-            if seg is None:
-                return [""] * (8 * len(spectral_markers))   # + band ratio
-            seg_min, seg_max = seg.xmin, seg.xmax
+            seg_min, seg_max = iv.xmin, iv.xmax
             dur = seg_max - seg_min
-            sr = (spectral_sound.sampling_frequency
-                  if spectral_sound is not None else 0.0)
+            sr = spectral_sound.sampling_frequency
             for pct in spectral_markers:
-                if spectral_sound is None:
-                    cols.extend([""] * 7)
-                    continue
                 t_center = seg_min + dur * pct / 100.0
                 t0, t1, win_source = resolve_spectral_window(
                     t_center, seg_min, seg_max,
@@ -2264,24 +2466,24 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     win_min_s=spectral_min_window_ms / 1000.0,
                     win_max_s=spectral_win_max_ms / 1000.0)
                 if win_source == "too_short":
-                    cols.extend(["", "", "", "", "", "", "too_short", ""])
+                    cell = [""] * width
+                    cell[SPECTRAL_MARKER_COLUMNS.index("winsource")] = (
+                        "too_short")
+                    cols.extend(cell)
                     continue
-                actual_ms = (t1 - t0) * 1000.0
-                nsamples = int(round((t1 - t0) * sr))
-                cog, sd, sk, ku, ratio = measure_window(
+                measures = measure_window(
                     spectral_sound, t0, t1, window_shape=spectral_shape,
                     estimator=spectral_estimator,
                     mt_nw=spectral_mt_nw, mt_k=spectral_mt_k,
                     band_low=band_low_hz, band_high=band_high_hz,
                     ratio_low=ratio_low_band, ratio_high=ratio_high_band)
-                cols.extend([
-                    f"{cog:.1f}" if not np.isnan(cog) else "",
-                    f"{sd:.1f}" if not np.isnan(sd) else "",
-                    f"{sk:.4f}" if not np.isnan(sk) else "",
-                    f"{ku:.4f}" if not np.isnan(ku) else "",
-                    f"{ratio:.3f}" if not np.isnan(ratio) else "",
-                    f"{actual_ms:.1f}", win_source, str(nsamples),
-                ])
+                hb_db = measures[SPECTRAL_TRACK_NAMES.index(HB_LEVEL_NAME)]
+                values = measures + (hb_db - speech_db,)
+                cols.extend(_fmt(v, SPECTRAL_CELL_FORMATS[name])
+                            for name, v in zip(SPECTRAL_MARKER_COLUMNS,
+                                               values))
+                cols.extend([f"{(t1 - t0) * 1000.0:.1f}", win_source,
+                             str(int(round((t1 - t0) * sr)))])
             return cols
 
         def _trajectory_cols(iv):
@@ -2318,8 +2520,9 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 cols.extend(f"{c:.4f}" if np.isfinite(c) else ""
                             for c in coeffs)
                 if traj_include_track:
-                    cols.extend(f"{v:.2f}" if np.isfinite(v) else ""
-                                for v in track)
+                    # Flatness lives in [0, 1]; two places would flatten it
+                    fmt = "{:.4f}" if m == FLATNESS_NAME else "{:.2f}"
+                    cols.extend(_fmt(v, fmt) for v in track)
             return cols
 
         # Helper: categorisation columns for a row (given label_cols already built)
@@ -2410,8 +2613,9 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             lc = _label_cols(unit)
             row = [os.path.splitext(audio_file)[0]]
             if extract_spectral or extract_trajectory:
-                row.append("" if not np.isfinite(hf_cutoff)
-                           else f"{hf_cutoff:.0f}")
+                row.extend(_fmt(v, f) for v, f in zip(
+                    (hf_cutoff, preemph_alpha, speech_db, clipped),
+                    ("{:.0f}", "{:.6f}", "{:.1f}", "{:.3f}")))
             row += lc
             if reconcile_allophone_tier:
                 row.append(unit.alignment or "")
@@ -6085,6 +6289,36 @@ class _DataOptionsPage(QWizardPage):
         data_layout.addLayout(hp_row)
         self._spectral_hp_cb.toggled.connect(self._spectral_hp_spin.setEnabled)
 
+        pe_row = QHBoxLayout()
+        self._spectral_pe_cb = QCheckBox("Pre-emphasis from (Hz):")
+        self._spectral_pe_cb.setToolTip(
+            "Tilts the spectrum up 6 dB/octave above this corner, so a weak "
+            "high band is not swamped by the low one. Off by default; turn "
+            "it on to match a pipeline that uses it. The corner converts to "
+            "a coefficient α = exp(−2π·f/fs) per file — written to the "
+            "pre_emphasis_alpha column — so e.g. α 0.98 at 44.1 kHz is a "
+            "142 Hz corner. Applied to the waveform before any window, "
+            "shared by both analyses.")
+        self._spectral_pe_cb.setChecked(False)
+        pe_row.addWidget(self._spectral_pe_cb)
+        self._spectral_pe_spin = QDoubleSpinBox()
+        self._spectral_pe_spin.setRange(1.0, 5000.0)
+        self._spectral_pe_spin.setDecimals(1)
+        self._spectral_pe_spin.setSingleStep(10.0)
+        self._spectral_pe_spin.setValue(50.0)
+        self._spectral_pe_spin.setEnabled(False)
+        pe_row.addWidget(self._spectral_pe_spin)
+        self._spectral_pe_alpha = QLabel()
+        self._spectral_pe_alpha.setStyleSheet(
+            "color: #888888; font-size: 11px;")
+        pe_row.addWidget(self._spectral_pe_alpha)
+        pe_row.addStretch()
+        data_layout.addLayout(pe_row)
+        self._spectral_pe_cb.toggled.connect(self._spectral_pe_spin.setEnabled)
+        self._spectral_pe_spin.valueChanged.connect(
+            self._update_spectral_pe_alpha)
+        self._update_spectral_pe_alpha()
+
         # The band the moments are taken over. Distinct from the filter above:
         # a filter attenuates, a band decides which frequencies enter the sum
         # at all. Left unstated the ceiling is the file's Nyquist, so a 16 kHz
@@ -6117,7 +6351,9 @@ class _DataOptionsPage(QWizardPage):
         # zero when the high-pass has already removed what is down there.
         ratio_tip = ("Reported in dB as power in the high band over power in "
                      "the low band. The two bands are independent — they may "
-                     "leave a gap, and neither has to start at zero.")
+                     "leave a gap, and neither has to start at zero. The "
+                     "high band is also the band the high-band level "
+                     "(hblevel, hbrel) is measured in.")
 
         def _ratio_spin(value, ceiling=48000.0):
             spin = QDoubleSpinBox()
@@ -6148,10 +6384,12 @@ class _DataOptionsPage(QWizardPage):
 
         # Sub-analysis 1 — moments at percentage markers
         self._spectral_cb = QCheckBox(
-            "Spectral moments (COG, SD, skewness, kurtosis)")
+            "Spectral measures at markers (moments, band ratio, flatness, "
+            "high-band level)")
         self._spectral_cb.setChecked(True)
         self._spectral_cb.setToolTip(
-            "Four moments measured at percentage markers through each "
+            "COG, SD, skewness, kurtosis, band ratio, spectral flatness and "
+            "high-band level, measured at percentage markers through each "
             "segment — a few static snapshots.")
         data_layout.addWidget(self._spectral_cb)
 
@@ -6160,9 +6398,9 @@ class _DataOptionsPage(QWizardPage):
 
         spec_note = QLabel(
             "Each window is centred on its marker and never crosses a "
-            "segment edge. Proportional width scales with the segment; a "
-            "marker too near an edge for a valid window is flagged "
-            "too_short.")
+            "segment edge. Proportional width scales with the segment; fixed "
+            "width is used exactly or not at all. A marker too near an edge "
+            "for a valid window is flagged too_short.")
         spec_note.setWordWrap(True)
         spec_note.setStyleSheet("color: #888888; font-size: 11px;")
         spec_layout.addWidget(spec_note)
@@ -6181,7 +6419,9 @@ class _DataOptionsPage(QWizardPage):
         self._spectral_wmode_combo.setToolTip(
             "Proportional sizes each window to the segment (removes the "
             "confound between window width and segment duration). Fixed "
-            "uses the same width everywhere.")
+            "uses the same width everywhere: a marker too near an edge for "
+            "the full width is too_short, never narrowed. At 20% or 80% a "
+            "fixed window needs a segment 2.5× its width.")
         mode_row.addWidget(self._spectral_wmode_combo, 1)
         spec_layout.addLayout(mode_row)
 
@@ -6265,9 +6505,9 @@ class _DataOptionsPage(QWizardPage):
         traj_layout.addWidget(traj_note)
 
         tm_row = QHBoxLayout()
-        tm_row.addWidget(QLabel("Moments:"))
+        tm_row.addWidget(QLabel("Measures:"))
         self._traj_moment_cbs = []
-        for name in SPECTRAL_MOMENT_NAMES:
+        for name in SPECTRAL_TRACK_NAMES:
             cb = QCheckBox(name)
             cb.setChecked(name in DEFAULT_TRAJ_MOMENTS)
             tm_row.addWidget(cb)
@@ -6504,19 +6744,25 @@ class _DataOptionsPage(QWizardPage):
         for w in (self._spectral_wshape_label, self._spectral_window_combo):
             w.setVisible(not mt)
 
+    def _update_spectral_pe_alpha(self):
+        """Show the coefficient the pre-emphasis corner gives at 44.1 kHz."""
+        alpha = pre_emphasis_alpha(self._spectral_pe_spin.value(), 44100.0)
+        self._spectral_pe_alpha.setText(f"α = {alpha:.4f} at 44.1 kHz")
+
     def _update_spectral_wmode_ui(self):
         """Show the proportional-% or the fixed-ms width control.
 
-        The max ceiling only bites in proportional mode (a fixed window is
-        the width the user typed); the min floor applies in both.
+        The min floor and max ceiling only bite in proportional mode: a fixed
+        window is the width the user typed or nothing.
         """
         proportional = self._spectral_wmode_combo.currentIndex() == 0
         self._spectral_wprop_label.setVisible(proportional)
         self._spectral_wprop_spin.setVisible(proportional)
         self._spectral_window_label.setVisible(not proportional)
         self._spectral_window_spin.setVisible(not proportional)
-        self._spectral_winmax_label.setVisible(proportional)
-        self._spectral_winmax_spin.setVisible(proportional)
+        for w in (self._spectral_winmin_label, self._spectral_winmin_spin,
+                  self._spectral_winmax_label, self._spectral_winmax_spin):
+            w.setVisible(proportional)
 
     def _confirm_whole_interval_spectra(self, primary, finer):
         """Warn that spectra will span the whole primary interval.
@@ -6749,6 +6995,9 @@ class _DataOptionsPage(QWizardPage):
             wiz.spectral_highpass_hz = (
                 self._spectral_hp_spin.value()
                 if self._spectral_hp_cb.isChecked() else 0.0)
+            wiz.spectral_preemph_hz = (
+                self._spectral_pe_spin.value()
+                if self._spectral_pe_cb.isChecked() else 0.0)
             wiz.band_low_hz = self._band_lo_spin.value()
             wiz.band_high_hz = self._band_hi_spin.value()
             wiz.ratio_low_band = (self._ratio_low_lo_spin.value(),
@@ -6793,6 +7042,7 @@ class _DataOptionsPage(QWizardPage):
             wiz.spectral_mt_nw = DEFAULT_SPECTRAL_MT_NW
             wiz.spectral_mt_k = DEFAULT_SPECTRAL_MT_K
             wiz.spectral_highpass_hz = 0.0
+            wiz.spectral_preemph_hz = 0.0
             wiz.band_low_hz = DEFAULT_BAND_LOW_HZ
             wiz.band_high_hz = DEFAULT_BAND_HIGH_HZ
             wiz.ratio_low_band = DEFAULT_RATIO_LOW_BAND
@@ -8122,6 +8372,7 @@ class BuildCSVWizard(QWizard):
         self.spectral_mt_nw = DEFAULT_SPECTRAL_MT_NW
         self.spectral_mt_k = DEFAULT_SPECTRAL_MT_K
         self.spectral_highpass_hz = 0.0
+        self.spectral_preemph_hz = 0.0
         self.band_low_hz = DEFAULT_BAND_LOW_HZ
         self.band_high_hz = DEFAULT_BAND_HIGH_HZ
         self.ratio_low_band = DEFAULT_RATIO_LOW_BAND
@@ -9215,6 +9466,7 @@ class MainWindow(QMainWindow):
                 traj_dct_coeffs=wizard.traj_dct_coeffs,
                 traj_include_track=wizard.traj_include_track,
                 spectral_highpass_hz=wizard.spectral_highpass_hz,
+                spectral_preemph_hz=wizard.spectral_preemph_hz,
                 band_low_hz=wizard.band_low_hz,
                 band_high_hz=wizard.band_high_hz,
                 ratio_low_band=wizard.ratio_low_band,
@@ -9449,15 +9701,16 @@ class MainWindow(QMainWindow):
                     "estimator": wizard.spectral_estimator,
                     "mt_nw": wizard.spectral_mt_nw,
                     "mt_k": wizard.spectral_mt_k,
-                    "highpass_hz": wizard.spectral_highpass_hz,
                     "analysis_band_hz": [wizard.band_low_hz,
                                          wizard.band_high_hz],
                     "band_ratio_low_hz": list(wizard.ratio_low_band),
                     "band_ratio_high_hz": list(wizard.ratio_high_band),
                     "band_ratio_units": "dB, 10*log10(P_high / P_low)",
-                    # Neither spectral estimator applies any spectral tilt;
-                    # pre-emphasis belongs to the formant analysis alone.
-                    "pre_emphasis": "none",
+                    "flatness": "Wiener entropy over the analysis band: "
+                                "geometric / arithmetic mean power, 0-1",
+                    "hblevel": "level of the band-ratio high band, "
+                               "dB re 20 uPa",
+                    "hbrel": "hblevel - speech_level_db of the same file",
                     "moment_power": SPECTRAL_MOMENT_POWER,
                     "kurtosis": "excess (Gaussian = 0)",
                 } if wizard.extract_spectral else None,
@@ -9471,6 +9724,29 @@ class MainWindow(QMainWindow):
                     "include_track": wizard.traj_include_track,
                     "frame_inset": "window_ms / 2 at each segment edge",
                 } if wizard.extract_trajectory else None,
+                # What the moments and trajectories both see: filters run
+                # once over each whole file, before any window or taper.
+                "signal": {
+                    "highpass_hz": wizard.spectral_highpass_hz,
+                    "pre_emphasis_from_hz": wizard.spectral_preemph_hz,
+                    "pre_emphasis": "y[n] = x[n] - alpha*x[n-1], "
+                                    "alpha = exp(-2*pi*from_hz/fs), "
+                                    "no rescaling; 0 = off",
+                    "pre_emphasis_alpha_column": "pre_emphasis_alpha",
+                    "order": "high-pass, then pre-emphasis",
+                } if (wizard.extract_spectral
+                      or wizard.extract_trajectory) else None,
+                "file_signal": {
+                    "columns": list(FILE_SIGNAL_COLUMNS),
+                    "speech_level_db": "mean power of the speech-active "
+                                       "LTAS frames (the hf_cutoff gate), "
+                                       "dB re 20 uPa, unfiltered signal",
+                    "clipped_pct": "percent of samples in runs of >= "
+                                   f"{CLIP_MIN_RUN} at >= "
+                                   f"{CLIP_PEAK_TOLERANCE:g} x the file's "
+                                   "own peak, one sign, all channels",
+                } if (wizard.extract_spectral
+                      or wizard.extract_trajectory) else None,
                 "hf_cutoff": {
                     "column": "hf_cutoff_hz",
                     "scope": "one value per audio file, repeated per row",

@@ -16,7 +16,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import formant_editor as fe
 from formant_editor import (
-    band_energy_ratio, band_mask, measure_window, spectrum_of,
+    SPECTRAL_TRACK_NAMES, band_energy_ratio, band_mask, measure_window,
+    spectrum_of,
 )
 
 
@@ -122,10 +123,10 @@ def test_ratio_is_nan_without_a_spectrum():
 # What measure_window promises
 # ---------------------------------------------------------------------------
 
-def test_measure_window_returns_four_moments_and_a_ratio():
+def test_measure_window_returns_every_track_measure_in_order():
     vals = measure_window(_tone_sound([2000.0]), 0.02, 0.18)
-    assert len(vals) == 5
-    assert all(np.isfinite(v) for v in vals[:2])
+    assert len(vals) == len(SPECTRAL_TRACK_NAMES)
+    assert all(np.isfinite(v) for v in vals)
 
 
 def test_measure_window_is_all_nan_for_an_impossible_region():

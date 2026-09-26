@@ -168,13 +168,35 @@ class TestResolveWindow:
         assert src == "fixed"
         assert (t1 - t0) == pytest.approx(0.025)
 
-    def test_fixed_mode_falls_back_to_floor_then_too_short(self):
-        # 25 ms fixed can't fit 8 ms from the edge → floor (5 ms) fits
-        _, _, src = _win(0.008, 0.0, 0.5, mode="fixed", fixed_s=0.025)
-        assert src == "clamped_min"
-        # 2 ms from the edge → not even the floor fits
-        _, _, src2 = _win(0.002, 0.0, 0.5, mode="fixed", fixed_s=0.025)
-        assert src2 == "too_short"
+    def test_fixed_mode_never_narrows_to_the_floor(self):
+        # 25 ms fixed can't fit 8 ms from the edge; the 5 ms floor would,
+        # but a fixed column must hold one width, so the marker is too_short
+        t0, t1, src = _win(0.008, 0.0, 0.5, mode="fixed", fixed_s=0.025)
+        assert src == "too_short"
+        assert t1 == t0
+
+    def test_fixed_mode_fits_exactly_at_the_edge(self):
+        # 20 ms centred at 10 ms of a 50 ms segment spans exactly 0–20 ms
+        t0, t1, src = _win(0.010, 0.0, 0.05, mode="fixed", fixed_s=0.020)
+        assert src == "fixed"
+        assert (t0, t1) == pytest.approx((0.0, 0.020))
+
+    def test_fixed_mode_ignores_the_min_floor(self):
+        # A fixed width under the floor is still the width the user asked for
+        t0, t1, src = _win(0.25, 0.0, 0.5, mode="fixed", fixed_s=0.004)
+        assert src == "fixed"
+        assert (t1 - t0) == pytest.approx(0.004)
+
+    @pytest.mark.parametrize("dur_ms, expected", [
+        (15, ["too_short", "too_short", "too_short"]),
+        (40, ["too_short", "fixed", "too_short"]),
+        (50, ["fixed", "fixed", "fixed"]),
+    ])
+    def test_fixed_20ms_at_20_50_80(self, dur_ms, expected):
+        dur = dur_ms / 1000.0
+        got = [_win(dur * p / 100.0, 0.0, dur, mode="fixed",
+                    fixed_s=0.020)[2] for p in (20, 50, 80)]
+        assert got == expected
 
 
 # ---------------------------------------------------------------------------
@@ -365,15 +387,18 @@ class TestSpectralCSV:
         assert rows[0][headers.index("winsource_50%")] == "clamped_max"
 
     def test_custom_min_window_floor_raises_too_short_threshold(self, tmp_path):
-        # A 10 ms segment clears the default 5 ms floor but not a 12 ms one.
+        # A 10 ms segment clears the default 5 ms floor but not a 12 ms one
+        # (the floor is a proportional-mode clamp; 30% of 10 ms is below it).
         audio, tg = _write_corpus(tmp_path, [(0.20, 0.210, "t")])
         tier = TextGrid.from_file(os.path.join(tg, "test.TextGrid")).tiers
         h5, r5 = _build_csv_data(**_spectral_kwargs(
             audio_dir=audio, textgrid_dir=tg, selected_tiers=tier,
+            spectral_window_mode="proportional",
             spectral_markers=[50], spectral_min_window_ms=5.0))
         assert r5[0][h5.index("winsource_50%")] != "too_short"
         h12, r12 = _build_csv_data(**_spectral_kwargs(
             audio_dir=audio, textgrid_dir=tg, selected_tiers=tier,
+            spectral_window_mode="proportional",
             spectral_markers=[50], spectral_min_window_ms=12.0))
         assert r12[0][h12.index("winsource_50%")] == "too_short"
         assert r12[0][h12.index("COG_50%")] == ""
@@ -669,6 +694,38 @@ class TestTaperCache:
         for taper in dpss(x.size, 4.0, k):
             spec = np.fft.rfft(x * taper)
             reference += spec.real ** 2 + spec.imag ** 2
-        reference /= k
+        # Calibrated to the window's mean square: unit-energy tapers, one side
+        reference *= 2.0 / (x.size * k)
         _, power = spectrum_of(snd, t0, t1, estimator="multitaper")
         assert power == pytest.approx(reference, rel=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Wizard: window-mode controls
+# ---------------------------------------------------------------------------
+
+class TestWindowModeControls:
+    @pytest.fixture
+    def page(self):
+        from PyQt6.QtWidgets import QApplication
+        from formant_editor import _DataOptionsPage
+        app = QApplication.instance() or QApplication(sys.argv)
+        page = _DataOptionsPage()
+        yield page
+        page.deleteLater()
+        app.processEvents()
+
+    @staticmethod
+    def _clamps_shown(page):
+        return [not w.isHidden() for w in (
+            page._spectral_winmin_spin, page._spectral_winmax_spin)]
+
+    def test_proportional_mode_shows_both_clamps(self, page):
+        page._spectral_wmode_combo.setCurrentIndex(0)
+        assert self._clamps_shown(page) == [True, True]
+        assert page._spectral_window_spin.isHidden()
+
+    def test_fixed_mode_hides_both_clamps(self, page):
+        page._spectral_wmode_combo.setCurrentIndex(1)
+        assert self._clamps_shown(page) == [False, False]
+        assert not page._spectral_window_spin.isHidden()

@@ -147,6 +147,42 @@ def _armed_wizard(tg_dir, spectral_tier, with_allophone=True):
     return wiz, page
 
 
+class TestPreEmphasisControls:
+    """Off unless asked for, and collected as a corner in Hz."""
+
+    def test_off_by_default(self, qapp, tg_dir):
+        wiz, page = _armed_wizard(tg_dir, "allophone")
+        assert not page._spectral_pe_cb.isChecked()
+        assert not page._spectral_pe_spin.isEnabled()
+        assert page.validatePage() is True
+        assert wiz.spectral_preemph_hz == 0.0
+
+    def test_ticked_collects_the_corner(self, qapp, tg_dir):
+        wiz, page = _armed_wizard(tg_dir, "allophone")
+        page._spectral_pe_cb.setChecked(True)
+        page._spectral_pe_spin.setValue(141.8)
+        assert page._spectral_pe_spin.isEnabled()
+        assert page.validatePage() is True
+        assert wiz.spectral_preemph_hz == pytest.approx(141.8)
+
+    def test_shows_the_equivalent_alpha(self, qapp, tg_dir):
+        _, page = _armed_wizard(tg_dir, "allophone")
+        page._spectral_pe_spin.setValue(141.8)
+        assert "0.9800" in page._spectral_pe_alpha.text()
+
+
+class TestTrajectoryMeasureChoices:
+    def test_every_tracked_measure_can_be_chosen(self, qapp, tg_dir):
+        wiz, page = _armed_wizard(tg_dir, "allophone")
+        assert [n for _, n in page._traj_moment_cbs] == list(
+            fe.SPECTRAL_TRACK_NAMES)
+        page._traj_cb.setChecked(True)
+        for cb, name in page._traj_moment_cbs:
+            cb.setChecked(name == "flatness")
+        assert page.validatePage() is True
+        assert wiz.traj_moments == ["flatness"]
+
+
 class TestWholeIntervalSpectraWarning:
     """The guard fires only when a finer tier would really have split things."""
 
@@ -284,6 +320,32 @@ class TestProvenanceSidecar:
         assert spec["band_ratio_low_hz"] == [500.0, 1500.0]
         assert spec["band_ratio_high_hz"] == [4000.0, 5500.0]
         assert "10*log10" in spec["band_ratio_units"]
+
+    def test_the_record_says_how_the_signal_was_filtered(self, qapp,
+                                                          tmp_path):
+        wiz = _full_run_wizard(qapp)
+        wiz.spectral_highpass_hz = 300.0
+        wiz.spectral_preemph_hz = 141.8
+        csv_path = tmp_path / "pe.csv"
+        csv_path.write_text("a\n1\n", encoding="utf-8")
+        rec = json.loads(open(fe.MainWindow._write_provenance_sidecar(
+            None, str(csv_path), wiz, 1), encoding="utf-8").read())
+        sig = rec["signal"]
+        assert sig["highpass_hz"] == 300.0
+        assert sig["pre_emphasis_from_hz"] == 141.8
+        assert sig["pre_emphasis_alpha_column"] == "pre_emphasis_alpha"
+        assert "highpass_hz" not in rec["spectral"]
+
+    def test_the_record_defines_the_noisiness_columns(self, qapp, tmp_path):
+        wiz = _full_run_wizard(qapp)
+        csv_path = tmp_path / "n.csv"
+        csv_path.write_text("a\n1\n", encoding="utf-8")
+        rec = json.loads(open(fe.MainWindow._write_provenance_sidecar(
+            None, str(csv_path), wiz, 1), encoding="utf-8").read())
+        assert rec["file_signal"]["columns"] == list(fe.FILE_SIGNAL_COLUMNS)
+        assert "clipped_pct" in rec["file_signal"]
+        for key in ("flatness", "hblevel", "hbrel"):
+            assert rec["spectral"][key]
 
     def test_the_record_says_which_tier_the_spectra_came_from(self, qapp,
                                                               tmp_path):

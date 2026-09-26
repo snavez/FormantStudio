@@ -351,7 +351,7 @@ than discovering a stranded arrow at extraction time.
 
 **How the settings are organised.** In the Build CSV wizard, **Extract spectral data** is the
 parent: it holds the settings both analyses share — the **segment tier**, the **estimator**
-(and its parameters), and the **high-pass filter**. Under it sit two independent sub-analyses:
+(and its parameters), the **high-pass filter** and **pre-emphasis**. Under it sit two independent sub-analyses:
 
 - **Spectral moments** — a few static snapshots at percentage markers through the segment (§5.1–5.5).
 - **Spectral trajectory** — how the spectrum evolves across the whole segment (§5.6).
@@ -429,15 +429,18 @@ never-lie geometry.
 - **Proportional** (default): window width = a chosen fraction of the segment's duration
   (default **30%**), so every segment is treated identically in its own terms.
 - **Fixed**: the same width in milliseconds everywhere (default 25 ms), if you specifically
-  want that.
+  want that. The width is used exactly or not at all: a marker whose full window won't fit
+  centred is `too_short`, never narrowed, so every measured value in a fixed column comes from
+  the same window. A marker at p% has room for 2 × min(p, 100−p)% of the segment, so a 20 ms
+  window fits at 50% from a 20 ms segment but at 20%/80% only from 50 ms.
 
-**Two clamps (both configurable in the wizard):**
+**Two clamps (both configurable in the wizard, proportional mode only):**
 
 - **Min window** (default 5 ms): the floor. Frequency resolution ≈ 1/window, so 5 ms ≈ 200 Hz —
   fine for COG/SD, marginal for skew/kurtosis. Windows are not allowed narrower than this.
-- **Max window** (default 30 ms, proportional mode only): the ceiling. Caps the window on long
+- **Max window** (default 30 ms): the ceiling. Caps the window on long
   segments so each marker stays a **local** estimate rather than averaging a big chunk of the
-  segment. (It does not apply in fixed mode — there, the width is exactly what you typed.)
+  segment.
 
 **Invariants the geometry guarantees (it never lies about location):**
 
@@ -445,9 +448,9 @@ never-lie geometry.
    analysed location are identical — a marker is never shifted to make a window fit.
 2. A window **never crosses a segment edge** and is **never one-sidedly truncated** — no reading
    of neighbouring-segment audio, no shift of the window's centre of mass near boundaries.
-3. If the requested width won't fit centred inside the segment, the window falls back to the
-   **min floor**; if even the floor won't fit, the marker is **`too_short`** and its moments are
-   left blank rather than fudged.
+3. If a proportional width won't fit centred inside the segment, the window falls back to the
+   **min floor**; if even the floor won't fit — or, in fixed mode, if the fixed width won't —
+   the marker is **`too_short`** and its moments are left blank rather than fudged.
 
 _Why proportional + these clamps:_ see §2's confound argument, plus Reidy (2015) on estimator
 choice for sibilants. The min floor guards frequency resolution / estimation variance; the max
@@ -460,6 +463,19 @@ fricatives. In the Build CSV wizard the **high-pass filter defaults to ON at 300
 Hann-band filter applied once per file before analysis). It is configurable and can be turned
 off. (The library-level default constant is off; the wizard turns it on because it is standard
 practice for fricative moments.)
+
+**Pre-emphasis** (off by default) tilts the spectrum up by 6 dB/octave above a corner frequency,
+so a weak high band is not swamped by the low one. It is a first difference,
+`y[n] = x[n] − α·x[n−1]`, applied to the whole waveform once per file — after the high-pass, before
+any window or taper — so the moments and the trajectories see the same signal. It is set as a
+corner in Hz, not as α, because α means different things at different sampling rates:
+`α = exp(−2π·f/fs)` (Praat's definition), so a 50 Hz corner is α 0.9929 at 44.1 kHz and α 0.9806
+at 16 kHz. To replicate a pipeline quoted as "α = 0.98 at 44.1 kHz", enter 142 Hz; the wizard shows
+the α a corner gives at 44.1 kHz as you type. Each file's actual α is written to the
+`pre_emphasis_alpha` column (0 when off), so a CSV is never ambiguous about it. Unlike Praat's own
+pre-emphasis filter, this one does not rescale the signal, so levels are unchanged. Pre-emphasis
+raises COG and the band ratio; values from runs with different settings
+are not comparable.
 
 ### 5.4 Sampling locations
 
@@ -476,6 +492,21 @@ Per percentage marker `p`, the CSV carries:
 - `bandratio_p%` — energy in the high ratio band over energy in the low one, in dB
   (`10*log10(P_high / P_low)`). Blunter than a moment and far steadier on short or noisy
   segments: it says whether there is energy up there without describing the shape.
+- `flatness_p%` — **spectral flatness** (Wiener entropy) over the analysis band: the geometric
+  mean of the power spectrum over its arithmetic mean, between 0 and 1. Near 1 for a flat,
+  noise-like spectrum (turbulent frication); near 0 for one dominated by peaks or harmonics
+  (vowels, voicing, strongly resonant aspiration). It measures *noisiness* rather than loudness
+  and is gain-free. Its value depends on the estimator — a single-taper periodogram of white
+  noise reads about 0.56 rather than 1, a multitaper one close to 1 — so compare runs made with
+  the same estimator settings. It is bounded and skewed; model its logarithm.
+- `hblevel_p%` — the **high-band level**: the level of the band ratio's *high* band (the same
+  band edges, set in the wizard as "Band ratio, high band"), in dB SPL (re 20 µPa, Praat's convention). An
+  absolute level mostly measures microphone gain and distance, so on its own it is only
+  comparable within one recording session.
+- `hbrel_p%` — the high-band level **relative to the file's speech level**:
+  `hblevel_p% − speech_level_db`. Recording gain cancels, so this is the level to compare across
+  files. Speaker-level normalisation (e.g. z-scoring within speaker) is left to FRED or your
+  statistics — FormantStudio does not know which files belong to which speaker.
 - `winms_p%` — the **effective** window width actually used (ms), so you can see what was
   measured (blank when `too_short`).
 - `winsource_p%` — which rule set the width: `proportional`, `clamped_max`, `fixed`,
@@ -487,6 +518,27 @@ And once per file, beside the filename:
 - `hf_cutoff_hz` — the recording's upper frequency limit: the highest frequency at which the
   file still carries signal rather than its own noise floor. It is a property of the
   **recording**, not the token, so every row a file contributed repeats the same value.
+- `pre_emphasis_alpha` — the pre-emphasis coefficient at this file's sampling rate (§5.3); 0 when
+  pre-emphasis is off.
+- `speech_level_db` — the recording's **speech level**: the mean power of its speech-active
+  frames (the same gate as `hf_cutoff_hz` below), in dB SPL, measured on the unfiltered signal.
+  It is the reference `hbrel` is relative to.
+- `clipped_pct` — the **percentage of samples that are clipped** (see below).
+
+**What `clipped_pct` is and why it is there.** Clipping happens when the recording level was set
+too high: the waveform hits the maximum the recorder can store and is flattened against it for
+as long as the signal would have gone beyond. The flat tops add harmonic distortion — spurious
+energy at high frequencies — which inflates **COG, flatness, high-band level and the band
+ratio**, the measures a release or fricative analysis depends on. Loud stressed vowels and strong
+releases are the likeliest to clip, and it is easy to miss by ear. The column counts, per file,
+the samples sitting in a flat top: a run of at least 3 consecutive samples within 0.01% of the
+file's own peak on that polarity (each polarity is judged separately, because a recording with a
+DC offset clips one side first). It is measured against the file's own peak rather than digital
+full scale, so a file that clipped and was normalised afterwards is still caught. A clean
+recording scores 0. Like `hf_cutoff_hz`, it corrects nothing: it is there so affected files can be
+**found and excluded**. A small non-zero value can come from a single loud event; any sizeable
+value means the file's high-frequency measures are unsafe. Clipping that went through a lossy
+codec afterwards (e.g. MP3) loses its flat tops and may be under-counted.
 
 A recording chain that removed the top octave — a phone mic, a lossy codec, an earlier
 resample — drags COG down regardless of how the speaker actually produced the sound, which
@@ -720,7 +772,8 @@ afterwards, so the table shows what the files now contain.
   plus full manual editing.
 - Spectrogram *display* only: dynamic range, brightness, display window, max frequency.
 - Spectral: window mode (proportional/fixed), width (% or ms), min window, max window,
-  window shape (Hamming/Hann), high-pass on/off + cutoff, percentage markers, segment tier.
+  window shape (Hamming/Hann), high-pass on/off + cutoff, pre-emphasis on/off + corner,
+  percentage markers, segment tier.
 - Build CSV: primary tier, tier inclusion, formant sampling mode/markers, duration & bounds
   per tier, categorisation options (including whether to categorise the flanking segments).
 
@@ -742,8 +795,8 @@ Recorded so they are added deliberately, as new columns, rather than invented ad
 - A configurable **`NA` token** — held until confirmed compatible with the downstream grapher;
   empty cells are working and remain the convention.
 - **Ensemble-average spectra** (full per-frame spectrum export), spectral peak frequency,
-  spectral tilt/slope, band-energy ratio ("sibilance index"), RMS amplitude, and
-  periodicity/HNR voicing measures. If added they become new columns, never inserted
+  spectral tilt/slope, broadband RMS amplitude, and periodicity/HNR voicing measures (see
+  `Docs/TODO.md`). If added they become new columns, never inserted
   mid-block, so existing consumers keep working.
 - **Recovering the segment before a stop closure** — the segment immediately preceding a
   release is usually its own closure, so the phonetically interesting context sits one step
@@ -751,7 +804,8 @@ Recorded so they are added deliberately, as new columns, rather than invented ad
 
 These are analytical upgrades; the current CSV is complete and valid without them.
 Already delivered: proportional windowing with centred geometry, configurable min/max window
-clamps, multitaper estimation, flanking segment context, and the trajectory/DCT pass (§5.6).
+clamps, multitaper estimation, flanking segment context, the trajectory/DCT pass (§5.6), the
+band-energy ratio, spectral flatness, and the high-band level with its file-relative form.
 
 A **provenance sidecar** is already written: every exported CSV gets a companion
 `<name>.provenance.json` recording the resolved run configuration (primary tier, selected tiers,
@@ -780,6 +834,14 @@ the max-formant setting suits your speakers.
 tier's `tH`). Keep the high-pass on (~300 Hz). Proportional 30% windows at 20/50/80% are a good
 default; watch the `winsource` columns — a lot of `clamped_min`/`too_short` means your segments
 are short and you may want to lean on COG/SD rather than skew/kurtosis.
+
+**Release noisiness.** To ask whether the upcoming vowel makes a release noisier, measure the
+release with gain-free quantities — `flatness`, `bandratio`, `hbrel` and the release's duration —
+and never normalise it against the following vowel's own level. Vowels differ in *intrinsic
+intensity* (low vowels are a few dB louder than high ones), so "release minus following vowel"
+builds a vowel-height effect into the measure before any speaker produced one. Model the vowel
+with both F1 and F2 (and speaker as a random effect): front vowels raise a release's COG through
+coarticulation and back vowels lower it, so height alone would blur the picture.
 
 **Combined analyses.** Vowel-formant and consonant-spectral data with *different* row
 populations (e.g. one row per vowel vs one row per release) belong in **separate runs / CSVs**;
@@ -910,6 +972,12 @@ does not lose the track.
 available but are noisy when computed from short frames — they are the moments most sensitive
 to estimation variance, which is precisely the trade a narrow trajectory window makes. If you
 do want them, use multitaper and consider a slightly wider window.
+
+The band ratio, **flatness** and **high-band level** (§5.5) can be tracked too. A flatness
+trajectory is the direct way to see a release change character: a fricated stretch stays near
+the top of the scale, and it falls as the release turns into aspiration shaped by the upcoming
+vowel's formants. The high-band level track is absolute (dB SPL); subtract the file's
+`speech_level_db` to compare it across files.
 
 ---
 
