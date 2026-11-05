@@ -1,4 +1,4 @@
-ipa,sampa,xsampa,type,subtype,height,fronting,rounding,length,voicing,place,manner
+ipa,sampa,xsampa,type,subtype,height,fronting,rounding,length,voicing,place,manner,status,note
 # ============================================================
 # MONOPHTHONG VOWELS — short (default)
 # ============================================================
@@ -195,6 +195,14 @@ l,l,l,consonant,,,,,,voiced,alveolar,lateral-approximant
 ʎ,L,L,consonant,,,,,,voiced,palatal,lateral-approximant
 ʟ,L\,L\,consonant,,,,,,voiced,velar,lateral-approximant
 # ============================================================
+# OTHER PULMONIC — epiglottals, lateral flap, sj-sound
+# ============================================================
+ʡ,>\,>\,consonant,,,,,,voiceless,epiglottal,plosive
+ʜ,H\,H\,consonant,,,,,,voiceless,epiglottal,fricative
+ʢ,<\,<\,consonant,,,,,,voiced,epiglottal,fricative
+ɺ,l\,l\,consonant,,,,,,voiced,alveolar,lateral-flap
+ɧ,x\,x\,consonant,,,,,,voiceless,palatal-velar,fricative
+# ============================================================
 # AFFRICATES
 # ============================================================
 t͡s,ts,ts,consonant,,,,,,voiceless,alveolar,affricate
@@ -232,3 +240,66 @@ qʼ,q_>,q_>,consonant,,,,,,voiceless,uvular,ejective
 sʼ,s_>,s_>,consonant,,,,,,voiceless,alveolar,ejective
 t͡sʼ,ts_>,ts_>,consonant,,,,,,voiceless,alveolar,ejective
 t͡ʃʼ,tS_>,tS_>,consonant,,,,,,voiceless,postalveolar,ejective
+# ============================================================
+# EXTENDED — beyond the IPA chart, in common use
+# ============================================================
+ɚ,@`,@`,vowel,monophthong,mid,centre,unrounded,short,voiced,,,extended,rhotacized schwa
+ɝ,3`,3`,vowel,monophthong,mid-low,centre,unrounded,short,voiced,,,extended,rhotacized open-mid central vowel
+ᵻ,I\,I\,vowel,monophthong,mid-high,centre,unrounded,short,voiced,,,extended,near-close central unrounded vowel
+ᵿ,U\,U\,vowel,monophthong,mid-high,centre,rounded,short,voiced,,,extended,near-close central rounded vowel
+ɫ,5,5,consonant,,,,,,voiced,alveolar,lateral-approximant,extended,velarized (dark) l
+k͡p,kp,kp,consonant,,,,,,voiceless,labio-velar,plosive,extended,doubly articulated
+ɡ͡b,gb,gb,consonant,,,,,,voiced,labio-velar,plosive,extended,doubly articulated
+ŋ͡m,Nm,Nm,consonant,,,,,,voiced,labio-velar,nasal,extended,doubly articulated
+# ============================================================
+# extIPA — extensions for disordered speech
+# ============================================================
+ꞎ,K`,K`,consonant,,,,,,voiceless,retroflex,lateral-fricative,extipa,
+𝼅,,,consonant,,,,,,voiced,retroflex,lateral-fricative,extipa,
+𝼆,,,consonant,,,,,,voiceless,palatal,lateral-fricative,extipa,
+𝼄,,,consonant,,,,,,voiceless,velar,lateral-fricative,extipa,
+𝼈,,,consonant,,,,,,voiced,retroflex,lateral-flap,extipa,
+𝼉,,,consonant,,,,,,voiceless,retroflex,implosive,extipa,
+𝼊,,,consonant,,,,,,voiceless,retroflex,click,extipa,
+𝼃,,,consonant,,,,,,voiceless,velodorsal,plosive,extipa,
+𝼁,,,consonant,,,,,,voiced,velodorsal,plosive,extipa,
+𝼇,,,consonant,,,,,,voiced,velodorsal,nasal,extipa,
+ʩ,,,consonant,,,,,,voiceless,velopharyngeal,fricative,extipa,
+𝼀,,,consonant,,,,,,voiceless,velopharyngeal,trill,extipa,
+ʪ,,,consonant,,,,,,voiceless,alveolar,lateral-fricative,extipa,grooved and lateral [ls]
+ʫ,,,consonant,,,,,,voiced,alveolar,lateral-fricative,extipa,grooved and lateral [lz]
+ʬ,,,consonant,,,,,,voiceless,bilabial,percussive,extipa,
+ʭ,,,consonant,,,,,,voiceless,bidental,percussive,extipa,
+¡,,,consonant,,,,,,voiceless,sublaminal,percussive,extipa,sublaminal lower-alveolar percussive
+# ============================================================
+# OBSOLETE & NON-STANDARD — withdrawn IPA letters, ligatures, variants
+# ============================================================
+ɩ,,,vowel,monophthong,mid-high,front,unrounded,short,voiced,,,obsolete,former symbol for ɪ
+ɷ,,,vowel,monophthong,mid-high,back,rounded,short,voiced,,,obsolete,former symbol for ʊ
+ʚ,,,vowel,monophthong,mid-low,centre,rounded,short,voiced,,,obsolete,misprint once used for ɞ
+ɿ,,,vowel,monophthong,high,centre,unrounded,short,voiced,,,obsolete,Sinological apical dental vowel
+ʅ,,,vowel,monophthong,high,centre,unrounded,short,voiced,,,obsolete,Sinological apical retroflex vowel
+ʮ,,,vowel,monophthong,high,centre,rounded,short,voiced,,,obsolete,Sinological rounded apical dental vowel
+ʯ,,,vowel,monophthong,high,centre,rounded,short,voiced,,,obsolete,Sinological rounded apical retroflex vowel
+g,,,consonant,,,,,,voiced,velar,plosive,obsolete,keyboard g; the IPA letter is ɡ
+ʦ,,,consonant,,,,,,voiceless,alveolar,affricate,obsolete,ligature for t͡s
+ʣ,,,consonant,,,,,,voiced,alveolar,affricate,obsolete,ligature for d͡z
+ʧ,,,consonant,,,,,,voiceless,postalveolar,affricate,obsolete,ligature for t͡ʃ
+ʤ,,,consonant,,,,,,voiced,postalveolar,affricate,obsolete,ligature for d͡ʒ
+ʨ,,,consonant,,,,,,voiceless,alveolo-palatal,affricate,obsolete,ligature for t͡ɕ
+ʥ,,,consonant,,,,,,voiced,alveolo-palatal,affricate,obsolete,ligature for d͡ʑ
+ꭧ,,,consonant,,,,,,voiceless,retroflex,affricate,obsolete,ligature for ʈ͡ʂ
+ꭦ,,,consonant,,,,,,voiced,retroflex,affricate,obsolete,ligature for ɖ͡ʐ
+ʇ,,,consonant,,,,,,voiceless,dental,click,obsolete,former symbol for ǀ
+ʗ,,,consonant,,,,,,voiceless,postalveolar,click,obsolete,former symbol for ǃ
+ʖ,,,consonant,,,,,,voiceless,lateral,click,obsolete,former symbol for ǁ
+ʞ,,,consonant,,,,,,voiceless,velar,click,obsolete,withdrawn 1970
+ƥ,,,consonant,,,,,,voiceless,bilabial,implosive,obsolete,withdrawn 1993
+ƭ,,,consonant,,,,,,voiceless,alveolar,implosive,obsolete,withdrawn 1993
+ƈ,,,consonant,,,,,,voiceless,palatal,implosive,obsolete,withdrawn 1993
+ƙ,,,consonant,,,,,,voiceless,velar,implosive,obsolete,withdrawn 1993
+ʠ,,,consonant,,,,,,voiceless,uvular,implosive,obsolete,withdrawn 1993
+ɼ,,,consonant,,,,,,voiced,alveolar,fricative-trill,obsolete,withdrawn 1989
+ʆ,,,consonant,,,,,,voiceless,alveolo-palatal,fricative,obsolete,palatalized ʃ; withdrawn 1989
+ʓ,,,consonant,,,,,,voiced,alveolo-palatal,fricative,obsolete,palatalized ʒ; withdrawn 1989
+ƞ,,,consonant,,,,,,voiced,alveolar,nasal,obsolete,withdrawn 1976

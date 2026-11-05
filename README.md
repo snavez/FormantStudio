@@ -83,8 +83,8 @@ python formant_editor.py
 
 | Shortcut | Action |
 |----------|--------|
-| ←  / → | Previous / next interval on the active tier |
-| ↑ / ↓ | Move between tiers |
+| Ctrl+← / Ctrl+→ | Previous / next interval on the active tier |
+| Ctrl+↑ / Ctrl+↓ | Move between tiers, carrying the selection |
 | Ctrl+Shift+O | Open WAV file |
 | Ctrl+S | Save formants |
 | Ctrl+Shift+S | Save TextGrid |
@@ -104,7 +104,13 @@ python formant_editor.py
 | Enter | Add boundary at cursor |
 | Del | Delete selected boundary/point |
 | F | Toggle formant visibility |
+| Ctrl+Shift+T | Add tier |
 | Scroll wheel | Zoom in/out (centred on cursor) |
+| Double-click a tier | Edit the label under the cursor |
+| Click a tier name | Rename the tier |
+| Shift+Drag boundary | Drag aligned boundaries on all tiers together |
+| Click a boundary's shadow | Copy the selected boundary to that tier |
+| Right-drag (edit mode) | Erase formant points |
 
 ## .formants File Format
 

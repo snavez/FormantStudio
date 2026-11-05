@@ -22,6 +22,7 @@ import errno
 import math
 import functools
 import time as _time
+from typing import NamedTuple, Optional
 import numpy as np
 import parselmouth
 from parselmouth import praat
@@ -251,34 +252,77 @@ def _checked_tick_qss():
     return (f'\nQCheckBox::indicator:checked {{ '
             f'image: url("{_checkmark_png_path()}"); }}\n')
 
-# Diacritic suffixes for SAMPA / X-SAMPA notation (longest first)
-_DIACRITIC_SUFFIXES = [
-    ("_h", "aspirated"),
-    ("_0", "voiceless"),
-    ("_t", "dental"),
-    ("_k", "velarized"),
-    ("_w", "labialized"),
-    ("_j", "palatalized"),
-    ("_~", "nasalized"),
-    ("_d", "breathy"),
-    ("_c", "creaky"),
-    ("_:", "long"),
-    (":", "long"),
+
+class _Diacritic(NamedTuple):
+    """A diacritic or suprasegmental in IPA and X-SAMPA.
+
+    ``feature`` names what the label classifier reports the mark as; None
+    for marks the symbol chart offers but classification does not
+    recognise.
+    """
+    ipa: str
+    sampa: str
+    description: str
+    feature: Optional[str] = None
+
+
+# Every diacritic the symbol chart offers, in chart order.  The classifier's
+# tables below are derived from the entries that carry a feature, so the
+# chart and the classifier cannot disagree about what a mark means.
+_DIACRITICS = [
+    _Diacritic("\u02B0", "_h", "aspirated", "aspirated"),
+    _Diacritic("\u0325", "_0", "voiceless", "voiceless"),
+    _Diacritic("\u032C", "_v", "voiced"),
+    _Diacritic("\u0324", "_t", "breathy voice", "breathy"),
+    _Diacritic("\u0330", "_k", "creaky voice", "creaky"),
+    _Diacritic("\u032A", "_d", "dental", "dental"),
+    _Diacritic("\u033A", "_a", "apical"),
+    _Diacritic("\u033B", "_m", "laminal"),
+    _Diacritic("\u033C", "_N", "linguolabial"),
+    _Diacritic("\u031F", "_+", "advanced"),
+    _Diacritic("\u0320", "_-", "retracted"),
+    _Diacritic("\u0308", '_"', "centralized"),
+    _Diacritic("\u033D", "_x", "mid-centralized"),
+    _Diacritic("\u031D", "_r", "raised"),
+    _Diacritic("\u031E", "_o", "lowered"),
+    _Diacritic("\u0339", "_O", "more rounded"),
+    _Diacritic("\u031C", "_c", "less rounded"),
+    _Diacritic("\u0318", "_A", "advanced tongue root"),
+    _Diacritic("\u0319", "_q", "retracted tongue root"),
+    _Diacritic("\u02B7", "_w", "labialized", "labialized"),
+    _Diacritic("\u02B2", "_j", "palatalized", "palatalized"),
+    _Diacritic("\u02E0", "_G", "velarized", "velarized"),
+    _Diacritic("\u02E4", "_?\\", "pharyngealized"),
+    _Diacritic("\u0334", "_e", "velarized or pharyngealized", "velarized"),
+    _Diacritic("\u0303", "_~", "nasalized", "nasalized"),
+    _Diacritic("\u207F", "_n", "nasal release"),
+    _Diacritic("\u02E1", "_l", "lateral release"),
+    _Diacritic("\u031A", "_}", "no audible release"),
+    _Diacritic("\u02DE", "`", "rhoticity"),
+    _Diacritic("\u02BC", "_>", "ejective"),
+    _Diacritic("\u0329", "=", "syllabic"),
+    _Diacritic("\u032F", "_^", "non-syllabic"),
 ]
 
-# IPA combining diacritics (Unicode)
-_IPA_COMBINING_DIACRITICS = [
-    ("\u02B0", "aspirated"),     # superscript h
-    ("\u0325", "voiceless"),     # combining ring below
-    ("\u032A", "dental"),        # combining bridge below
-    ("\u0334", "velarized"),     # combining tilde overlay
-    ("\u02B7", "labialized"),    # superscript w
-    ("\u02B2", "palatalized"),   # superscript j
-    ("\u0303", "nasalized"),     # combining tilde
-    ("\u0324", "breathy"),       # combining diaeresis below
-    ("\u0330", "creaky"),        # combining tilde below
-    ("\u02D0", "long"),          # length mark ː
+_SUPRASEGMENTALS = [
+    _Diacritic("\u02C8", '"', "primary stress"),
+    _Diacritic("\u02CC", "%", "secondary stress"),
+    _Diacritic("\u02D0", ":", "long", "long"),
+    _Diacritic("\u02D1", ":\\", "half-long"),
+    _Diacritic("\u0306", "_X", "extra-short"),
+    _Diacritic(".", ".", "syllable break"),
 ]
+
+# IPA marks the classifier strips from the end of a label
+_IPA_COMBINING_DIACRITICS = [
+    (d.ipa, d.feature) for d in _DIACRITICS + _SUPRASEGMENTALS if d.feature]
+
+# X-SAMPA suffixes the classifier strips, longest first so a mark is never
+# taken for the tail of a longer one ("_:" before ":").
+_DIACRITIC_SUFFIXES = sorted(
+    [(d.sampa, d.feature) for d in _DIACRITICS + _SUPRASEGMENTALS
+     if d.feature] + [("_:", "long")],
+    key=lambda pair: -len(pair[0]))
 
 # All known diacritic feature names (for column generation)
 _ALL_DIACRITIC_FEATURES = [
@@ -1500,18 +1544,25 @@ def _load_ipa_chart(csv_path):
 
     Returns ``{'ipa': {symbol: props}, 'sampa': {...}, 'xsampa': {...}}``
     where *props* is a dict with keys: type, subtype, height, fronting,
-    rounding, length, voicing, place, manner.
+    rounding, length, voicing, place, manner, status, note.
+
+    *status* is blank for symbols on the official IPA chart, otherwise
+    ``extended`` (in common use beyond it), ``extipa`` (extensions for
+    disordered speech) or ``obsolete``; *note* says what a symbol is when
+    its properties alone do not.  Symbols with no SAMPA form leave that
+    column blank and appear only under ``'ipa'``.
     """
     with open(csv_path, "r", encoding="utf-8") as fh:
         raw_lines = [ln for ln in fh if not ln.strip().startswith("#")]
     reader = csv.DictReader(io.StringIO("".join(raw_lines)))
     chart = {"ipa": {}, "sampa": {}, "xsampa": {}}
     prop_keys = ["type", "subtype", "height", "fronting", "rounding",
-                 "length", "voicing", "place", "manner"]
+                 "length", "voicing", "place", "manner", "status", "note"]
     for row in reader:
-        props = {k: row.get(k, "").strip() for k in prop_keys}
+        # Rows written before the trailing columns existed leave them None.
+        props = {k: (row.get(k) or "").strip() for k in prop_keys}
         for notation in ("ipa", "sampa", "xsampa"):
-            sym = row.get(notation, "").strip()
+            sym = (row.get(notation) or "").strip()
             if sym:
                 chart[notation][sym] = props
     return chart
@@ -7268,15 +7319,25 @@ class _MultiSelectDropdown(QWidget):
 class _IPAChartDialog(QDialog):
     """Floating IPA / SAMPA symbol reference panel.
 
-    Displays the standard IPA vowel trapezoid and consonant table with
-    clickable symbol buttons.  Clicking a symbol copies it to the clipboard
-    and inserts it into the active LabelEdit field (if one is focused).
-    A notation dropdown switches all symbols between IPA and SAMPA.
+    Lays out every symbol in the chart CSV as a button.  The official IPA
+    chart comes first: vowels by height and backness, pulmonic consonants
+    by place and manner, the consonants that fit no cell of that grid
+    beneath it.  A cell holds every symbol the CSV classifies there -- the
+    chart's five vowel heights fold the near-close and near-open vowels in
+    with their neighbours -- so no symbol is left without a button.
+    Diacritics and suprasegmentals have a tab of their own, as do the
+    symbols beyond the official chart: common extensions, extIPA, and
+    obsolete letters a corpus may still contain.
+
+    Clicking a symbol copies it to the clipboard and types it into the
+    label editor, replacing any selected text, exactly as a keystroke
+    would.  A notation dropdown switches every button between IPA and
+    SAMPA; symbols with no SAMPA form are disabled under SAMPA.
     """
 
-    # Ordered lists matching the IPA chart layout
     _VOWEL_HEIGHTS = ["high", "mid-high", "mid", "mid-low", "low"]
     _VOWEL_FRONTINGS = ["front", "centre", "back"]
+    _VOWEL_ROUNDINGS = ["unrounded", "rounded"]
 
     _CONSONANT_MANNERS = [
         "plosive", "nasal", "trill", "tap", "fricative",
@@ -7300,6 +7361,13 @@ class _IPAChartDialog(QDialog):
         "lateral-fricative": "Lat. Fric.", "approximant": "Approximant",
         "lateral-approximant": "Lat. Approx.", "affricate": "Affricate",
     }
+    _EXTENDED_SECTIONS = [
+        ("extended", "Beyond the IPA chart, in common use"),
+        ("extipa", "extIPA (disordered speech)"),
+        ("obsolete", "Obsolete and non-standard"),
+    ]
+    _FLOW_COLUMNS = 12   # buttons per row in a symbol list
+    _MARK_COLUMNS = 3    # diacritics per row
 
     _BTN_STYLE = """
         QPushButton {
@@ -7309,8 +7377,10 @@ class _IPAChartDialog(QDialog):
         }
         QPushButton:hover { background: #3a3a5a; border-color: #6699cc; }
         QPushButton:pressed { background: #4a4a6a; }
+        QPushButton:disabled { color: #555; border-color: #333; }
     """
     _HDR_STYLE = "color: #999; font-weight: bold; font-size: 12px;"
+    _SECTION_STYLE = "font-weight: bold; font-size: 13px; color: #aaa;"
 
     def __init__(self, main_window, parent=None):
         super().__init__(parent)
@@ -7331,15 +7401,19 @@ class _IPAChartDialog(QDialog):
             "QComboBox QAbstractItemView { background: #2a2a3a; color: #ddd; }"
         )
 
-        self._symbol_buttons = []  # list of QPushButton (for notation switch)
+        self._symbol_buttons = []
 
-        # Load chart data
-        self._chart = _load_ipa_chart(_IPA_CHART_PATH)
+        chart = _load_ipa_chart(_IPA_CHART_PATH)
+        # Rows share one props dict across notations; pair them back up.
+        sampa_of = {id(p): s for s, p in chart["sampa"].items()}
+        symbols = [(ipa, sampa_of.get(id(p), ""), p)
+                   for ipa, p in chart["ipa"].items()]
+        self._symbols = [s for s in symbols if not s[2]["status"]]
+        self._extended = [s for s in symbols if s[2]["status"]]
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
 
-        # Top bar — notation dropdown
         top = QHBoxLayout()
         top.addWidget(QLabel("Notation:"))
         self._notation_combo = QComboBox()
@@ -7352,285 +7426,311 @@ class _IPAChartDialog(QDialog):
         top.addWidget(hint)
         layout.addLayout(top)
 
-        # Tab widget
         tabs = QTabWidget()
         tabs.addTab(self._build_vowel_tab(), "Vowels")
         tabs.addTab(self._build_consonant_tab(), "Consonants")
+        tabs.addTab(self._build_marks_tab(), "Diacritics")
+        tabs.addTab(self._build_extended_tab(), "Extended")
         layout.addWidget(tabs)
-
-    # Diacritics: (display_suffix_ipa, display_suffix_sampa, description)
-    # Shown on a dotted circle (◌) base character.
-    _DIACRITICS = [
-        ("\u02B0",  "_h",  "aspirated"),
-        ("\u0325",  "_0",  "voiceless"),
-        ("\u032A",  "_t",  "dental"),
-        ("\u0334",  "_k",  "velarized"),
-        ("\u02B7",  "_w",  "labialized"),
-        ("\u02B2",  "_j",  "palatalized"),
-        ("\u0303",  "_~",  "nasalized"),
-        ("\u0324",  "_d",  "breathy voice"),
-        ("\u0330",  "_c",  "creaky voice"),
-        ("\u02D0",  ":",   "long"),
-        ("\u0329",  "=",   "syllabic"),
-        ("\u032F",  "_^",  "non-syllabic"),
-        ("\u031A",  "_}",  "no audible release"),
-        ("\u0339",  "_O",  "more rounded"),
-        ("\u031C",  "_c",  "less rounded"),
-        ("\u031D",  "_r",  "raised"),
-        ("\u031E",  "_o",  "lowered"),
-        ("\u0318",  "_A",  "advanced tongue root"),
-        ("\u0319",  "_q",  "retracted tongue root"),
-    ]
 
     # ------------------------------------------------------------------
     # Vowel tab
     # ------------------------------------------------------------------
     def _build_vowel_tab(self):
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("QScrollArea { border: none; background: #1e1e2e; }")
-        container = QWidget()
-        outer = QVBoxLayout(container)
-        outer.setContentsMargins(8, 8, 8, 8)
+        container, outer = self._tab_body()
 
-        # --- Monophthong grid ---
         mono_label = QLabel("Monophthongs (click two vowels for a diphthong)")
-        mono_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #aaa;")
+        mono_label.setStyleSheet(self._SECTION_STYLE)
         outer.addWidget(mono_label)
 
         grid = QGridLayout()
         grid.setSpacing(2)
         grid.setContentsMargins(0, 0, 0, 0)
 
-        # Two-level column headers:  fronting on top, unrounded / rounded below
-        #  Col layout:  0=row-label, then for each fronting: unrounded, rounded
-        col_base = 1
+        # Two-level column headers: fronting on top, unrounded / rounded below
         for fi, fronting in enumerate(self._VOWEL_FRONTINGS):
-            c = col_base + fi * 2
+            c = 1 + fi * 2
             lbl = QLabel(fronting.title())
             lbl.setStyleSheet(self._HDR_STYLE)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            grid.addWidget(lbl, 0, c, 1, 2)  # span 2 cols
+            grid.addWidget(lbl, 0, c, 1, 2)
             for si, sub in enumerate(["unrnd", "rnd"]):
                 sl = QLabel(sub)
                 sl.setStyleSheet("color: #777; font-size: 10px;")
                 sl.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 grid.addWidget(sl, 1, c + si)
 
-        # Build lookup: (height, fronting, rounding) -> (ipa, sampa)
-        vowel_lookup = {}
-        for ipa_sym, props in self._chart["ipa"].items():
-            if props["type"] != "vowel":
-                continue
-            if props["subtype"] != "monophthong" or props["length"] != "short":
-                continue
-            sampa_sym = ""
-            for s, p in self._chart["sampa"].items():
-                if p is props:
-                    sampa_sym = s
-                    break
-            key = (props["height"], props["fronting"], props["rounding"])
-            vowel_lookup[key] = (ipa_sym, sampa_sym)
+        cells = {}
+        for ipa, sampa, props in self._symbols:
+            if (props["type"] == "vowel"
+                    and props["subtype"] == "monophthong"
+                    and props["length"] == "short"):
+                key = (props["height"], props["fronting"], props["rounding"])
+                cells.setdefault(key, []).append((ipa, sampa, props))
 
-        # Rows (start at row 2 — after fronting + rounding headers)
         for row, height in enumerate(self._VOWEL_HEIGHTS):
             lbl = QLabel(height.title())
             lbl.setStyleSheet(self._HDR_STYLE)
             lbl.setAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             grid.addWidget(lbl, row + 2, 0)
-
             for fi, fronting in enumerate(self._VOWEL_FRONTINGS):
-                c = col_base + fi * 2
-                for ri, rounding in enumerate(["unrounded", "rounded"]):
-                    entry = vowel_lookup.get((height, fronting, rounding))
-                    if entry:
-                        btn = self._make_btn(entry[0], entry[1])
-                        grid.addWidget(btn, row + 2, c + ri,
+                for ri, rounding in enumerate(self._VOWEL_ROUNDINGS):
+                    entries = cells.get((height, fronting, rounding))
+                    if entries:
+                        grid.addWidget(self._button_row([entries]),
+                                       row + 2, 1 + fi * 2 + ri,
                                        alignment=Qt.AlignmentFlag.AlignCenter)
 
         outer.addLayout(grid)
-
-        # --- Diacritics ---
-        outer.addSpacing(14)
-        dia_label = QLabel("Diacritics (combining marks)")
-        dia_label.setStyleSheet(
-            "font-weight: bold; font-size: 13px; color: #aaa;")
-        outer.addWidget(dia_label)
-        dia_grid = QGridLayout()
-        dia_grid.setSpacing(3)
-        cols = 4  # diacritics per row
-        for i, (ipa_suf, sampa_suf, desc) in enumerate(self._DIACRITICS):
-            r, c = divmod(i, cols)
-            # Show on dotted circle base (◌)
-            ipa_display = "\u25CC" + ipa_suf
-            sampa_display = sampa_suf
-            btn = self._make_btn(ipa_suf, sampa_suf)
-            # Override display to show on dotted circle
-            btn.setText(ipa_display)
-            btn.setProperty("ipa_display", ipa_display)
-            btn.setProperty("sampa_display", sampa_suf)
-            btn.setToolTip(f"{desc}\nIPA: {ipa_display}   SAMPA: {sampa_suf}")
-            btn.setMinimumWidth(40)
-            cell = QHBoxLayout()
-            cell.setSpacing(4)
-            cell.setContentsMargins(0, 0, 0, 0)
-            cell.addWidget(btn)
-            lbl = QLabel(desc)
-            lbl.setStyleSheet("color: #888; font-size: 11px;")
-            cell.addWidget(lbl)
-            cell.addStretch()
-            w = QWidget()
-            w.setLayout(cell)
-            dia_grid.addWidget(w, r, c)
-        outer.addLayout(dia_grid)
-
         outer.addStretch()
-        scroll.setWidget(container)
-        return scroll
+        return self._scrolled(container)
 
     # ------------------------------------------------------------------
     # Consonant tab
     # ------------------------------------------------------------------
     def _build_consonant_tab(self):
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("QScrollArea { border: none; background: #1e1e2e; }")
-        container = QWidget()
-        outer = QVBoxLayout(container)
-        outer.setContentsMargins(8, 8, 8, 8)
+        container, outer = self._tab_body()
 
         pul_label = QLabel("Pulmonic Consonants")
-        pul_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #aaa;")
+        pul_label.setStyleSheet(self._SECTION_STYLE)
         outer.addWidget(pul_label)
 
         grid = QGridLayout()
         grid.setSpacing(3)
 
-        # Build lookup: (manner, place, voicing) -> (ipa, sampa)
-        cons_lookup = {}
-        non_pulmonic = []  # (ipa, sampa, props)
-        for ipa_sym, props in self._chart["ipa"].items():
+        cells = {}   # (manner, place) -> {voicing: [(ipa, sampa)]}
+        other = []   # (ipa, sampa, props) for symbols with no grid cell
+        for ipa, sampa, props in self._symbols:
             if props["type"] != "consonant":
                 continue
-            sampa_sym = ""
-            for s, p in self._chart["sampa"].items():
-                if p is props:
-                    sampa_sym = s
-                    break
-            manner = props["manner"]
-            place = props["place"]
-            if manner in ("click", "implosive", "ejective"):
-                non_pulmonic.append((ipa_sym, sampa_sym, props))
-                continue
-            if place in ("labio-velar", "labio-palatal"):
-                non_pulmonic.append((ipa_sym, sampa_sym, props))
-                continue
-            key = (manner, place, props["voicing"])
-            cons_lookup[key] = (ipa_sym, sampa_sym)
+            manner, place = props["manner"], props["place"]
+            if (manner in self._CONSONANT_MANNERS
+                    and place in self._CONSONANT_PLACES):
+                cell = cells.setdefault((manner, place), {})
+                cell.setdefault(props["voicing"], []).append((ipa, sampa, props))
+            else:
+                other.append((ipa, sampa, props))
 
-        # Column headers
         for col, place in enumerate(self._CONSONANT_PLACES):
-            lbl = QLabel(self._PLACE_ABBREV.get(place, place[:4].title()))
+            lbl = QLabel(self._PLACE_ABBREV[place])
             lbl.setStyleSheet(self._HDR_STYLE + " font-size: 10px;")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             grid.addWidget(lbl, 0, col + 1)
 
-        # Rows
         for row, manner in enumerate(self._CONSONANT_MANNERS):
-            lbl = QLabel(self._MANNER_LABELS.get(manner, manner.title()))
+            lbl = QLabel(self._MANNER_LABELS[manner])
             lbl.setStyleSheet(self._HDR_STYLE)
-            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            lbl.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             grid.addWidget(lbl, row + 1, 0)
-
             for col, place in enumerate(self._CONSONANT_PLACES):
-                vl = cons_lookup.get((manner, place, "voiceless"))
-                vd = cons_lookup.get((manner, place, "voiced"))
-                cell = QHBoxLayout()
-                cell.setSpacing(1)
-                cell.setContentsMargins(0, 0, 0, 0)
-                if vl:
-                    cell.addWidget(self._make_btn(vl[0], vl[1]))
-                if vl and vd:
-                    dot = QLabel("\u00B7")
-                    dot.setStyleSheet("color: #555; font-size: 10px;")
-                    dot.setFixedWidth(6)
-                    cell.addWidget(dot)
-                if vd:
-                    cell.addWidget(self._make_btn(vd[0], vd[1]))
-                if not vl and not vd:
-                    cell.addStretch()
-                w = QWidget()
-                w.setLayout(cell)
-                grid.addWidget(w, row + 1, col + 1)
+                cell = cells.get((manner, place), {})
+                groups = [cell[v] for v in ("voiceless", "voiced") if v in cell]
+                grid.addWidget(self._button_row(groups), row + 1, col + 1)
 
         outer.addLayout(grid)
 
-        # --- Non-pulmonic ---
-        if non_pulmonic:
+        if other:
             outer.addSpacing(12)
-            np_label = QLabel("Other (clicks, implosives, ejectives, labio-velars)")
-            np_label.setStyleSheet(
-                "font-weight: bold; font-size: 13px; color: #aaa;")
+            np_label = QLabel(
+                "Other consonants (clicks, implosives, ejectives, "
+                "co-articulated, epiglottal)")
+            np_label.setStyleSheet(self._SECTION_STYLE)
             outer.addWidget(np_label)
-            flow = QHBoxLayout()
-            flow.setSpacing(4)
-            non_pulmonic.sort(key=lambda x: (x[2]["manner"], x[0]))
-            for ipa_sym, sampa_sym, _ in non_pulmonic:
-                flow.addWidget(self._make_btn(ipa_sym, sampa_sym))
-            flow.addStretch()
-            np_widget = QWidget()
-            np_widget.setLayout(flow)
-            outer.addWidget(np_widget)
+            outer.addLayout(self._symbol_flow(other))
 
         outer.addStretch()
-        scroll.setWidget(container)
-        return scroll
+        return self._scrolled(container)
+
+    # ------------------------------------------------------------------
+    # Extended tab
+    # ------------------------------------------------------------------
+    def _build_extended_tab(self):
+        container, outer = self._tab_body()
+        for status, title in self._EXTENDED_SECTIONS:
+            entries = [s for s in self._extended if s[2]["status"] == status]
+            if not entries:
+                continue
+            lbl = QLabel(title)
+            lbl.setStyleSheet(self._SECTION_STYLE)
+            outer.addWidget(lbl)
+            outer.addLayout(self._symbol_flow(entries))
+            outer.addSpacing(14)
+        outer.addStretch()
+        return self._scrolled(container)
+
+    # ------------------------------------------------------------------
+    # Diacritics tab
+    # ------------------------------------------------------------------
+    def _build_marks_tab(self):
+        container, outer = self._tab_body()
+        for title, marks in (("Diacritics", _DIACRITICS),
+                             ("Suprasegmentals", _SUPRASEGMENTALS)):
+            lbl = QLabel(title)
+            lbl.setStyleSheet(self._SECTION_STYLE)
+            outer.addWidget(lbl)
+            grid = QGridLayout()
+            grid.setSpacing(3)
+            for i, mark in enumerate(marks):
+                r, c = divmod(i, self._MARK_COLUMNS)
+                grid.addWidget(self._mark_cell(mark), r, c)
+            outer.addLayout(grid)
+            outer.addSpacing(14)
+        outer.addStretch()
+        return self._scrolled(container)
+
+    def _mark_cell(self, mark):
+        """A diacritic's button, shown on a dotted circle, with its name."""
+        # Stress marks precede the syllable they mark; the rest follow.
+        if mark.ipa in ("\u02C8", "\u02CC"):
+            ipa_display = mark.ipa + "\u25CC"
+        else:
+            ipa_display = "\u25CC" + mark.ipa
+        btn = self._make_btn(mark.ipa, mark.sampa, description=mark.description,
+                             ipa_display=ipa_display)
+        btn.setMinimumWidth(40)
+        cell = QHBoxLayout()
+        cell.setSpacing(4)
+        cell.setContentsMargins(0, 0, 0, 0)
+        cell.addWidget(btn)
+        lbl = QLabel(mark.description)
+        lbl.setStyleSheet("color: #888; font-size: 11px;")
+        cell.addWidget(lbl)
+        cell.addStretch()
+        w = QWidget()
+        w.setLayout(cell)
+        return w
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _make_btn(self, ipa, sampa):
-        """Create a symbol button storing both notations."""
-        btn = QPushButton(ipa)  # default to IPA
+    @staticmethod
+    def _tab_body():
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(8, 8, 8, 8)
+        return container, outer
+
+    @staticmethod
+    def _scrolled(container):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(
+            "QScrollArea { border: none; background: #1e1e2e; }")
+        scroll.setWidget(container)
+        return scroll
+
+    def _button_row(self, groups):
+        """One chart cell: a run of buttons per group, dots between groups.
+
+        *groups* is a list of ``[(ipa, sampa, props), ...]`` -- voiceless then
+        voiced for a consonant cell, a single group for a vowel cell.
+        """
+        cell = QHBoxLayout()
+        cell.setSpacing(1)
+        cell.setContentsMargins(0, 0, 0, 0)
+        for gi, group in enumerate(groups):
+            if gi:
+                dot = QLabel("\u00B7")
+                dot.setStyleSheet("color: #555; font-size: 10px;")
+                dot.setFixedWidth(6)
+                cell.addWidget(dot)
+            for entry in group:
+                cell.addWidget(self._make_btn(*entry))
+        if not groups:
+            cell.addStretch()
+        w = QWidget()
+        w.setLayout(cell)
+        return w
+
+    def _symbol_flow(self, entries):
+        """A wrapping grid of buttons for symbols outside the chart grids."""
+        flow = QGridLayout()
+        flow.setSpacing(4)
+        entries = sorted(entries, key=lambda s: (
+            s[2]["type"], s[2]["manner"], s[2]["place"], s[0]))
+        for i, entry in enumerate(entries):
+            r, c = divmod(i, self._FLOW_COLUMNS)
+            flow.addWidget(self._make_btn(*entry), r, c)
+        flow.setColumnStretch(self._FLOW_COLUMNS, 1)
+        return flow
+
+    @staticmethod
+    def _describe(props):
+        """What a symbol stands for, from its chart properties."""
+        if props["type"] == "vowel":
+            what = (f"{props['height']} {props['fronting']} "
+                    f"{props['rounding']} vowel")
+        else:
+            what = f"{props['voicing']} {props['place']} {props['manner']}"
+        return f"{what}\n{props['note']}" if props["note"] else what
+
+    def _make_btn(self, ipa, sampa, props=None, *, description=None,
+                  ipa_display=None):
+        """Create a symbol button storing both notations.
+
+        *ipa_display* is what the button shows under IPA when that differs
+        from what it types -- a diacritic shown on a dotted circle.
+        """
+        btn = QPushButton()
         btn.setProperty("ipa", ipa)
         btn.setProperty("sampa", sampa)
-        btn.setToolTip(f"IPA: {ipa}   SAMPA: {sampa}")
+        btn.setProperty("ipa_display", ipa_display or ipa)
+        if description is None and props is not None:
+            description = self._describe(props)
+        sampa_text = sampa or "(none)"
+        tip = f"IPA: {ipa_display or ipa}   SAMPA: {sampa_text}"
+        btn.setToolTip(f"{description}\n{tip}" if description else tip)
         btn.setStyleSheet(self._BTN_STYLE)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.clicked.connect(lambda checked, b=btn: self._on_symbol_click(b))
         self._symbol_buttons.append(btn)
+        self._show_notation(btn, self._is_ipa())
         return btn
 
-    def _on_symbol_click(self, btn):
-        """Copy symbol to clipboard and insert into active label edit."""
-        key = "ipa" if self._notation_combo.currentIndex() == 0 else "sampa"
-        symbol = btn.property(key)
+    def _is_ipa(self):
+        return self._notation_combo.currentIndex() == 0
 
-        # Copy to clipboard
+    @staticmethod
+    def _show_notation(btn, is_ipa):
+        """Label *btn* in the chosen notation.
+
+        A symbol with no SAMPA form keeps its IPA face under SAMPA but is
+        disabled: there is nothing to type.  ``&`` is doubled because a
+        button reads a lone one as its keyboard-accelerator marker and
+        shows nothing -- which is what hid SAMPA ``&``.
+        """
+        typable = is_ipa or bool(btn.property("sampa"))
+        btn.setEnabled(typable)
+        text = (btn.property("sampa") if not is_ipa and typable
+                else btn.property("ipa_display"))
+        btn.setText(text.replace("&", "&&"))
+
+    def _on_symbol_click(self, btn):
+        """Copy the symbol to the clipboard and type it into the label.
+
+        ``insert`` rather than ``setText``: it replaces the selection and
+        counts as the user's edit, so the label editor writes it through
+        to the TextGrid.  ``setText`` is how the editor is refilled when
+        the selection moves, and the editor deliberately ignores it.
+        """
+        symbol = btn.property("ipa" if self._is_ipa() else "sampa")
         QApplication.clipboard().setText(symbol)
 
-        # Insert into label edit if active
         le = self._main_window.label_edit
         if le.isEnabled():
-            pos = le.cursorPosition()
-            text = le.text()
-            le.setText(text[:pos] + symbol + text[pos:])
-            le.setCursorPosition(pos + len(symbol))
+            le.insert(symbol)
+            self._main_window.activateWindow()
             le.setFocus()
 
         self._main_window.status.showMessage(f"Copied: {symbol}", 2000)
 
     def _switch_notation(self):
         """Update all buttons to show the selected notation."""
-        is_ipa = self._notation_combo.currentIndex() == 0
+        is_ipa = self._is_ipa()
         for btn in self._symbol_buttons:
-            # Diacritic buttons have special display properties
-            disp = btn.property("ipa_display" if is_ipa else "sampa_display")
-            if disp is not None:
-                btn.setText(disp)
-            else:
-                btn.setText(btn.property("ipa" if is_ipa else "sampa"))
+            self._show_notation(btn, is_ipa)
 
 
 class _LabelCheckDialog(QDialog):
@@ -8407,9 +8507,29 @@ class BuildCSVWizard(QWizard):
 class MainWindow(QMainWindow):
     """FormantStudio main application window."""
 
+    # Keys and gestures handled by keyPressEvent and the canvas rather than
+    # bound to actions, listed in the View menu so they can be found.  Each
+    # inner list is a menu section.
+    _SHORTCUT_REFERENCE = [
+        [("Undo", "Ctrl+Z"), ("Redo", "Ctrl+Y")],
+        [("Previous / Next Interval", "Ctrl+\u2190 / Ctrl+\u2192"),
+         ("Previous / Next Tier", "Ctrl+\u2191 / Ctrl+\u2193")],
+        [("Play Selection", "Tab"),
+         ("Add Boundary (both ends of a selection)", "Enter"),
+         ("Delete Boundary / Point", "Del"),
+         ("Stop / Clear Selection", "Esc")],
+        [("Select F1\u2013F5 (edit mode)", "F1\u2013F5"),
+         ("Erase Formants (edit mode)", "Right-drag")],
+        [("Zoom at Cursor", "Scroll wheel"),
+         ("Edit Label", "Double-click"),
+         ("Rename Tier", "Click tier name"),
+         ("Drag Aligned Boundaries", "Shift+Drag"),
+         ("Copy Boundary to Another Tier", "Click its shadow")],
+    ]
+
     def __init__(self):
         super().__init__()
-        self._app_title = "FormantStudio — Manual Formant Editor"
+        self._app_title = "FormantStudio \u2014 Manual Formant Editor"
         self.setWindowTitle(self._app_title)
         self.setMinimumSize(1200, 900)
         self.resize(2100, 1425)
@@ -8651,37 +8771,12 @@ class MainWindow(QMainWindow):
                 not self.controls.show_formants_cb.isChecked()))
         view_menu.addAction(toggle_formants_action)
 
-        view_menu.addSeparator()
-
-        undo_ref = QAction("Undo\tCtrl+Z", self)
-        undo_ref.setEnabled(False)
-        view_menu.addAction(undo_ref)
-
-        redo_ref = QAction("Redo\tCtrl+Y", self)
-        redo_ref.setEnabled(False)
-        view_menu.addAction(redo_ref)
-
-        view_menu.addSeparator()
-
-        for text, shortcut in [
-            ("Play Selection", "Tab"),
-            ("Add Boundary", "Enter"),
-            ("Delete Boundary", "Del"),
-            ("Stop / Clear Selection", "Esc"),
-        ]:
-            a = QAction(f"{text}\t{shortcut}", self)
-            a.setEnabled(False)
-            view_menu.addAction(a)
-
-        view_menu.addSeparator()
-
-        ref_fkeys = QAction("Select F1\u2013F5 (edit mode)\tF1\u2013F5", self)
-        ref_fkeys.setEnabled(False)
-        view_menu.addAction(ref_fkeys)
-
-        ref_shift = QAction("Drag aligned boundaries\tShift+Drag", self)
-        ref_shift.setEnabled(False)
-        view_menu.addAction(ref_shift)
+        for group in self._SHORTCUT_REFERENCE:
+            view_menu.addSeparator()
+            for text, shortcut in group:
+                a = QAction(f"{text}\t{shortcut}", self)
+                a.setEnabled(False)
+                view_menu.addAction(a)
 
         # Tools menu
         tools_menu = menubar.addMenu("&Tools")
