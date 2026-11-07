@@ -20,3 +20,5 @@ nul
 .claude/
 formant_editor_SpectroCanvas.py
 tmp/
+# Local test corpora and the CSVs exported from them
+testdata/
