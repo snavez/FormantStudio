@@ -15,6 +15,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from PyQt6.QtCore import QEvent, Qt
 from PyQt6.QtWidgets import QApplication
 
 from formant_editor import (
@@ -62,6 +63,10 @@ def window(qapp):
     # Closing a dirty window asks to save, which would block the run.
     mw._textgrid_dirty = mw._formants_dirty = False
     mw.close()
+    # Destroyed now, not whenever the garbage collector reaches it, so a
+    # half-torn-down window cannot crash a later test.
+    mw.deleteLater()
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 @pytest.fixture
@@ -132,6 +137,18 @@ class TestClickWritesThrough:
         assert QApplication.clipboard().text() == "\u027D"
         assert _labels(window) == ["h", "a"]
         assert window._textgrid_dirty is False
+
+
+class TestWindowBehaviour:
+
+    def test_chart_does_not_float_over_other_applications(self, dialog):
+        flags = dialog.windowFlags()
+        assert not flags & Qt.WindowType.WindowStaysOnTopHint
+
+    def test_chart_is_owned_by_the_main_window(self, window, dialog):
+        """Owned, it stays above FormantStudio without a stay-on-top hint."""
+        assert dialog.parent() is window
+        assert dialog.isWindow()
 
 
 class TestEverySymbolHasAButton:

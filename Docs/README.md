@@ -60,7 +60,7 @@ python formant_editor.py
 |----------|--------|
 | ←  / → | Previous / next interval on the active tier |
 | ↑ / ↓ | Move between tiers |
-| Ctrl+Shift+O | Open WAV file |
+| Ctrl+Shift+O | Open audio file (WAV, AIFF, MP3) |
 | Ctrl+S | Save formants |
 | Ctrl+Shift+S | Save TextGrid |
 | Ctrl+Alt+S | Save TextGrid As... |

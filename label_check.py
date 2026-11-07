@@ -153,8 +153,48 @@ def check_unlabelled(tg, name, tier_names):
     return issues
 
 
+def _one_keystroke_away(label, alphabet):
+    """Labels one slip away from *label*, grouped likeliest slip first.
+
+    A doubled key is the commonest typing slip, then two keys swapped, then
+    a wrong key, then a missed one -- so deletions are tried before
+    transpositions, substitutions and insertions.
+    """
+    n = len(label)
+    return [
+        [label[:i] + label[i + 1:] for i in range(n)],
+        [label[:i] + label[i + 1] + label[i] + label[i + 2:]
+         for i in range(n - 1)],
+        [label[:i] + c + label[i + 1:] for i in range(n) for c in alphabet],
+        [label[:i] + c + label[i:] for i in range(n + 1) for c in alphabet],
+    ]
+
+
+def suggest_symbols(label, accept, candidates):
+    """Repairs for a rejected *label*, best first; empty when none is likely.
+
+    Spelling-corrector style: the labels one keystroke away that *accept*
+    takes, from the likeliest kind of slip that yields any.  That reaches
+    composed labels a candidate list never holds -- ``p__h`` gives ``p_h``,
+    a base symbol plus a diacritic.  Only when no single slip explains the
+    label does it fall back to the closest whole symbol in *candidates*.
+    """
+    alphabet = sorted({c for s in candidates for c in s} | set(label))
+    for group in _one_keystroke_away(label, alphabet):
+        hits = []
+        for c in group:
+            if c and c != label and not _skip_symbol(c) and c not in hits \
+                    and accept(c):
+                hits.append(c)
+        if hits:
+            return sorted(hits, key=lambda c: -difflib.SequenceMatcher(
+                None, label, c).ratio())
+    return difflib.get_close_matches(label, sorted(candidates), n=3,
+                                     cutoff=0.6)
+
+
 def check_symbols(tg, name, tier_names, accept, candidates, kind):
-    """Labels that *accept* rejects, with the nearest of *candidates* proposed.
+    """Labels that *accept* rejects, with the likeliest repair proposed.
 
     The policy is the caller's: pass an inventory membership test to catch
     symbols that are valid IPA but impossible for the language, or a chart
@@ -162,9 +202,9 @@ def check_symbols(tg, name, tier_names, accept, candidates, kind):
     and divergence arrows are annotation syntax and are never validated.
 
     No suggestion is proposed when nothing is close enough, which is the honest
-    answer for a label that is simply wrong rather than mistyped.
+    answer for a label that is simply wrong rather than mistyped.  Other
+    plausible repairs are named in the detail, since the first is a guess.
     """
-    pool = sorted(candidates)
     issues = []
     for tier_name in tier_names:
         tier = _tier(tg, tier_name)
@@ -178,12 +218,15 @@ def check_symbols(tg, name, tier_names, accept, candidates, kind):
             label = text.strip()
             if _skip_symbol(label) or accept(label):
                 continue
-            near = difflib.get_close_matches(label, pool, n=1, cutoff=0.6)
+            near = suggest_symbols(label, accept, candidates)
+            detail = ("not in the inventory" if kind == NOT_IN_INVENTORY
+                      else "not a recognised symbol")
+            if len(near) > 1:
+                detail += " — or perhaps " + ", ".join(near[1:4])
             issues.append(Issue(
                 file=name, kind=kind, tier=tier_name, index=i, time=when,
                 current=label, proposed=near[0] if near else "",
-                detail=("not in the inventory" if kind == NOT_IN_INVENTORY
-                        else "not a recognised symbol")))
+                detail=detail))
     return issues
 
 

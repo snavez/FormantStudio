@@ -3,7 +3,7 @@ FormantStudio — Manual Formant Editor
 Built on Praat's analysis engine (via Parselmouth) with a PyQt6 editing interface.
 
 Milestone 1:
-  - Open WAV file, display spectrogram
+  - Open an audio file (WAV, AIFF, MP3), display spectrogram
   - Overlay Praat-calculated formants (F1–F3 default, up to F5), color-coded
   - Spectrogram contrast/brightness/pre-emphasis sliders
   - Click-drag formant editing with F1–F5 key selection
@@ -22,6 +22,7 @@ import errno
 import math
 import functools
 import time as _time
+import dataclasses
 from typing import NamedTuple, Optional
 import numpy as np
 import parselmouth
@@ -33,13 +34,13 @@ import phone_aligner
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QToolBar, QFileDialog, QLabel, QSlider, QGroupBox, QStatusBar,
+    QFileDialog, QLabel, QSlider, QGroupBox, QStatusBar,
     QPushButton, QSplitter, QComboBox, QDoubleSpinBox, QSpinBox, QCheckBox,
     QMessageBox, QSizePolicy, QScrollBar, QLineEdit, QDialog,
     QDialogButtonBox, QFormLayout, QGridLayout,
     QWizard, QWizardPage, QProgressDialog, QListWidget, QListWidgetItem,
     QRadioButton, QButtonGroup, QTabWidget, QScrollArea, QInputDialog,
-    QTableWidget, QTableWidgetItem, QHeaderView
+    QTableWidget, QTableWidgetItem, QHeaderView, QStyledItemDelegate
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QEvent, QObject, pyqtSignal, QByteArray, QBuffer, QIODevice,
@@ -195,6 +196,26 @@ def is_empty_label(text):
     return text.strip() in EMPTY_LABEL_MARKERS or not text.strip()
 
 
+# Recordings FormantStudio reads, matched case-insensitively.
+AUDIO_EXTENSIONS = (".wav", ".aiff", ".mp3")
+
+
+def audio_files_in(folder):
+    """Names of the recordings in *folder*, sorted."""
+    return sorted(f for f in os.listdir(folder)
+                  if os.path.splitext(f)[1].lower() in AUDIO_EXTENSIONS)
+
+
+def find_audio(folder, base):
+    """Path of the recording called *base* in *folder*, or None."""
+    if not os.path.isdir(folder):
+        return None
+    for f in audio_files_in(folder):
+        if os.path.splitext(f)[0] == base:
+            return os.path.join(folder, f)
+    return None
+
+
 # A CSV wider than this is worth a word before it is written: splitting
 # spectral data per acoustic segment multiplies the columns.
 WIDE_CSV_COLUMNS = 300
@@ -249,7 +270,9 @@ def _checkmark_png_path():
 
 def _checked_tick_qss():
     """QSS rule drawing the tick inside checked checkbox indicators."""
-    return (f'\nQCheckBox::indicator:checked {{ '
+    return (f'\nQCheckBox::indicator:checked, '
+            f'QListWidget::indicator:checked, '
+            f'QTableView::indicator:checked {{ '
             f'image: url("{_checkmark_png_path()}"); }}\n')
 
 
@@ -1905,12 +1928,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
     # Keep a stable, canonical order regardless of how they were supplied
     traj_moments = [m for m in SPECTRAL_TRACK_NAMES if m in set(traj_moments)]
 
-    # Discover audio files
-    audio_exts = {".wav", ".aiff", ".mp3"}
-    audio_files = sorted(
-        f for f in os.listdir(audio_dir)
-        if os.path.splitext(f)[1].lower() in audio_exts
-    )
+    audio_files = audio_files_in(audio_dir)
 
     bounds_set = set(bounds_tier_names or [])
 
@@ -3388,7 +3406,7 @@ class SpectrogramCanvas(QWidget):
         if self._playback_playing:
             self.stop_playback()
 
-        if self.spectrogram_data is None:
+        if self.spectrogram_data is None and not self._tier_plots:
             self._setup_empty_axes()
             return
 
@@ -3398,10 +3416,13 @@ class SpectrogramCanvas(QWidget):
 
         # Set view range (propagates via X link)
         self._spec_plot.setXRange(self.view_start, self.view_end, padding=0)
-        self._spec_plot.setYRange(0, self.max_freq, padding=0)
 
         # Draw components
-        self._draw_spectrogram()
+        if self.spectrogram_data is None:
+            self._draw_no_recording_note()
+        else:
+            self._spec_plot.setYRange(0, self.max_freq, padding=0)
+            self._draw_spectrogram()
         if self._wave_plot is not None:
             self._draw_waveform()
 
@@ -3425,6 +3446,29 @@ class SpectrogramCanvas(QWidget):
         self._draw_selection_overlay()
 
         self._last_render_time = _time.monotonic()
+
+    def _draw_no_recording_note(self):
+        """Say, where the spectrogram would be, how to add the recording."""
+        self._spec_plot.setYRange(0, 1, padding=0)
+        # Without a recording there is no frequency to scale; the axes are
+        # rebuilt when one is attached, so the ticks come back with it.
+        self._spec_plot.getAxis('left').setStyle(showValues=False)
+        self._spec_plot.setLabel('left', '')
+        note = pg.TextItem(
+            "No recording open — File → Open Recording for TextGrid…",
+            color='#aaaaaa', anchor=(0.5, 0.5))
+        note.setFont(QFont("Segoe UI", 11))
+        self._spec_plot.addItem(note)
+        note.setPos((self.view_start + self.view_end) / 2.0, 0.5)
+        self._transient_items.append((note, self._spec_plot))
+
+    @property
+    def has_timeline(self):
+        """Whether there is a time axis to zoom and scroll.
+
+        A recording gives one, and so does a TextGrid shown on its own.
+        """
+        return self.total_duration > 0
 
     def _clear_transient_items(self):
         """Remove transient items from all plots."""
@@ -3859,7 +3903,7 @@ class SpectrogramCanvas(QWidget):
 
     def _update_title(self):
         """Update title text on the topmost plot (persistent TextItem)."""
-        title = os.path.basename(self._filepath) if hasattr(self, "_filepath") else ""
+        title = os.path.basename(getattr(self, "_filepath", None) or "")
         if self.edit_mode:
             fn = self.active_formant + 1
             color = FORMANT_COLORS.get(fn, "#ffffff")
@@ -4261,6 +4305,39 @@ class SpectrogramCanvas(QWidget):
             self.request_render()
         return iv
 
+    def show_item(self, tier_name, index, context_s=1.0):
+        """Select item *index* of the tier called *tier_name* and zoom to it.
+
+        The view is at least *context_s* wide, so the item is seen with its
+        neighbours.  The tier becomes the active one.  Returns False, leaving
+        the view alone, when the tier or the item is not there -- the file
+        may have been edited since whoever named it looked.
+        """
+        tg = self.textgrid_data
+        if tg is None:
+            return False
+        tier_idx = next((i for i, t in enumerate(tg.tiers)
+                         if t.name == tier_name), None)
+        if tier_idx is None:
+            return False
+        tier = tg.tiers[tier_idx]
+        items = (tier.intervals if tier.tier_class == "IntervalTier"
+                 else tier.points)
+        if not 0 <= index < len(items):
+            return False
+        if tier.tier_class == "IntervalTier":
+            xmin, xmax = items[index].xmin, items[index].xmax
+        else:
+            xmin = xmax = items[index].time
+
+        width = min(self.total_duration, max(context_s, 3 * (xmax - xmin)))
+        centre = (xmin + xmax) / 2.0
+        start = max(0.0, min(self.total_duration - width, centre - width / 2))
+        self.set_view(start, start + width)
+        self._active_tier = tier_idx
+        self._select_interval(tier_idx, centre)
+        return True
+
     def centre_view_on(self, xmin, xmax):
         """Centre the view on [*xmin*, *xmax*], keeping its width.
 
@@ -4424,7 +4501,7 @@ class SpectrogramCanvas(QWidget):
 
     def _on_scroll(self, event):
         """Mouse wheel zoom — centered on cursor position."""
-        if self.sound is None:
+        if not self.has_timeline:
             return
         _, _, time, _, _ = self._map_event_to_data(event)
         if time is None:
@@ -5520,13 +5597,13 @@ _DIALOG_FIELD_STYLE = """
     QListWidget::item:selected {
         background-color: #3a4a5a;
     }
-    QListWidget::indicator {
+    QListWidget::indicator, QTableView::indicator {
         width: 16px; height: 16px;
         border: 2px solid #8899aa;
         border-radius: 3px;
         background-color: #2a2a3a;
     }
-    QListWidget::indicator:checked {
+    QListWidget::indicator:checked, QTableView::indicator:checked {
         background-color: #6699cc;
         border-color: #88bbee;
     }
@@ -7316,6 +7393,25 @@ class _MultiSelectDropdown(QWidget):
         return self._popup.checked_keys()
 
 
+class _PlaceholderDelegate(QStyledItemDelegate):
+    """Draws an empty cell's placeholder in grey italics.
+
+    The placeholder is stored under :attr:`ROLE` and only painted, so a
+    cell that is edited starts empty rather than holding the hint.
+    """
+
+    ROLE = Qt.ItemDataRole.UserRole + 1
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        hint = index.data(self.ROLE)
+        if hint and not index.data(Qt.ItemDataRole.DisplayRole):
+            option.text = hint
+            option.font.setItalic(True)
+            option.palette.setColor(option.palette.ColorRole.Text,
+                                    QColor("#888888"))
+
+
 class _IPAChartDialog(QDialog):
     """Floating IPA / SAMPA symbol reference panel.
 
@@ -7382,12 +7478,14 @@ class _IPAChartDialog(QDialog):
     _HDR_STYLE = "color: #999; font-weight: bold; font-size: 12px;"
     _SECTION_STYLE = "font-weight: bold; font-size: 13px; color: #aaa;"
 
-    def __init__(self, main_window, parent=None):
-        super().__init__(parent)
+    def __init__(self, main_window):
+        # Owned by the main window: it floats above FormantStudio, so a
+        # click on the spectrogram does not bury it, yet other applications
+        # can still come in front of both.
+        super().__init__(main_window)
         self._main_window = main_window
         self.setWindowTitle("IPA Symbol Chart")
-        self.setWindowFlags(
-            Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowFlags(Qt.WindowType.Window)
         self.setMinimumSize(700, 480)
         self.setStyleSheet(
             "QDialog { background: #1e1e2e; }"
@@ -7750,26 +7848,50 @@ class _LabelCheckDialog(QDialog):
     }
     COLUMNS = ["Fix?", "File", "Tier", "Time", "Issue", "Current",
                "Proposed", "Detail"]
+    _PROPOSED_COL = COLUMNS.index("Proposed")
+    _NO_FIX_HINT = "(no suggestion — double-click to type)"
+    _NO_SNAP_HINT = "(cannot snap safely)"
+
+    # A TextGrid path, the issue's tier name and item index, and the folder
+    # holding the recordings: show it.
+    open_requested = pyqtSignal(str, str, int, str)
+    # Paths of the TextGrids that Apply has just rewritten.
+    files_changed = pyqtSignal(list)
 
     def __init__(self, textgrid_dir="", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Check Label Files")
         self.resize(1040, 700)
+        self.setStyleSheet(_DIALOG_FIELD_STYLE + _checked_tick_qss())
         self._issues = []
 
         layout = QVBoxLayout(self)
 
         # --- Where ---
-        dir_row = QHBoxLayout()
-        dir_row.addWidget(QLabel("TextGrid folder:"))
+        where = QGridLayout()
+        where.addWidget(QLabel("TextGrid folder:"), 0, 0)
         self._dir_edit = QLineEdit(textgrid_dir)
         self._dir_edit.setPlaceholderText("Folder of .TextGrid files to check")
         self._dir_edit.editingFinished.connect(self._rescan_tiers)
-        dir_row.addWidget(self._dir_edit, 1)
+        where.addWidget(self._dir_edit, 0, 1)
         browse = QPushButton("Browse...")
         browse.clicked.connect(self._browse)
-        dir_row.addWidget(browse)
-        layout.addLayout(dir_row)
+        where.addWidget(browse, 0, 2)
+
+        where.addWidget(QLabel("Audio folder:"), 1, 0)
+        self._audio_dir_edit = QLineEdit()
+        self._audio_dir_edit.setPlaceholderText(
+            "optional — leave empty when the recordings sit beside the "
+            "TextGrids")
+        self._audio_dir_edit.setToolTip(
+            "Where the recordings are kept, if not with the TextGrids. Used "
+            "only to open an issue together with its recording; the check "
+            "itself reads the TextGrids alone.")
+        where.addWidget(self._audio_dir_edit, 1, 1)
+        browse_audio = QPushButton("Browse...")
+        browse_audio.clicked.connect(self._browse_audio)
+        where.addWidget(browse_audio, 1, 2)
+        layout.addLayout(where)
 
         # --- What to check ---
         self._unlabelled_cb = QCheckBox("Unlabelled segments and points")
@@ -7860,6 +7982,10 @@ class _LabelCheckDialog(QDialog):
         self._table.setAlternatingRowColors(True)
         self._table.horizontalHeader().setSectionResizeMode(
             len(self.COLUMNS) - 1, QHeaderView.ResizeMode.Stretch)
+        self._table.itemChanged.connect(self._on_item_changed)
+        self._table.setItemDelegateForColumn(
+            self._PROPOSED_COL, _PlaceholderDelegate(self._table))
+        self._table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         layout.addWidget(self._table, 1)
 
         tick_row = QHBoxLayout()
@@ -7876,9 +8002,19 @@ class _LabelCheckDialog(QDialog):
         tick_kind.clicked.connect(self._tick_kind)
         tick_row.addWidget(tick_kind)
         tick_row.addStretch(1)
+        hint = QLabel("Double-click an issue to open it in the editor")
+        hint.setStyleSheet("color: #888; font-style: italic;")
+        tick_row.addWidget(hint)
         layout.addLayout(tick_row)
 
         btn_row = QHBoxLayout()
+        open_btn = QPushButton("Open in Editor")
+        open_btn.setToolTip(
+            "Open the selected issue's recording and TextGrid in the main "
+            "window, zoomed to the issue. Double-clicking a row does the "
+            "same. This window stays open.")
+        open_btn.clicked.connect(self._open_selected)
+        btn_row.addWidget(open_btn)
         btn_row.addStretch(1)
         self._apply_btn = QPushButton("Apply Ticked Fixes")
         self._apply_btn.setEnabled(False)
@@ -7905,12 +8041,25 @@ class _LabelCheckDialog(QDialog):
         row.addWidget(widget)
         return holder
 
-    def _browse(self):
+    def _pick_folder(self, edit, title):
+        """Let the user choose a folder for *edit*; True when they did."""
         d = QFileDialog.getExistingDirectory(
-            self, "Folder of TextGrid files", self._dir_edit.text())
+            self, title, edit.text() or self._dir_edit.text())
         if d:
-            self._dir_edit.setText(d)
+            edit.setText(d)
+        return bool(d)
+
+    def _browse(self):
+        if self._pick_folder(self._dir_edit, "Folder of TextGrid files"):
             self._rescan_tiers()
+
+    def _browse_audio(self):
+        self._pick_folder(self._audio_dir_edit, "Folder of recordings")
+
+    def audio_dir(self):
+        """Where the recordings are: the audio folder, else the TextGrids'."""
+        return (self._audio_dir_edit.text().strip()
+                or self._dir_edit.text().strip())
 
     def _rescan_tiers(self):
         """Offer the tiers this corpus actually has.
@@ -8056,34 +8205,41 @@ class _LabelCheckDialog(QDialog):
         """Fill the table from *issues*, ticking nothing by default.
 
         Every fix is a change to the user's annotation, so each one is opted
-        into rather than out of; rows carrying no proposal are reported but
-        cannot be ticked at all.
+        into rather than out of.  A label's proposal can be overwritten, or
+        typed where none was found; a boundary's cannot, since a time typed
+        by hand is no repair.  Rows with nothing proposed cannot be ticked.
         """
         self._issues = list(issues)
+        self._table.blockSignals(True)
         self._table.setSortingEnabled(False)
         self._table.setRowCount(len(self._issues))
         for row, issue in enumerate(self._issues):
             tick = QTableWidgetItem()
-            if issue.fixable:
-                tick.setFlags(Qt.ItemFlag.ItemIsUserCheckable
-                              | Qt.ItemFlag.ItemIsEnabled)
-                tick.setCheckState(Qt.CheckState.Unchecked)
-            else:
-                tick.setFlags(Qt.ItemFlag.NoItemFlags)
             tick.setData(Qt.ItemDataRole.UserRole, row)
+            self._set_fixable(tick, issue.fixable)
             self._table.setItem(row, 0, tick)
 
+            editable = issue.kind != label_check.BOUNDARY_DRIFT
             cells = [issue.file, issue.tier, f"{issue.time:.4f}",
                      self.ISSUE_LABELS.get(issue.kind, issue.kind),
-                     issue.current or "(blank)",
-                     issue.proposed or "—", issue.detail]
+                     issue.current or "(blank)", issue.proposed,
+                     issue.detail]
             for col, text in enumerate(cells, start=1):
                 item = QTableWidgetItem(text)
-                item.setFlags(Qt.ItemFlag.ItemIsEnabled
-                              | Qt.ItemFlag.ItemIsSelectable)
+                flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                if col == self._PROPOSED_COL:
+                    item.setData(_PlaceholderDelegate.ROLE,
+                                 self._NO_FIX_HINT if editable
+                                 else self._NO_SNAP_HINT)
+                    if editable:
+                        flags |= Qt.ItemFlag.ItemIsEditable
+                        item.setData(Qt.ItemDataRole.UserRole, row)
+                        item.setToolTip("Double-click to type your own fix")
+                item.setFlags(flags)
                 self._table.setItem(row, col, item)
         self._table.setSortingEnabled(True)
         self._table.resizeColumnsToContents()
+        self._table.blockSignals(False)
 
         kinds = []
         for issue in self._issues:
@@ -8097,6 +8253,34 @@ class _LabelCheckDialog(QDialog):
     # ------------------------------------------------------------------
     # Ticking
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _set_fixable(tick, fixable, ticked=False):
+        """Give the row's tick box, or take it away when there is no fix."""
+        if fixable:
+            tick.setFlags(Qt.ItemFlag.ItemIsUserCheckable
+                          | Qt.ItemFlag.ItemIsEnabled)
+            tick.setCheckState(Qt.CheckState.Checked if ticked
+                               else Qt.CheckState.Unchecked)
+        else:
+            tick.setFlags(Qt.ItemFlag.NoItemFlags)
+            tick.setData(Qt.ItemDataRole.CheckStateRole, None)
+
+    def _on_item_changed(self, item):
+        """A typed fix replaces the proposal, and ticks the row.
+
+        Typing a repair is as clear an instruction as ticking one, so the
+        row is ticked for it; clearing the cell withdraws the fix.
+        """
+        if item.column() != self._PROPOSED_COL:
+            return
+        index = item.data(Qt.ItemDataRole.UserRole)
+        text = item.text().strip()
+        self._issues[index] = dataclasses.replace(
+            self._issues[index], proposed=text)
+        self._set_fixable(self._table.item(item.row(), 0), bool(text),
+                          ticked=True)
+        self._apply_btn.setEnabled(any(i.fixable for i in self._issues))
 
     def _rows(self):
         """``(row_index, issue, tick_item)`` for every row that can be ticked."""
@@ -8189,10 +8373,47 @@ class _LabelCheckDialog(QDialog):
         else:
             QMessageBox.information(self, "Fixes Applied", report)
         self._summary.setText(lines[0])
+        if changed:
+            self.files_changed.emit([paths[n] for n in changed])
 
         # Re-check, so the table shows what the files now contain rather than
         # what they contained before the fixes landed.
         self._run()
+
+    # ------------------------------------------------------------------
+    # Opening in the editor
+    # ------------------------------------------------------------------
+
+    def _on_cell_double_clicked(self, row, column):
+        """Open the row's issue, unless the cell is an editable Proposed
+        cell, where a double-click starts typing a fix instead."""
+        item = self._table.item(row, column)
+        if (column == self._PROPOSED_COL and item is not None
+                and item.flags() & Qt.ItemFlag.ItemIsEditable):
+            return
+        self._open_row(row)
+
+    def _open_selected(self):
+        row = self._table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Nothing Selected",
+                                    "Select an issue in the table first.")
+            return
+        self._open_row(row)
+
+    def _open_row(self, row):
+        """Ask the main window to show the issue on *row*."""
+        issue = self._issues[self._table.item(row, 0).data(
+            Qt.ItemDataRole.UserRole)]
+        path = label_check.paths_by_name(
+            self._dir_edit.text().strip()).get(issue.file)
+        if path is None:
+            QMessageBox.warning(
+                self, "File Not Found",
+                f"{issue.file} is no longer in the folder.")
+            return
+        self.open_requested.emit(path, issue.tier, issue.index,
+                                 self.audio_dir())
 
 
 class _CategorisationPage(QWizardPage):
@@ -8550,6 +8771,14 @@ class MainWindow(QMainWindow):
         self._formants_dirty = False
         self._textgrid_dirty = False
 
+        # Tool windows, created on first use and kept, so reopening one
+        # finds it as it was left.
+        self._symbol_chart_dialog = None
+        self._label_check_dialog = None
+        # Where a recording was last opened for a TextGrid, so issues in a
+        # corpus that keeps its audio apart find their recordings there.
+        self._recordings_dir = ""
+
         self._setup_ui()
         self._setup_menu()
         self._connect_signals()
@@ -8668,7 +8897,7 @@ class MainWindow(QMainWindow):
         # File menu
         file_menu = menubar.addMenu("&File")
 
-        open_action = QAction("&Open WAV...", self)
+        open_action = QAction("&Open Audio...", self)
         open_action.setShortcut(QKeySequence("Ctrl+Shift+O"))
         open_action.triggered.connect(self.open_file)
         file_menu.addAction(open_action)
@@ -8679,6 +8908,13 @@ class MainWindow(QMainWindow):
         load_tg_action.setShortcut(QKeySequence("Ctrl+T"))
         load_tg_action.triggered.connect(lambda: self.load_textgrid())
         file_menu.addAction(load_tg_action)
+
+        attach_action = QAction("Open &Recording for TextGrid...", self)
+        attach_action.setStatusTip(
+            "Add the recording to a TextGrid opened on its own, keeping any "
+            "edits made to it")
+        attach_action.triggered.connect(self._choose_recording_for_textgrid)
+        file_menu.addAction(attach_action)
 
         load_fmt_action = QAction("&Load Formants...", self)
         load_fmt_action.setShortcut(QKeySequence("Ctrl+L"))
@@ -8795,7 +9031,7 @@ class MainWindow(QMainWindow):
 
     def _menu_action(self, fn):
         """Run fn then re-render + update scrollbar (for View menu actions)."""
-        if self.canvas.sound is not None:
+        if self.canvas.has_timeline:
             fn()
             self.canvas.render()
             self._update_scrollbar()
@@ -8803,7 +9039,8 @@ class MainWindow(QMainWindow):
     def _menu_zoom_to_selection(self):
         """Zoom to selection triggered from View menu."""
         c = self.canvas
-        if c.sound is not None and c._selection_start is not None and c._selection_end is not None:
+        if (c.has_timeline and c._selection_start is not None
+                and c._selection_end is not None):
             sel_width = c._selection_end - c._selection_start
             pad = sel_width * 0.05
             c.set_view(c._selection_start - pad, c._selection_end + pad)
@@ -8936,7 +9173,7 @@ class MainWindow(QMainWindow):
         mods = event.modifiers()
         ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
 
-        if ctrl and self.canvas.sound is not None:
+        if ctrl and self.canvas.has_timeline:
             if key == Qt.Key.Key_I:
                 # Zoom in
                 self.canvas.zoom(1.0 / ZOOM_FACTOR)
@@ -9173,73 +9410,169 @@ class MainWindow(QMainWindow):
             self, "Open Audio File", "",
             "Audio Files (*.wav *.WAV *.aiff *.AIFF *.mp3);;All Files (*)"
         )
-        if not filepath:
-            return
+        if filepath:
+            self.open_audio(filepath)
 
-        self._filepath = filepath
-        self.canvas._filepath = filepath
-        self._textgrid_path = None
-        self._formants_path = None
-        self._formants_dirty = False
-        self._textgrid_dirty = False
-        # Discard any TextGrid from the previously opened file — it does not
-        # match the new audio.  If the user later skips the TextGrid prompt,
-        # no stale tier panes must remain.
-        self.canvas.textgrid_data = None
-        self.canvas.hidden_tiers = set()
-        self.canvas._active_tier = None
-        self.canvas._clear_selection()
-        self.canvas._click_time = None
-        self.canvas._hover_time = None
-        self._setup_tier_checkboxes()
-        self.status.showMessage(f"Loading {os.path.basename(filepath)}...")
-        QApplication.processEvents()
+    def open_audio(self, filepath, textgrid_path=None):
+        """Open the recording at *filepath*, replacing whatever is open.
 
+        Its TextGrid is *textgrid_path* when given; otherwise one with the
+        same base name beside the recording, or the user is asked.  Unsaved
+        work is the caller's to protect.  Returns whether the recording
+        loaded.
+        """
+        # The previous file's TextGrid does not match the new audio; if the
+        # user later skips the TextGrid prompt, no stale tiers must remain.
+        self._close_annotation()
         try:
-            self.canvas.load_sound(filepath)
-            self._run_formant_analysis()
-            self._update_scrollbar()
-            self.canvas.render()
-            self.setWindowTitle(
-                f"{self._app_title}  —  {os.path.basename(filepath)}"
-            )
-            self.status.showMessage(
-                f"Loaded: {os.path.basename(filepath)} "
-                f"({self.canvas.sound.duration:.2f}s, "
-                f"{int(self.canvas.sound.sampling_frequency)} Hz)"
-            )
-
-            # Check for existing .formants file
-            fmt_path = os.path.splitext(filepath)[0] + ".formants"
-            if os.path.exists(fmt_path):
-                reply = QMessageBox.question(
-                    self, "Load saved formants?",
-                    f"Found saved formant data:\n{os.path.basename(fmt_path)}\n\nLoad it?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                if reply == QMessageBox.StandardButton.Yes:
-                    self.canvas.formant_data = FormantData.load(fmt_path)
-                    self._formants_path = fmt_path
-                    self.canvas.render()
-                    self.status.showMessage(
-                        f"Loaded formants from {os.path.basename(fmt_path)}"
-                    )
-
-            # Auto-detect TextGrid with same basename
-            base = os.path.splitext(filepath)[0]
-            tg_found = False
-            for ext in (".TextGrid", ".textgrid"):
-                tg_path = base + ext
-                if os.path.exists(tg_path):
-                    self.load_textgrid(tg_path)
-                    tg_found = True
-                    break
-            if not tg_found:
-                self._prompt_textgrid_choice()
-
+            self._load_recording(filepath)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load file:\n{e}")
             self.status.showMessage("Error loading file")
+            return False
+
+        if textgrid_path is None:
+            base = os.path.splitext(filepath)[0]
+            textgrid_path = next(
+                (base + ext for ext in (".TextGrid", ".textgrid")
+                 if os.path.exists(base + ext)), None)
+        if textgrid_path is not None:
+            self.load_textgrid(textgrid_path)
+        else:
+            self._prompt_textgrid_choice()
+        return True
+
+    def open_textgrid_alone(self, path):
+        """Open the TextGrid at *path* with no recording, closing any open.
+
+        The annotation can be read, navigated and relabelled; what needs the
+        sound -- the spectrogram, formants, playback -- waits until a
+        recording is attached (:meth:`attach_recording`).  Unsaved work is
+        the caller's to protect.  Returns whether the TextGrid loaded.
+        """
+        try:
+            tg = TextGrid.from_file(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load TextGrid:\n{e}")
+            return False
+        self._close_annotation()
+        c = self.canvas
+        c.sound = None
+        c.spectrogram_data = None
+        c.formant_data = None
+        self._filepath = None
+        c._filepath = path
+        self._formants_path = None
+        self._formants_dirty = False
+        c.total_duration = tg.xmax
+        c.view_start, c.view_end = tg.xmin, tg.xmax
+        self._apply_textgrid(tg, path, dirty=False)
+        self._update_scrollbar()
+        self.setWindowTitle(
+            f"{self._app_title}  \u2014  {os.path.basename(path)} (no recording)")
+        self.status.showMessage(
+            f"TextGrid: {os.path.basename(path)} ({self._describe_tiers(tg)}) "
+            "\u2014 no recording open")
+        return True
+
+    def attach_recording(self, filepath):
+        """Open *filepath* as the recording for the TextGrid already open.
+
+        Unlike :meth:`open_audio` the TextGrid stays, unsaved edits and all,
+        and so does the view.  Returns whether the recording loaded.
+        """
+        c = self.canvas
+        view = (c.view_start, c.view_end)
+        try:
+            self._load_recording(filepath)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load file:\n{e}")
+            self.status.showMessage("Error loading file")
+            return False
+        if c.textgrid_data is not None:
+            self._fit_textgrid_to_audio(c.textgrid_data, self._textgrid_path)
+        start = max(0.0, min(view[0], c.total_duration))
+        end = min(c.total_duration, view[1])
+        if end > start:
+            c.set_view(start, end)
+        c.render()
+        self._update_scrollbar()
+        return True
+
+    def _choose_recording_for_textgrid(self):
+        """File menu: pick the recording that belongs to the open TextGrid."""
+        if self.canvas.textgrid_data is None:
+            QMessageBox.information(
+                self, "No TextGrid Open",
+                "Open a TextGrid first; this adds its recording.")
+            return
+        start = self._recordings_dir or (
+            os.path.dirname(self._textgrid_path) if self._textgrid_path
+            else "")
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Open Recording for TextGrid", start,
+            "Audio Files (*.wav *.WAV *.aiff *.AIFF *.mp3);;All Files (*)")
+        if not filepath:
+            return
+        self._recordings_dir = os.path.dirname(filepath)
+        self.attach_recording(filepath)
+
+    def _close_annotation(self):
+        """Drop the open TextGrid and everything selected on it."""
+        self._textgrid_path = None
+        self._textgrid_dirty = False
+        c = self.canvas
+        c.textgrid_data = None
+        c.hidden_tiers = set()
+        c._active_tier = None
+        c._clear_selection()
+        c._click_time = None
+        c._hover_time = None
+        self._setup_tier_checkboxes()
+
+    def _load_recording(self, filepath):
+        """Load *filepath* as the recording, leaving the TextGrid alone.
+
+        Raises whatever reading the sound raises; the caller reports it.
+        """
+        self._filepath = filepath
+        self.canvas._filepath = filepath
+        self._formants_path = None
+        self._formants_dirty = False
+        self.status.showMessage(f"Loading {os.path.basename(filepath)}...")
+        QApplication.processEvents()
+
+        self.canvas.load_sound(filepath)
+        self._run_formant_analysis()
+        self._update_scrollbar()
+        self.canvas.render()
+        self.setWindowTitle(
+            f"{self._app_title}  \u2014  {os.path.basename(filepath)}"
+        )
+        self.status.showMessage(
+            f"Loaded: {os.path.basename(filepath)} "
+            f"({self.canvas.sound.duration:.2f}s, "
+            f"{int(self.canvas.sound.sampling_frequency)} Hz)"
+        )
+        self._offer_saved_formants(filepath)
+
+    def _offer_saved_formants(self, filepath):
+        """Offer the .formants file saved beside *filepath*, if there is one."""
+        fmt_path = os.path.splitext(filepath)[0] + ".formants"
+        if not os.path.exists(fmt_path):
+            return
+        reply = QMessageBox.question(
+            self, "Load saved formants?",
+            f"Found saved formant data:\n{os.path.basename(fmt_path)}\n\nLoad it?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.canvas.formant_data = FormantData.load(fmt_path)
+            self._formants_path = fmt_path
+            self.canvas.render()
+            self.status.showMessage(
+                f"Loaded formants from {os.path.basename(fmt_path)}"
+            )
 
     def save_formants(self):
         if self.canvas.formant_data is None:
@@ -9348,7 +9681,11 @@ class MainWindow(QMainWindow):
             self.canvas.render()
 
     def load_textgrid(self, filepath=None):
-        """Load a TextGrid file, optionally from a given path or via dialog."""
+        """Load a TextGrid file, optionally from a given path or via dialog.
+
+        With no recording open the TextGrid opens on its own, its own span
+        giving the time axis.
+        """
         if filepath is None:
             start_dir = os.path.dirname(self._filepath) if self._filepath else ""
             filepath, _ = QFileDialog.getOpenFileName(
@@ -9357,6 +9694,9 @@ class MainWindow(QMainWindow):
             )
             if not filepath:
                 return
+        if self.canvas.sound is None:
+            self.open_textgrid_alone(filepath)
+            return
 
         try:
             tg = TextGrid.from_file(filepath)
@@ -9454,7 +9794,7 @@ class MainWindow(QMainWindow):
 
     def _show_symbol_chart(self):
         """Show (or raise) the floating IPA / SAMPA symbol chart."""
-        if not hasattr(self, '_symbol_chart_dialog') or self._symbol_chart_dialog is None:
+        if self._symbol_chart_dialog is None:
             self._symbol_chart_dialog = _IPAChartDialog(self)
         self._symbol_chart_dialog.show()
         self._symbol_chart_dialog.raise_()
@@ -9475,12 +9815,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "No valid tiers selected.")
             return
 
-        # Count audio files
-        audio_exts = {".wav", ".aiff", ".mp3"}
-        audio_files = [
-            f for f in os.listdir(wizard.audio_dir)
-            if os.path.splitext(f)[1].lower() in audio_exts
-        ]
+        audio_files = audio_files_in(wizard.audio_dir)
         if not audio_files:
             QMessageBox.warning(
                 self, "Error",
@@ -10067,9 +10402,91 @@ class MainWindow(QMainWindow):
         Opens on the folder of the loaded TextGrid when there is one, since
         that is almost always the corpus about to be exported.
         """
-        start = (os.path.dirname(self._textgrid_path)
-                 if self._textgrid_path else "")
-        _LabelCheckDialog(start, parent=self).exec()
+        if self._label_check_dialog is None:
+            start = (os.path.dirname(self._textgrid_path)
+                     if self._textgrid_path else "")
+            self._label_check_dialog = _LabelCheckDialog(start, parent=self)
+            self._label_check_dialog.open_requested.connect(self._open_issue)
+            self._label_check_dialog.files_changed.connect(
+                self._on_files_fixed)
+        self._label_check_dialog.show()
+        self._label_check_dialog.raise_()
+        self._label_check_dialog.activateWindow()
+
+    def _open_issue(self, textgrid_path, tier_name, index, audio_dir=""):
+        """Show a Label Check issue, opening its file if need be.
+
+        The recording comes too when it can be found (see :meth:`_audio_for`)
+        and otherwise the TextGrid opens alone, with the recording one menu
+        item away.  The file already open is navigated rather than reloaded,
+        so edits in progress survive moving between its issues -- though a
+        recording found for it since is attached.
+        """
+        if self._is_open_textgrid(textgrid_path):
+            if self.canvas.sound is None:
+                audio = self._audio_for(textgrid_path, audio_dir)
+                if audio:
+                    self.attach_recording(audio)
+        else:
+            if not self._check_unsaved_changes():
+                return
+            audio = self._audio_for(textgrid_path, audio_dir)
+            opened = (self.open_audio(audio, textgrid_path=textgrid_path)
+                      if audio else self.open_textgrid_alone(textgrid_path))
+            if not opened:
+                return
+        if not self.canvas.show_item(tier_name, index):
+            self.status.showMessage(
+                f"Could not find item {index + 1} on tier '{tier_name}': "
+                "the file may have changed since the check ran")
+            return
+        self.canvas.render()
+        self._update_scrollbar()
+        self.raise_()
+        self.activateWindow()
+        self.canvas.focus_label_for_selection(self.canvas._active_tier)
+        if self.canvas.sound is None:
+            self.status.showMessage(
+                "No recording found for this TextGrid \u2014 "
+                "File \u2192 Open Recording for TextGrid\u2026 to add it")
+
+    def _is_open_textgrid(self, path):
+        """Whether *path* is the TextGrid open now."""
+        if not self._textgrid_path:
+            return False
+        same = os.path.normcase(os.path.abspath(self._textgrid_path))
+        return same == os.path.normcase(os.path.abspath(path))
+
+    def _audio_for(self, textgrid_path, audio_dir=""):
+        """The recording for *textgrid_path*, or None when it is not found.
+
+        Looked for in *audio_dir* (the folder Label Check was told holds the
+        recordings), then beside the TextGrid, then in the folder a
+        recording was last opened from for a TextGrid -- so a corpus that
+        keeps its audio apart needs pointing at only once.
+        """
+        base = os.path.splitext(os.path.basename(textgrid_path))[0]
+        for folder in (audio_dir, os.path.dirname(textgrid_path),
+                       self._recordings_dir):
+            found = folder and find_audio(folder, base)
+            if found:
+                return found
+        return None
+
+    def _on_files_fixed(self, paths):
+        """Keep the editor in step with fixes written by Label Check."""
+        if not any(self._is_open_textgrid(p) for p in paths):
+            return
+        if self._textgrid_dirty:
+            QMessageBox.warning(
+                self, "TextGrid Changed on Disk",
+                "Label Check has just fixed the TextGrid that is open here, "
+                "but this window also has unsaved edits to it. Saving now "
+                "would overwrite those fixes; reload it (Load TextGrid) to "
+                "pick them up, at the cost of the unsaved edits.")
+            return
+        self.load_textgrid(self._textgrid_path)
+        self.status.showMessage("Reloaded the TextGrid with Label Check's fixes")
 
     def _align_template(self, template, tier_name, duration):
         """Warp *template* onto the open recording using its acoustics.
@@ -10315,7 +10732,7 @@ class MainWindow(QMainWindow):
     def _scroll_backward(self):
         """Arrow button: scroll backward by 2/3 of visible window."""
         c = self.canvas
-        if c.sound is None:
+        if not c.has_timeline:
             return
         shift = c.view_width * 2 / 3
         new_start = max(0, c.view_start - shift)
@@ -10326,7 +10743,7 @@ class MainWindow(QMainWindow):
     def _scroll_forward(self):
         """Arrow button: scroll forward by 2/3 of visible window."""
         c = self.canvas
-        if c.sound is None:
+        if not c.has_timeline:
             return
         shift = c.view_width * 2 / 3
         new_start = min(c.total_duration - c.view_width, c.view_start + shift)
@@ -10522,7 +10939,7 @@ def main():
         )
 
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
+    _apply_app_theme(app)
 
     # Application icon (title bar + taskbar)
     from PyQt6.QtGui import QIcon
@@ -10533,7 +10950,14 @@ def main():
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 
-    # Dark palette
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+def _apply_app_theme(app):
+    """Give *app* the Fusion style and the dark palette every window uses."""
+    app.setStyle("Fusion")
     from PyQt6.QtGui import QPalette
     palette = QPalette()
     palette.setColor(QPalette.ColorRole.Window, QColor("#1e1e2e"))
@@ -10546,10 +10970,6 @@ def main():
     palette.setColor(QPalette.ColorRole.Highlight, QColor("#6699cc"))
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
     app.setPalette(palette)
-
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

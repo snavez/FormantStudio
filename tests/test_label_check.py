@@ -140,6 +140,53 @@ def test_a_label_close_to_nothing_gets_no_proposal():
     assert not issues[0].fixable
 
 
+def _chart_accept(label):
+    """A toy chart policy: base symbols, optionally with one diacritic."""
+    base, sep, mark = label.partition("_")
+    return base in {"p", "t", "a"} and (not sep or mark in ("h", "0"))
+
+
+def test_a_doubled_key_is_repaired_by_deleting_it():
+    """The reported case: p__h is p_h with the underscore struck twice."""
+    near = lc.suggest_symbols("p__h", _chart_accept, {"p", "t", "a"})
+    assert near == ["p_h"]
+
+
+def test_repairs_reach_composed_labels_no_candidate_lists():
+    """p_h is base plus diacritic; no candidate list holds it whole."""
+    assert "p_h" not in {"p", "t", "a"}
+    near = lc.suggest_symbols("ph_", _chart_accept, {"p", "t", "a"})
+    assert near[0] == "p_h"
+
+
+def test_deletions_are_preferred_to_substitutions():
+    assert lc.suggest_symbols("tt", _chart_accept, {"p", "t", "a"}) == ["t"]
+
+
+def test_suggestions_never_propose_annotation_syntax():
+    def accept_all(_label):
+        return True
+    assert "-" not in lc.suggest_symbols("-x", accept_all, {"-", "x"})
+
+
+def test_whole_symbol_matching_is_the_fallback():
+    """No single slip explains it, but one candidate is still close."""
+    near = lc.suggest_symbols("abcdef", {"abxdey"}.__contains__, {"abxdey"})
+    assert near == ["abxdey"]
+
+
+def test_a_label_far_from_everything_gets_no_suggestion():
+    assert lc.suggest_symbols("qqq", {"abc"}.__contains__, {"abc"}) == []
+
+
+def test_alternatives_are_named_in_the_detail():
+    tier = _itier("phones", [(0.0, DUR, "tp")])
+    issues = lc.check_symbols(_grid(tier), "f", ["phones"], _chart_accept,
+                              {"p", "t", "a"}, lc.UNKNOWN_SYMBOL)
+    assert issues[0].proposed in ("t", "p")
+    assert "or perhaps" in issues[0].detail
+
+
 def test_pause_markers_and_arrows_are_syntax_not_symbols():
     tier = _itier("phones", [(0.0, 0.5, "-"), (0.5, 1.0, ">"),
                              (1.0, 1.5, "<"), (1.5, DUR, "")])

@@ -177,6 +177,52 @@ def test_repopulating_replaces_the_previous_results(dlg):
     assert dlg._table.rowCount() == 1
 
 
+def _proposed_item(dlg, row):
+    return dlg._table.item(row, dlg._PROPOSED_COL)
+
+
+def test_typing_a_fix_makes_the_row_tickable_and_ticks_it(dlg):
+    """A label with no suggestion can still be repaired from the table."""
+    dlg._populate(_issues(fixable=False))
+    _proposed_item(dlg, 1).setText("t")
+    accepted = dlg.accepted_issues()
+    assert [(i.current, i.proposed) for i in accepted] == [("θ", "t")]
+    assert dlg._apply_btn.isEnabled()
+
+
+def test_typing_over_a_suggestion_replaces_it(dlg):
+    dlg._populate(_issues())
+    _proposed_item(dlg, 1).setText("s")
+    assert dlg._issues[1].proposed == "s"
+
+
+def test_clearing_a_typed_fix_withdraws_it(dlg):
+    dlg._populate(_issues(fixable=False))
+    _proposed_item(dlg, 1).setText("t")
+    _proposed_item(dlg, 1).setText("  ")
+    assert dlg.accepted_issues() == []
+    tick = dlg._table.item(1, 0)
+    assert not tick.flags() & Qt.ItemFlag.ItemIsUserCheckable
+
+
+def test_a_boundary_proposal_cannot_be_typed_over(dlg):
+    """A hand-typed time is no repair; only the snap is offered."""
+    dlg._populate([lc.Issue("one", lc.BOUNDARY_DRIFT, "allo", 1, 0.4968,
+                            "0.4968", "", "crosses a neighbour")])
+    assert not _proposed_item(dlg, 0).flags() & Qt.ItemFlag.ItemIsEditable
+
+
+def test_populating_does_not_count_as_typing(dlg):
+    """Filling the table must not tick suggestions on the user's behalf."""
+    dlg._populate(_issues())
+    assert dlg.accepted_issues() == []
+
+
+def test_the_table_tick_boxes_are_styled(dlg):
+    """Unstyled, they draw dark grey on the dark theme and vanish."""
+    assert "QTableView::indicator" in dlg.styleSheet()
+
+
 # ---------------------------------------------------------------------------
 # End to end, against real files
 # ---------------------------------------------------------------------------

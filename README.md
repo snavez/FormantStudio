@@ -85,7 +85,7 @@ python formant_editor.py
 |----------|--------|
 | Ctrl+← / Ctrl+→ | Previous / next interval on the active tier |
 | Ctrl+↑ / Ctrl+↓ | Move between tiers, carrying the selection |
-| Ctrl+Shift+O | Open WAV file |
+| Ctrl+Shift+O | Open audio file (WAV, AIFF, MP3) |
 | Ctrl+S | Save formants |
 | Ctrl+Shift+S | Save TextGrid |
 | Ctrl+Alt+S | Save TextGrid As... |
