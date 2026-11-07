@@ -43,3 +43,29 @@ analytical upgrades.
      involves vowel quality. Vowels differ in intrinsic intensity (low vowels are a few dB louder
      than high ones), so "release minus following vowel" builds a vowel-height effect into the
      measure.
+
+3. Opening files
+
+1. [ ] **Load TextGrid over an open recording should offer to change the recording too.** Today
+   File → Load TextGrid swaps the TextGrid and leaves the recording and formants untouched, which
+   is right when deliberately pairing a TextGrid with some other recording, but surprising
+   otherwise.
+   - *Proposal (from the user, 2026-11-07):* when a recording is open and the chosen TextGrid
+     does not share its base name, ask: open the name-matched recording from the TextGrid's
+     folder if there is one, choose a recording, keep the current one, or close it (TextGrid
+     alone, see `open_textgrid_alone`). Formants follow the recording (`_offer_saved_formants`).
+   - *Watch for:* unsaved formant or TextGrid edits must still go through
+     `_check_unsaved_changes`; keep the existing behaviour one click away for the deliberate
+     mismatch.
+
+4. Tools
+
+1. [ ] **Forced alignment as a FormantStudio tool.** The user has a working aligner built for one
+   workflow (`D:\Research\AIPBC\LabelledData\aligner\`, launched by `Textgrid Tool.bat` there).
+   - *Goal:* make it general — specify tiers by name and type, enter the text for each tier, and
+     align a batch of files in which every speaker repeats the same phrase or list in the same
+     order.
+   - *Related, already in FormantStudio:* `phone_aligner.py` (phone-class aligner, 12.5 ms
+     median boundary error) and template alignment (`_align_template`, pause-anchored, measured
+     11× better than linear stretching). Survey the external aligner against these before
+     designing, so the tool reuses rather than duplicates them.

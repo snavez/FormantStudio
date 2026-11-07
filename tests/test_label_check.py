@@ -88,7 +88,7 @@ def test_an_entirely_blank_tier_reports_nothing():
 
 def test_the_proposed_fix_for_a_hole_is_the_pause_marker():
     issues = lc.check_unlabelled(_grid(_holey()), "f", ["phones"])
-    assert issues[0].proposed == lc.PAUSE_MARKER
+    assert issues[0].proposed == "-"
     assert issues[0].fixable
 
 
@@ -112,8 +112,8 @@ MAORI = {"p", "t", "k", "m", "n", "ŋ", "f", "h", "r", "w",
 
 
 def _symbols(tg, tiers=("phones",), inventory=MAORI):
-    return lc.check_symbols(tg, "f", list(tiers), inventory.__contains__,
-                            inventory, lc.NOT_IN_INVENTORY)
+    policy = lc.LabelPolicy.only(inventory, lc.NOT_IN_INVENTORY)
+    return lc.check_labels(tg, "f", {t: policy for t in tiers})
 
 
 def test_a_symbol_outside_the_inventory_is_flagged():
@@ -181,8 +181,9 @@ def test_a_label_far_from_everything_gets_no_suggestion():
 
 def test_alternatives_are_named_in_the_detail():
     tier = _itier("phones", [(0.0, DUR, "tp")])
-    issues = lc.check_symbols(_grid(tier), "f", ["phones"], _chart_accept,
-                              {"p", "t", "a"}, lc.UNKNOWN_SYMBOL)
+    policy = lc.LabelPolicy(_chart_accept, frozenset({"p", "t", "a"}),
+                            lc.UNKNOWN_SYMBOL)
+    issues = lc.check_labels(_grid(tier), "f", {"phones": policy})
     assert issues[0].proposed in ("t", "p")
     assert "or perhaps" in issues[0].detail
 
@@ -196,8 +197,8 @@ def test_pause_markers_and_arrows_are_syntax_not_symbols():
 def test_the_chart_mode_reports_its_own_kind():
     chart = {"t", "a", "s"}
     tier = _itier("phones", [(0.0, DUR, "θ")])
-    issues = lc.check_symbols(_grid(tier), "f", ["phones"],
-                              chart.__contains__, chart, lc.UNKNOWN_SYMBOL)
+    issues = lc.check_labels(_grid(tier), "f", {
+        "phones": lc.LabelPolicy.only(chart, lc.UNKNOWN_SYMBOL)})
     assert issues[0].kind == lc.UNKNOWN_SYMBOL
     assert "recognised" in issues[0].detail
 
@@ -298,7 +299,7 @@ def test_a_label_fix_is_written_to_the_interval():
     issues = lc.check_unlabelled(tg, "f", ["phones"])
     applied, skipped = lc.apply_fixes(tg, issues)
     assert (applied, skipped) == (1, 0)
-    assert tg.tiers[0].intervals[2].text == lc.PAUSE_MARKER
+    assert tg.tiers[0].intervals[2].text == "-"
 
 
 def test_a_boundary_fix_moves_both_sides_of_the_seam():
@@ -391,9 +392,9 @@ def test_tier_names_are_unioned_across_the_corpus(tmp_path):
                      "targets": "TextTier"}
 
 
-def test_the_symbol_check_needs_something_to_validate_against(corpus):
-    """Naming tiers is not enough; with no policy there is nothing to say."""
-    opts = lc.CheckOptions(symbol_tiers=("phones",))
+def test_a_tier_without_a_policy_is_not_judged(corpus):
+    """Only the tiers given a rule have their labels checked."""
+    opts = lc.CheckOptions(label_policies={"words": lc.LabelPolicy.only({"x"})})
     issues, _ = lc.check_directory(str(corpus), opts, TextGrid.from_file)
     assert issues == []
 
@@ -439,7 +440,7 @@ def test_the_fix_survives_the_round_trip_through_the_file(tmp_path):
     lc.save_with_backup(tg, path)
 
     reloaded = TextGrid.from_file(path)
-    assert reloaded.tiers[0].intervals[2].text == lc.PAUSE_MARKER
+    assert reloaded.tiers[0].intervals[2].text == "-"
     assert lc.check_unlabelled(reloaded, "g", ["phones"]) == []
 
 
@@ -468,3 +469,89 @@ def test_names_map_back_to_their_files_whatever_the_extension_case(tmp_path):
     found = lc.paths_by_name(str(tmp_path))
     assert set(found) == {"upper", "lower"}
     assert found["lower"].endswith(".textgrid")
+
+
+# ---------------------------------------------------------------------------
+# The corpus's own non-speech labels
+# ---------------------------------------------------------------------------
+
+NOISY = ("<p:>", "<noise>", "<speech noise>")
+
+
+def test_configured_non_speech_labels_are_not_symbols():
+    tier = _itier("phones", [(0.0, 0.5, "<noise>"), (0.5, 1.0, "a"),
+                             (1.0, DUR, "<speech noise>")])
+    issues = lc.check_labels(_grid(tier), "f", {
+        "phones": lc.LabelPolicy.only(MAORI, lc.NOT_IN_INVENTORY)}, NOISY)
+    assert issues == []
+
+
+def test_a_label_off_the_list_is_still_checked():
+    """The dash is only the default; a corpus that drops it validates it."""
+    tier = _itier("phones", [(0.0, 1.0, "-"), (1.0, DUR, "a")])
+    issues = lc.check_labels(_grid(tier), "f", {
+        "phones": lc.LabelPolicy.only(MAORI, lc.NOT_IN_INVENTORY)}, NOISY)
+    assert [i.current for i in issues] == ["-"]
+
+
+def test_a_hole_is_offered_the_corpus_pause_label():
+    issues = lc.check_unlabelled(_grid(_holey()), "f", ["phones"], NOISY)
+    assert issues[0].proposed == "<p:>"
+
+
+def test_with_no_non_speech_labels_a_hole_gets_no_proposal():
+    issues = lc.check_unlabelled(_grid(_holey()), "f", ["phones"], ())
+    assert issues and not issues[0].fixable
+
+
+def test_a_non_speech_label_is_never_suggested_as_a_repair():
+    candidates = {"<p:>", "p", "a"}
+    near = lc.suggest_symbols("<p:", candidates.__contains__, candidates,
+                              NOISY)
+    assert "<p:>" not in near
+
+
+def test_the_options_carry_the_list_through_a_whole_check():
+    tier = _itier("phones", [(0.0, 0.4, "a"), (0.4, 0.8, ""),
+                             (0.8, 1.2, "<noise>"), (1.2, DUR, "a")])
+    options = lc.CheckOptions(
+        non_speech=NOISY, unlabelled_tiers=("phones",),
+        label_policies={"phones": lc.LabelPolicy.only(MAORI)})
+    issues = lc.check_textgrid(_grid(tier), "f", options)
+    assert [(i.kind, i.proposed) for i in issues] == [
+        (lc.UNLABELLED, "<p:>")]
+
+
+# ---------------------------------------------------------------------------
+# Per-tier rules
+# ---------------------------------------------------------------------------
+
+TARGETS = ("T", "T1", "T2")
+
+
+def test_a_tier_can_be_held_to_its_own_few_labels():
+    tier = _ptier("targets", [(0.2, "T"), (0.6, "T3"), (1.0, "T1")])
+    issues = lc.check_labels(_grid(tier), "f", {
+        "targets": lc.LabelPolicy.only(TARGETS)})
+    assert [i.current for i in issues] == ["T3"]
+    assert issues[0].kind == lc.NOT_ALLOWED
+    assert "allowed" in issues[0].detail
+
+
+def test_allowed_labels_are_case_sensitive():
+    tier = _ptier("targets", [(0.5, "t1")])
+    issues = lc.check_labels(_grid(tier), "f", {
+        "targets": lc.LabelPolicy.only(TARGETS)})
+    assert [i.current for i in issues] == ["t1"]
+    assert issues[0].proposed == "T1"
+
+
+def test_each_tier_is_judged_by_its_own_rule():
+    """A phone that would be fine as a target is still wrong as a phone."""
+    phones = _itier("phones", [(0.0, 1.0, "T"), (1.0, DUR, "a")])
+    targets = _ptier("targets", [(0.5, "a"), (1.5, "T2")])
+    issues = lc.check_labels(_grid(phones, targets), "f", {
+        "phones": lc.LabelPolicy.only(MAORI, lc.NOT_IN_INVENTORY),
+        "targets": lc.LabelPolicy.only(TARGETS)})
+    assert [(i.tier, i.current) for i in issues] == [
+        ("phones", "T"), ("targets", "a")]

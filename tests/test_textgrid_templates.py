@@ -266,7 +266,8 @@ def test_default_save_path_empty_without_audio():
 # The "-" empty-interval marker
 # ---------------------------------------------------------------------------
 
-from formant_editor import EMPTY_LABEL_MARKERS, is_empty_label
+from corpus_profile import DEFAULT_NON_SPEECH
+from formant_editor import is_empty_label
 
 
 @pytest.mark.parametrize("text", ["-", "", "   ", " - ", "\t-\n"])
@@ -281,10 +282,18 @@ def test_real_labels_are_not_empty(text):
 
 
 def test_marker_does_not_clash_with_the_pause_convention():
-    """<p:> stays a real label to the editor, so existing data is unaffected."""
-    assert "-" in EMPTY_LABEL_MARKERS
-    assert "<p:>" not in EMPTY_LABEL_MARKERS
+    """<p:> stays a real label by default, so existing data is unaffected."""
+    assert "-" in DEFAULT_NON_SPEECH
+    assert "<p:>" not in DEFAULT_NON_SPEECH
     assert not is_empty_label("<p:>")
+
+
+def test_a_corpus_can_name_its_own_non_speech_labels():
+    noisy = ("<p:>", "<noise>")
+    assert is_empty_label("<p:>", noisy)
+    assert is_empty_label(" <noise> ", noisy)
+    assert is_empty_label("", noisy)
+    assert not is_empty_label("-", noisy)
 
 
 def test_marker_reads_as_silence_to_the_aligner():

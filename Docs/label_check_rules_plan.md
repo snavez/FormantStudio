@@ -23,6 +23,13 @@ Decisions already taken with the user (2026-11-07):
 - A label error with no obvious repair shows a clear placeholder, not `—` (which reads as a
   pause marker).
 - Label Check stays open while issues are opened in the main window.
+- (Revised after trying Stage 2) **Profiles are saved explicitly**, with a Save to Corpus button
+  and a status line saying whether there is a profile and whether the screen has unsaved
+  changes. Running a check saves nothing. Non-speech labels are one list for all tiers, and the
+  UI says so.
+- (Revised after trying Stage 2) **Mislabelled segments are configured per tier**: each tier
+  carries any label, the symbols of a notation (IPA, SAMPA or X-SAMPA, optionally only an
+  inventory of them), or exactly a list of its own (case-sensitive, e.g. `T, T1, T2`).
 
 1. Stage 1: Working alongside the editor
 
@@ -46,32 +53,36 @@ Decisions already taken with the user (2026-11-07):
 
 2. Stage 2: Corpus profile and non-speech labels
 
-1. [ ] New Qt-free module `corpus_profile.py`: a `CorpusProfile` dataclass holding the
+1. [x] New Qt-free module `corpus_profile.py`: a `CorpusProfile` dataclass holding the
    non-speech labels and every Label Check setting (audio folder, tiers per check, notation,
    inventory, reference tier, tolerance), with `load(path)` / `save(path)` to JSON (versioned) and
    `for_folder(dir)` returning the folder's profile or the defaults. Unit tests for round-trip,
    missing file, unknown version, and malformed JSON (reported, not raised).
-2. [ ] `label_check`: replace the hard-coded `PAUSE_MARKER` with the profile's non-speech labels
+2. [x] `label_check`: replace the hard-coded `PAUSE_MARKER` with the profile's non-speech labels
    (skipped by the symbol check, accepted by the unlabelled check; the unlabelled fix proposes
    the first label in the list).
-3. [ ] Label Check dialog: a "Non-speech labels" field with the explanation above as visible
-   text, not just a tooltip; Save Profile / Load Profile buttons; the folder's profile loaded
-   automatically when the folder is chosen, and saved back on Run.
-4. [ ] Build CSV: replace the `EMPTY_LABEL_MARKERS` constant with the profile's non-speech list,
+3. [x] Label Check dialog: a "Non-speech labels" field with the explanation above as visible
+   text, not just a tooltip; the folder's profile loaded automatically when the folder is
+   chosen. Saving was later made explicit (see 3.2).
+4. [x] Build CSV: replace the `EMPTY_LABEL_MARKERS` constant with the profile's non-speech list,
    passed down as a parameter (no globals). The wizard shows the list it will use, with the same
    warning, and saves any change to the folder's profile.
-5. [ ] `divergence.py`: treat every non-speech label as `EMPTY` (an insertion against a label;
+5. [x] `divergence.py`: treat every non-speech label as `EMPTY` (an insertion against a label;
    nothing to analyse against another non-speech label), with the list passed in. Check against
    the existing divergence tests before changing semantics.
 
-3. Stage 3: Allowed labels per tier
+3. Stage 3: Labels per tier, and explicit profiles
 
-1. [ ] Profile: `allowed_labels` as tier → label set (e.g. `phone_mark` → yes, no, maybe,
-   unmarked). Label Check flags any other label on that tier (non-speech labels and blanks are
-   left to the unlabelled check), with repairs from `suggest_symbols` against the set.
-2. [ ] The global inventory becomes the default for symbol tiers without their own set, so
-   existing use keeps working.
-3. [ ] Dialog: an editable table of tier → allowed labels.
+1. [x] Profile: `label_check.label_rules`, one `LabelRule(tier, kind, labels)` per checked tier,
+   replacing the single notation, inventory and symbol-tier selection. `kind` is `ipa`, `sampa`,
+   `xsampa` (labels, when given, are the inventory) or `list` (exactly these labels,
+   case-sensitive). Rules for tiers a corpus lacks are kept, so a shared profile loses nothing.
+2. [x] `label_check`: `check_labels(tg, name, policies)` judges each tier by its own
+   `LabelPolicy(accept, candidates, kind)`; a listed label that is wrong is reported as
+   `NOT_ALLOWED`, with repairs from `suggest_symbols` (`t2` → `T2`).
+3. [x] Dialog: the Mislabelled check is a table, one row per tier, with the rule and its labels.
+   Profiles: Save to Corpus / Load… / Save As…, a status line tracking unsaved changes, nothing
+   saved as a side effect of running.
 
 4. Stage 4: Containment rules
 

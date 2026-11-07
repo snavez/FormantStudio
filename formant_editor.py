@@ -28,8 +28,10 @@ import numpy as np
 import parselmouth
 from parselmouth import praat
 
+import corpus_profile
 import divergence
 import label_check
+from corpus_profile import CorpusProfile, ProfileError
 import phone_aligner
 
 from PyQt6.QtWidgets import (
@@ -180,20 +182,15 @@ ZOOM_FACTOR = 1.3              # per scroll wheel notch
 # marker.
 DRAG_START_PX = 5.0
 
-# Labels that mark an interval as deliberately empty rather than unannotated.
-# A bare "-" is one keypress, so a pause or a gap can be marked without the
-# typo risk of a longer convention.
-EMPTY_LABEL_MARKERS = frozenset({"-"})
 
-
-def is_empty_label(text):
+def is_empty_label(text, non_speech=corpus_profile.DEFAULT_NON_SPEECH):
     """True if *text* leaves an interval empty rather than labelling it.
 
-    Blank text and any marker in :data:`EMPTY_LABEL_MARKERS` count, so an
+    Blank text and any of the corpus's *non_speech* labels count, so an
     interval the annotator deliberately marked empty behaves exactly like one
     they have not filled in.
     """
-    return text.strip() in EMPTY_LABEL_MARKERS or not text.strip()
+    return text.strip() in non_speech or not text.strip()
 
 
 # Recordings FormantStudio reads, matched case-insensitively.
@@ -1591,6 +1588,22 @@ def _load_ipa_chart(csv_path):
     return chart
 
 
+def _chart_policy(notation):
+    """A :class:`label_check.LabelPolicy` accepting *notation*'s symbols.
+
+    Whatever the label classifier recognises passes: chart symbols, with
+    diacritics stripped, and vowel sequences read as diphthongs.  Raises
+    when the chart cannot be read.
+    """
+    lookup = _load_ipa_chart(_IPA_CHART_PATH)[notation]
+    vowels = _build_known_vowels(lookup)
+
+    def accept(label):
+        return _classify_label(label, lookup, notation, vowels)[2]
+    return label_check.LabelPolicy(accept, frozenset(lookup),
+                                   label_check.UNKNOWN_SYMBOL)
+
+
 def _build_known_vowels(chart_lookup):
     """Return set of single-character vowel symbols from *chart_lookup*."""
     return {sym for sym, props in chart_lookup.items()
@@ -1654,19 +1667,20 @@ def _classify_label(label, chart_lookup, notation, known_vowels):
     return {}, modifiers, False
 
 
-def _units_for(primary_tier):
+def _units_for(primary_tier, non_speech=corpus_profile.DEFAULT_NON_SPEECH):
     """Row units for a primary tier: labelled intervals, or all points.
 
     Each unit carries the label of its immediately adjacent neighbour on
     the primary tier (by time) — the previous/next interval (Praat tiers
     tile, so an empty neighbour is a real pause and reads as "") or the
-    previous/next point.  Edges have "" for the missing side.
+    previous/next point.  Edges have "" for the missing side.  Intervals
+    carrying a *non_speech* label are not units.
     """
     if primary_tier.tier_class == "IntervalTier":
         ivs = primary_tier.intervals
         units = []
         for i, iv in enumerate(ivs):
-            if is_empty_label(iv.text):
+            if is_empty_label(iv.text, non_speech):
                 continue
             prev = ivs[i - 1].text if i > 0 else ""
             nxt = ivs[i + 1].text if i + 1 < len(ivs) else ""
@@ -1680,7 +1694,8 @@ def _units_for(primary_tier):
             for i, p in enumerate(pts)]
 
 
-def _labelled_within(unit, tier):
+def _labelled_within(unit, tier,
+                     non_speech=corpus_profile.DEFAULT_NON_SPEECH):
     """Labelled intervals of *tier* lying inside *unit*.
 
     A tier finer than the row unit subdivides it — a stop's closure and
@@ -1691,12 +1706,13 @@ def _labelled_within(unit, tier):
     if tier is None or tier.tier_class != "IntervalTier":
         return []
     return [iv for iv in tier.intervals
-            if not is_empty_label(iv.text)
+            if not is_empty_label(iv.text, non_speech)
             and iv.xmin >= unit.xmin - TIME_EPS
             and iv.xmax <= unit.xmax + TIME_EPS]
 
 
-def _subdividing_labels(tier_name, tmap_units):
+def _subdividing_labels(tier_name, tmap_units,
+                        non_speech=corpus_profile.DEFAULT_NON_SPEECH):
     """Distinct labels of *tier_name* where it subdivides a row unit.
 
     Empty when the tier matches the row unit one for one, or is coarser:
@@ -1707,7 +1723,7 @@ def _subdividing_labels(tier_name, tmap_units):
     for tmap, units in tmap_units:
         tier = tmap.get(tier_name)
         for u in units:
-            inside = _labelled_within(u, tier)
+            inside = _labelled_within(u, tier, non_speech)
             if len(inside) < 2:
                 continue
             for iv in inside:
@@ -1717,7 +1733,8 @@ def _subdividing_labels(tier_name, tmap_units):
     return labels
 
 
-def _scan_row_units(textgrid_dir, primary_tier_name, max_files=5):
+def _scan_row_units(textgrid_dir, primary_tier_name, max_files=5,
+                    non_speech=corpus_profile.DEFAULT_NON_SPEECH):
     """(tier map, row units) pairs read from the first few TextGrids.
 
     The pairs are what ``_subdividing_labels`` consumes. Only *max_files*
@@ -1743,14 +1760,15 @@ def _scan_row_units(textgrid_dir, primary_tier_name, max_files=5):
         pri = tmap.get(primary_tier_name)
         if pri is None or pri.tier_class != "IntervalTier":
             continue
-        scanned.append((tmap, _units_for(pri)))
+        scanned.append((tmap, _units_for(pri, non_speech)))
         if len(scanned) >= max_files:
             break
     return scanned
 
 
 def _tiers_subdividing_primary(textgrid_dir, primary_tier_name, tier_names,
-                               max_files=5):
+                               max_files=5,
+                               non_speech=corpus_profile.DEFAULT_NON_SPEECH):
     """Which of *tier_names* cut the primary tier's intervals into parts.
 
     The same test the export itself applies when it decides whether a tier
@@ -1761,12 +1779,13 @@ def _tiers_subdividing_primary(textgrid_dir, primary_tier_name, tier_names,
     others = [n for n in tier_names if n and n != primary_tier_name]
     if not others:
         return []
-    scanned = _scan_row_units(textgrid_dir, primary_tier_name, max_files)
+    scanned = _scan_row_units(textgrid_dir, primary_tier_name, max_files,
+                              non_speech)
     if not scanned:
         return []
     found = []
     for name in others:
-        labels = _subdividing_labels(name, scanned)
+        labels = _subdividing_labels(name, scanned, non_speech)
         if labels:
             found.append((name, labels))
     return found
@@ -1860,7 +1879,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     cat_vowel_props=None, cat_consonant_props=None,
                     auto_diphthong_candidates=None,
                     unmatched_labels=None,
-                    skipped_files=None):
+                    skipped_files=None,
+                    non_speech_labels=corpus_profile.DEFAULT_NON_SPEECH):
     """Build CSV header and rows for batch formant/duration export.
 
     One row per unit of the PRIMARY tier (*primary_tier_name*): each
@@ -1956,7 +1976,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         t = tmap.get(spectral_tier_name)
         if t is None or t.tier_class != "IntervalTier":
             return []
-        inside = _labelled_within(unit, t)
+        inside = _labelled_within(unit, t, non_speech_labels)
         if inside:
             return inside
         # Coarser than the row unit: one containing interval, so nothing is
@@ -1965,7 +1985,9 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         if civ is None:
             civ = _find_containing_interval_for_point(
                 t, (unit.xmin + unit.xmax) / 2)
-        return [] if civ is None or is_empty_label(civ.text) else [civ]
+        if civ is None or is_empty_label(civ.text, non_speech_labels):
+            return []
+        return [civ]
 
     # Pre-scan TextGrids for corpus-dependent column counts: the longest
     # segment (time-step sampling columns) and the most target points in any
@@ -2002,13 +2024,14 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             pri = tmap.get(primary_tier_name)
             if pri is None or pri.tier_class != "IntervalTier":
                 continue
-            scanned.append((tmap, _units_for(pri)))
+            scanned.append((tmap, _units_for(pri, non_speech_labels)))
 
         if ((extract_spectral or extract_trajectory) and spectral_tier_name
                 and spectral_tier_name != primary_tier_name):
-            spectral_labels = _subdividing_labels(spectral_tier_name, scanned)
+            spectral_labels = _subdividing_labels(
+                spectral_tier_name, scanned, non_speech_labels)
         for tn in _scan_needed:
-            labels = _subdividing_labels(tn, scanned)
+            labels = _subdividing_labels(tn, scanned, non_speech_labels)
             if labels:
                 duration_labels[tn] = labels
 
@@ -2033,7 +2056,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 tier = tmap.get(segment_tier_name)
                 if tier is not None and tier.tier_class == "IntervalTier":
                     for iv in tier.intervals:
-                        if not is_empty_label(iv.text):
+                        if not is_empty_label(iv.text, non_speech_labels):
                             d = iv.xmax - iv.xmin
                             if d > max_dur_s:
                                 max_dur_s = d
@@ -2042,7 +2065,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 ptt = tmap.get(point_tier_name)
                 if (pri is not None and ptt is not None
                         and ptt.tier_class == "TextTier"):
-                    for u in _units_for(pri):
+                    for u in _units_for(pri, non_speech_labels):
                         n = 0
                         for pt in sorted(ptt.points, key=lambda x: x.time):
                             if not (u.xmin - 1e-6 <= pt.time <= u.xmax + 1e-6):
@@ -2074,7 +2097,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
         ivs = primary.intervals
         records = divergence.resolve(
             [(iv.xmin, iv.xmax, iv.text) for iv in ivs],
-            [(iv.xmin, iv.xmax, iv.text) for iv in allophone_tier.intervals])
+            [(iv.xmin, iv.xmax, iv.text) for iv in allophone_tier.intervals],
+            empty=non_speech_labels)
 
         units = []
         for i, rec in enumerate(records):
@@ -2349,7 +2373,8 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 continue
             problems = divergence.validate(
                 [(iv.xmin, iv.xmax, iv.text) for iv in primary.intervals],
-                [(iv.xmin, iv.xmax, iv.text) for iv in allo.intervals])
+                [(iv.xmin, iv.xmax, iv.text) for iv in allo.intervals],
+                empty=non_speech_labels)
             if problems:
                 if skipped_files is not None:
                     skipped_files.append((
@@ -2359,7 +2384,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 continue
             units = _reconciled_units(primary, allo)
         else:
-            units = _units_for(primary)
+            units = _units_for(primary, non_speech_labels)
 
         # Resolve point tier for at-points formant extraction
         at_pt_tier = None
@@ -2387,11 +2412,12 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                     cols.append(iv.realised)
                 else:
                     civ = _find_containing_interval(t, iv.xmin, iv.xmax)
-                    if civ is not None and not is_empty_label(civ.text):
+                    if civ is not None and not is_empty_label(
+                            civ.text, non_speech_labels):
                         cols.append(civ.text)
                     else:
                         kids = [k.text for k in t.intervals
-                                if not is_empty_label(k.text)
+                                if not is_empty_label(k.text, non_speech_labels)
                                 and k.xmin >= iv.xmin - TIME_EPS
                                 and k.xmax <= iv.xmax + TIME_EPS]
                         cols.append("; ".join(kids))
@@ -2420,7 +2446,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
                 if labels:
                     # Each labelled part of the row unit reports its own span.
                     by_label = {}
-                    for sub_iv in _labelled_within(iv, t):
+                    for sub_iv in _labelled_within(iv, t, non_speech_labels):
                         by_label.setdefault(sub_iv.text.strip(), sub_iv)
                     spans = [
                         ((by_label[k].xmin, by_label[k].xmax)
@@ -2470,7 +2496,7 @@ def _build_csv_data(audio_dir, textgrid_dir, formants_dir,
             if civ is None:
                 civ = _find_containing_interval_for_point(
                     t, (iv.xmin + iv.xmax) / 2)
-            if civ is None or is_empty_label(civ.text):
+            if civ is None or is_empty_label(civ.text, non_speech_labels):
                 return None
             return civ
 
@@ -5939,7 +5965,88 @@ class _PathsPage(QWizardPage):
 
         self._fmt_separate_cb.toggled.connect(self._toggle_fmt)
 
+        # Non-speech labels, read from and saved to the TextGrid folder's
+        # corpus profile, which Label Check shares.
+        self._non_speech_edit = QLineEdit(
+            corpus_profile.format_labels(corpus_profile.DEFAULT_NON_SPEECH))
+        self._non_speech_edit.setPlaceholderText(
+            "comma-separated \u2014 e.g.  -, <p:>, <noise>")
+        layout.addRow("Non-speech labels:", self._non_speech_edit)
+        ns_note = QLabel(
+            "Separate labels with commas. On every tier, intervals labelled "
+            "with any of these are left out of the CSV. To measure something "
+            "such as pause length, keep its label off this list. Read from "
+            "the corpus profile, which Label Check shares.")
+        ns_note.setWordWrap(True)
+        ns_note.setStyleSheet("color: #999; font-style: italic;")
+        layout.addRow("", ns_note)
+        self._save_ns_cb = QCheckBox("Save these labels to the corpus profile")
+        self._save_ns_cb.setToolTip(
+            "Unticked, a change here applies to this build only.")
+        layout.addRow("", self._save_ns_cb)
+        self._profile = None   # the profile read from the TextGrid folder
+        self._profile_dir = None
+
         self.setStyleSheet(_DIALOG_FIELD_STYLE + _checked_tick_qss())
+
+    def _textgrid_dir(self):
+        """The TextGrid folder as currently chosen, or ""."""
+        if self._tg_separate_cb.isChecked():
+            return self._tg_edit.text().strip()
+        return self._audio_edit.text().strip()
+
+    def _load_profile(self):
+        """Show the non-speech labels saved with the chosen TextGrid folder.
+
+        Read once per folder, so a choice the user has typed is not undone
+        by browsing again.  A broken profile is reported and the field is
+        left as it was.
+        """
+        folder = self._textgrid_dir()
+        if not folder or folder == self._profile_dir \
+                or not os.path.isdir(folder):
+            return
+        self._profile_dir = folder
+        try:
+            self._profile = CorpusProfile.for_folder(folder)
+        except ProfileError as e:
+            self._profile = None
+            QMessageBox.warning(
+                self, "Corpus Profile Unreadable",
+                f"{e}\n\nThe non-speech labels shown are the defaults, not "
+                "this corpus's. Building will replace the file with them.")
+            return
+        self._non_speech_edit.setText(
+            corpus_profile.format_labels(self._profile.non_speech_labels))
+
+    def _save_profile(self, folder, labels):
+        """Keep *labels* with the corpus in *folder*, when they changed.
+
+        Only the non-speech labels are touched; the rest of the profile
+        (Label Check's settings) is written back as it was read.  An
+        unreadable profile is replaced, as the warning on reading it said.
+        """
+        if folder == self._profile_dir:
+            base = self._profile
+        else:
+            try:
+                base = CorpusProfile.for_folder(folder)
+            except ProfileError:
+                base = None
+        if base is not None and base.non_speech_labels == labels:
+            return
+        updated = dataclasses.replace(base or CorpusProfile(),
+                                      non_speech_labels=labels)
+        try:
+            updated.save_to_folder(folder)
+        except OSError as e:
+            QMessageBox.warning(
+                self, "Cannot Save Corpus Profile",
+                f"The build will use these labels, but they could not be "
+                f"saved with the corpus:\n{e}")
+            return
+        self._profile = updated
+        self._profile_dir = folder
 
     # --- Browsing ---
     def _browse_audio(self):
@@ -5947,11 +6054,13 @@ class _PathsPage(QWizardPage):
         if d:
             self._audio_edit.setText(d)
             self.completeChanged.emit()
+            self._load_profile()
 
     def _browse_tg(self):
         d = QFileDialog.getExistingDirectory(self, "Select TextGrid Directory")
         if d:
             self._tg_edit.setText(d)
+            self._load_profile()
 
     def _browse_fmt(self):
         d = QFileDialog.getExistingDirectory(self, "Select Formants Directory")
@@ -5962,6 +6071,7 @@ class _PathsPage(QWizardPage):
         self._tg_edit.setVisible(checked)
         self._tg_btn.setVisible(checked)
         self._tg_label.setVisible(checked)
+        self._load_profile()
 
     def _toggle_fmt(self, checked):
         self._fmt_edit.setVisible(checked)
@@ -5995,11 +6105,16 @@ class _PathsPage(QWizardPage):
         fmt_dir = (self._fmt_edit.text().strip()
                    if self._fmt_separate_cb.isChecked() else audio_dir)
 
+        labels = corpus_profile.parse_labels(self._non_speech_edit.text())
+        if self._save_ns_cb.isChecked():
+            self._save_profile(tg_dir, labels)
+
         # Store on wizard
         wiz = self.wizard()
         wiz.audio_dir = audio_dir
         wiz.textgrid_dir = tg_dir
         wiz.formants_dir = fmt_dir
+        wiz.non_speech_labels = labels
         return True
 
 
@@ -6110,7 +6225,7 @@ class _TierSelectionPage(QWizardPage):
         for idx, tier in enumerate(first.tiers):
             kind = "Interval" if tier.tier_class == "IntervalTier" else "Point"
             n = (len([iv for iv in tier.intervals
-                      if not is_empty_label(iv.text)])
+                      if not is_empty_label(iv.text, wiz.non_speech_labels)])
                  if tier.tier_class == "IntervalTier"
                  else len(tier.points))
             self._primary_combo.addItem(f"{tier.name}  [{kind}]", tier.name)
@@ -7159,7 +7274,8 @@ class _DataOptionsPage(QWizardPage):
                 finer = _tiers_subdividing_primary(
                     wiz.textgrid_dir, wiz.primary_tier_name,
                     [n for n, tc in wiz.selected_tier_info
-                     if tc == "IntervalTier"])
+                     if tc == "IntervalTier"],
+                    non_speech=wiz.non_speech_labels)
                 if finer and not self._confirm_whole_interval_spectra(
                         wiz.primary_tier_name, finer):
                     return False
@@ -7336,11 +7452,15 @@ class _CheckablePopup(QWidget):
 class _MultiSelectDropdown(QWidget):
     """A button that opens a checkable dropdown. Shows selected count.
 
+    Emits :attr:`changed` whenever the selection or the items change.
+
     Uses a custom ``_CheckablePopup`` (``Qt.WindowType.Popup``) which
     auto-closes on any click outside the popup — including clicking the
     button itself, clicking elsewhere in the wizard, or clicking another
     application window.
     """
+
+    changed = pyqtSignal()
 
     def __init__(self, label, items, parent=None):
         """*items* is a list of (key, display_text) tuples."""
@@ -7382,6 +7502,7 @@ class _MultiSelectDropdown(QWidget):
             self._button.setText("None selected  \u25BC")
         else:
             self._button.setText(f"{len(checked)} of {total} selected  \u25BC")
+        self.changed.emit()
 
     def set_items(self, items):
         """Repopulate the dropdown; everything starts selected, as on build."""
@@ -7391,6 +7512,122 @@ class _MultiSelectDropdown(QWidget):
 
     def selected_keys(self):
         return self._popup.checked_keys()
+
+    def selection(self):
+        """The selected keys, or None when every item is selected.
+
+        None rather than the full list, so a saved "everything" still means
+        everything once more items appear.
+        """
+        keys = self.selected_keys()
+        return None if len(keys) == len(self._popup._checkboxes) else tuple(keys)
+
+    def set_selection(self, keys):
+        """Select exactly *keys*; None selects everything."""
+        for cb in self._popup._checkboxes:
+            cb.setChecked(keys is None or cb.property("item_key") in keys)
+
+
+class _LabelRulesTable(QTableWidget):
+    """One row per tier: what its labels are allowed to be.
+
+    Each tier may carry any label (not checked), the symbols of a notation
+    -- optionally only an inventory of them -- or exactly a list of labels
+    of its own.  Rules for tiers this corpus does not have, as when a
+    profile comes from another corpus, are kept and given back by
+    :meth:`rules`, so saving does not lose them.  Emits :attr:`changed`
+    whenever a rule is edited.
+    """
+
+    changed = pyqtSignal()
+
+    KINDS = [
+        ("Any label (not checked)", ""),
+        ("IPA symbols", "ipa"),
+        ("SAMPA symbols", "sampa"),
+        ("X-SAMPA symbols", "xsampa"),
+        ("Only these labels", corpus_profile.ONLY_LISTED),
+    ]
+    _HINTS = {
+        "": "",
+        corpus_profile.ONLY_LISTED:
+            "comma-separated, case-sensitive \u2014 e.g.  T, T1, T2",
+    }
+    _SYMBOL_HINT = ("optional inventory \u2014 e.g.  p t k a e i o u  "
+                    "(empty: any symbol)")
+
+    def __init__(self, parent=None):
+        super().__init__(0, 3, parent)
+        self.setHorizontalHeaderLabels(["Tier", "Allowed labels",
+                                        "Labels / inventory"])
+        self.verticalHeader().setVisible(False)
+        self.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch)
+        self.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.setMaximumHeight(170)
+        self._tiers = []
+        self._hidden = ()
+
+    def set_tiers(self, tiers):
+        """Show a row for each ``(name, tier_class)``, keeping their rules."""
+        keep = self.rules()
+        self._tiers = [name for name, _ in tiers]
+        self.setRowCount(len(tiers))
+        for row, (name, tier_class) in enumerate(tiers):
+            kind_text = "points" if tier_class == "TextTier" else "intervals"
+            item = QTableWidgetItem(f"{name}  ({kind_text})")
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.setItem(row, 0, item)
+            combo = QComboBox()
+            for text, key in self.KINDS:
+                combo.addItem(text, key)
+            combo.currentIndexChanged.connect(
+                lambda _i, r=row: self._kind_changed(r))
+            self.setCellWidget(row, 1, combo)
+            edit = QLineEdit()
+            edit.textChanged.connect(self.changed.emit)
+            self.setCellWidget(row, 2, edit)
+            self._kind_changed(row)
+        self.set_rules(keep)
+        self.resizeColumnToContents(0)
+        self.resizeColumnToContents(1)
+
+    def set_rules(self, rules):
+        """Show *rules*; tiers without one carry any label."""
+        by_tier = {r.tier: r for r in rules}
+        for row, name in enumerate(self._tiers):
+            rule = by_tier.get(name)
+            combo, edit = self.cellWidget(row, 1), self.cellWidget(row, 2)
+            combo.setCurrentIndex(max(0, combo.findData(
+                rule.kind if rule else "")))
+            if rule is None:
+                edit.clear()
+            elif rule.kind == corpus_profile.ONLY_LISTED:
+                edit.setText(corpus_profile.format_labels(rule.labels))
+            else:
+                edit.setText(" ".join(rule.labels))
+        self._hidden = tuple(r for r in rules if r.tier not in self._tiers)
+
+    def rules(self):
+        """Every tier's rule, those for tiers not shown included."""
+        shown = []
+        for row, name in enumerate(self._tiers):
+            kind = self.cellWidget(row, 1).currentData()
+            if not kind:
+                continue
+            text = self.cellWidget(row, 2).text()
+            labels = (corpus_profile.parse_labels(text)
+                      if kind == corpus_profile.ONLY_LISTED
+                      else corpus_profile.parse_inventory(text))
+            shown.append(corpus_profile.LabelRule(name, kind, labels))
+        return tuple(shown) + self._hidden
+
+    def _kind_changed(self, row):
+        kind = self.cellWidget(row, 1).currentData()
+        edit = self.cellWidget(row, 2)
+        edit.setEnabled(bool(kind))
+        edit.setPlaceholderText(self._HINTS.get(kind, self._SYMBOL_HINT))
+        self.changed.emit()
 
 
 class _PlaceholderDelegate(QStyledItemDelegate):
@@ -7844,6 +8081,7 @@ class _LabelCheckDialog(QDialog):
         label_check.UNLABELLED: "Unlabelled",
         label_check.UNKNOWN_SYMBOL: "Unknown symbol",
         label_check.NOT_IN_INVENTORY: "Not in inventory",
+        label_check.NOT_ALLOWED: "Not an allowed label",
         label_check.BOUNDARY_DRIFT: "Boundary drift",
     }
     COLUMNS = ["Fix?", "File", "Tier", "Time", "Issue", "Current",
@@ -7864,6 +8102,10 @@ class _LabelCheckDialog(QDialog):
         self.resize(1040, 700)
         self.setStyleSheet(_DIALOG_FIELD_STYLE + _checked_tick_qss())
         self._issues = []
+        # The corpus's profile as last read or saved, None when it has none;
+        # the status line compares what is on screen with it.
+        self._saved_profile = None
+        self._profile_broken = False
 
         layout = QVBoxLayout(self)
 
@@ -7891,6 +8133,52 @@ class _LabelCheckDialog(QDialog):
         browse_audio = QPushButton("Browse...")
         browse_audio.clicked.connect(self._browse_audio)
         where.addWidget(browse_audio, 1, 2)
+
+        where.addWidget(QLabel("Non-speech labels:"), 2, 0)
+        self._non_speech_edit = QLineEdit(
+            corpus_profile.format_labels(corpus_profile.DEFAULT_NON_SPEECH))
+        self._non_speech_edit.setPlaceholderText(
+            "comma-separated \u2014 e.g.  -, <p:>, <noise>, <speech noise>")
+        where.addWidget(self._non_speech_edit, 2, 1, 1, 2)
+        ns_note = QLabel(
+            "Separate labels with commas. On every tier, intervals labelled "
+            "with any of these have nothing to analyse: Label Check accepts "
+            "them as deliberate, and Build CSV leaves them out. To measure "
+            "something such as pause length, keep its label off this list.")
+        ns_note.setWordWrap(True)
+        ns_note.setStyleSheet("color: #999; font-style: italic;")
+        where.addWidget(ns_note, 3, 1, 1, 2)
+
+        profile_label = QLabel("Profile:")
+        profile_tip = (
+            "A profile keeps every setting in this window with the corpus, "
+            f"as {corpus_profile.PROFILE_NAME} beside the TextGrids. It is "
+            "loaded whenever this folder is chosen, and Build CSV uses its "
+            "non-speech labels.")
+        profile_label.setToolTip(profile_tip)
+        where.addWidget(profile_label, 4, 0)
+        profile_row = QHBoxLayout()
+        self._profile_status = QLabel("choose a TextGrid folder")
+        self._profile_status.setStyleSheet("color: #999;")
+        self._profile_status.setToolTip(profile_tip)
+        profile_row.addWidget(self._profile_status, 1)
+        save_corpus = QPushButton("Save to Corpus")
+        save_corpus.setToolTip(profile_tip)
+        save_corpus.clicked.connect(self._save_to_corpus)
+        profile_row.addWidget(save_corpus)
+        load_profile = QPushButton("Load...")
+        load_profile.setToolTip(
+            "Use the settings from a profile saved elsewhere, such as "
+            "another corpus's. Save to Corpus keeps them with this one.")
+        load_profile.clicked.connect(self._load_profile_from)
+        profile_row.addWidget(load_profile)
+        save_profile = QPushButton("Save As...")
+        save_profile.setToolTip(
+            "Save these settings as a profile file somewhere else, to load "
+            "into another corpus.")
+        save_profile.clicked.connect(self._save_profile_as)
+        profile_row.addWidget(save_profile)
+        where.addLayout(profile_row, 4, 1, 1, 2)
         layout.addLayout(where)
 
         # --- What to check ---
@@ -7898,36 +8186,19 @@ class _LabelCheckDialog(QDialog):
         self._unlabelled_cb.setToolTip(
             "Blank intervals lying inside the annotated stretch of a tier. "
             "Silence before the first label and after the last is ignored, "
-            "and so is a pause the annotator marked '-' deliberately.")
+            "and so is any interval carrying a non-speech label.")
         self._unlabelled_tiers = _MultiSelectDropdown("Tiers:", [])
         layout.addWidget(self._unlabelled_cb)
         layout.addWidget(self._indent(self._unlabelled_tiers))
 
-        self._symbol_cb = QCheckBox("Mislabelled segments and points")
-        self._symbol_cb.setToolTip(
-            "Labels that are not valid symbols. With an inventory supplied "
-            "the check is against that; without one it falls back to the "
-            "built-in chart for the chosen notation.")
-        self._symbol_tiers = _MultiSelectDropdown("Tiers:", [])
-        layout.addWidget(self._symbol_cb)
-        layout.addWidget(self._indent(self._symbol_tiers))
-
-        sym_row = QHBoxLayout()
-        sym_row.addSpacing(20)
-        sym_row.addWidget(QLabel("Notation:"))
-        self._notation_combo = QComboBox()
-        self._notation_combo.addItems(["IPA", "SAMPA", "X-SAMPA"])
-        sym_row.addWidget(self._notation_combo)
-        sym_row.addWidget(QLabel("Inventory:"))
-        self._inventory_edit = QLineEdit()
-        self._inventory_edit.setPlaceholderText(
-            "optional — e.g.  p t k m n ŋ f h r w a e i o u")
-        self._inventory_edit.setToolTip(
-            "The symbols this corpus is allowed to use, separated by spaces "
-            "or commas. Catches labels that are valid IPA but impossible for "
-            "the language. Left empty, the built-in chart is used instead.")
-        sym_row.addWidget(self._inventory_edit, 1)
-        layout.addLayout(sym_row)
+        self._labels_cb = QCheckBox("Mislabelled segments and points")
+        self._labels_cb.setToolTip(
+            "Labels a tier does not allow. Choose for each tier: any label, "
+            "the symbols of a notation (optionally only an inventory of "
+            "them), or a list of its own such as T, T1, T2.")
+        self._rules_table = _LabelRulesTable()
+        layout.addWidget(self._labels_cb)
+        layout.addWidget(self._indent(self._rules_table))
 
         self._boundary_cb = QCheckBox("Boundaries that nearly align")
         self._boundary_cb.setToolTip(
@@ -7959,13 +8230,24 @@ class _LabelCheckDialog(QDialog):
 
         for cb, governed in (
                 (self._unlabelled_cb, [self._unlabelled_tiers]),
-                (self._symbol_cb, [self._symbol_tiers, self._notation_combo,
-                                   self._inventory_edit]),
+                (self._labels_cb, [self._rules_table]),
                 (self._boundary_cb, [self._boundary_tiers, self._ref_combo,
                                      self._tolerance_spin])):
             cb.setChecked(True)
             for w in governed:
                 cb.toggled.connect(w.setEnabled)
+
+        for signal in (self._non_speech_edit.textChanged,
+                       self._audio_dir_edit.textChanged,
+                       self._unlabelled_cb.toggled,
+                       self._unlabelled_tiers.changed,
+                       self._labels_cb.toggled,
+                       self._rules_table.changed,
+                       self._boundary_cb.toggled,
+                       self._boundary_tiers.changed,
+                       self._ref_combo.currentTextChanged,
+                       self._tolerance_spin.valueChanged):
+            signal.connect(self._refresh_profile_status)
 
         run_row = QHBoxLayout()
         self._run_btn = QPushButton("Run Check")
@@ -8078,54 +8360,171 @@ class _LabelCheckDialog(QDialog):
             return
         items = [(n, f"{n}  ({'points' if c == 'TextTier' else 'intervals'})")
                  for n, c in found]
-        for dd in (self._unlabelled_tiers, self._symbol_tiers,
-                   self._boundary_tiers):
+        for dd in (self._unlabelled_tiers, self._boundary_tiers):
             dd.set_items(items)
+        self._rules_table.set_tiers(found)
         previous = self._ref_combo.currentText()
         self._ref_combo.clear()
         self._ref_combo.addItems([n for n, _ in found])
         if previous:
             self._ref_combo.setCurrentText(previous)
+        self._load_folder_profile(directory)
 
-    def _inventory_symbols(self):
-        """The inventory as a set, empty when the user supplied none."""
-        raw = self._inventory_edit.text().replace(",", " ").split()
-        return frozenset(s for s in (t.strip() for t in raw) if s)
+    # ------------------------------------------------------------------
+    # Corpus profile
+    # ------------------------------------------------------------------
 
-    def _symbol_policy(self):
-        """``(accept, candidates)`` for the symbol check, inventory first.
+    def _load_folder_profile(self, directory):
+        """Show the settings saved with the corpus in *directory*.
 
-        An inventory says what this corpus may contain, which the chart never
-        can — it accepts any symbol some language uses.  Without one the
-        chart is the only standard available, so it is the fallback rather
-        than a peer.
+        A corpus with no profile shows the defaults.  A broken profile is
+        reported and left on disk untouched; the settings on screen stay as
+        they were until the user saves over it.
         """
-        inventory = self._inventory_symbols()
-        if inventory:
-            return inventory.__contains__, inventory
-        chart = _load_ipa_chart(_IPA_CHART_PATH)
-        notation = self._notation_combo.currentText().lower().replace("-", "")
-        lookup = chart[notation]
-        vowels = _build_known_vowels(lookup)
-        return (lambda label: _classify_label(label, lookup, notation,
-                                              vowels)[2],
-                set(lookup))
+        self._profile_broken = False
+        try:
+            profile = CorpusProfile.for_folder(directory)
+        except ProfileError as e:
+            self._saved_profile = None
+            self._profile_broken = True
+            QMessageBox.warning(
+                self, "Corpus Profile Unreadable",
+                f"{e}\n\nThe settings shown are not this corpus's saved ones. "
+                "Save to Corpus will replace the file with them.")
+            self._refresh_profile_status()
+            return
+        self.apply_profile(profile)
+        # Compared as shown rather than as read: the screen fills in what
+        # the file leaves open, such as a reference tier, and that is not
+        # an unsaved change.
+        exists = os.path.exists(corpus_profile.profile_path(directory))
+        self._saved_profile = self.profile() if exists else None
+        self._refresh_profile_status()
+
+    def apply_profile(self, profile):
+        """Set every control from *profile*."""
+        lc = profile.label_check
+        self._non_speech_edit.setText(
+            corpus_profile.format_labels(profile.non_speech_labels))
+        self._audio_dir_edit.setText(profile.audio_dir)
+        self._unlabelled_cb.setChecked(lc.unlabelled)
+        self._unlabelled_tiers.set_selection(lc.unlabelled_tiers)
+        self._labels_cb.setChecked(lc.labels)
+        self._rules_table.set_rules(lc.label_rules)
+        self._boundary_cb.setChecked(lc.boundaries)
+        self._boundary_tiers.set_selection(lc.boundary_tiers)
+        if lc.reference_tier:
+            self._ref_combo.setCurrentText(lc.reference_tier)
+        self._tolerance_spin.setValue(lc.tolerance_ms)
+
+    def profile(self):
+        """The settings on screen, as a :class:`CorpusProfile`."""
+        return CorpusProfile(
+            non_speech_labels=self._non_speech_labels(),
+            audio_dir=self._audio_dir_edit.text().strip(),
+        ).with_label_check(
+            unlabelled=self._unlabelled_cb.isChecked(),
+            unlabelled_tiers=self._unlabelled_tiers.selection(),
+            labels=self._labels_cb.isChecked(),
+            label_rules=self._rules_table.rules(),
+            boundaries=self._boundary_cb.isChecked(),
+            boundary_tiers=self._boundary_tiers.selection(),
+            reference_tier=self._ref_combo.currentText(),
+            tolerance_ms=self._tolerance_spin.value())
+
+    def _save_to_corpus(self):
+        """Save the settings on screen as this corpus's profile."""
+        directory = self._dir_edit.text().strip()
+        if not directory or not os.path.isdir(directory):
+            QMessageBox.information(
+                self, "No Folder", "Choose a folder of TextGrid files first.")
+            return
+        profile = self.profile()
+        try:
+            profile.save_to_folder(directory)
+        except OSError as e:
+            QMessageBox.warning(self, "Cannot Save Corpus Profile", str(e))
+            return
+        self._saved_profile = profile
+        self._profile_broken = False
+        self._refresh_profile_status()
+
+    def _refresh_profile_status(self):
+        """Say whether the settings on screen are the corpus's saved ones."""
+        if not self._dir_edit.text().strip():
+            text = "choose a TextGrid folder"
+        elif self._profile_broken:
+            text = ("the saved profile is unreadable \u2014 Save to Corpus "
+                    "replaces it")
+        elif self._saved_profile is None:
+            text = ("none saved yet \u2014 Save to Corpus keeps these "
+                    "settings with this corpus")
+        elif self.profile() == self._saved_profile:
+            text = "these settings are saved with this corpus"
+        else:
+            text = "unsaved changes \u2014 Save to Corpus to keep them"
+        self._profile_status.setText(text)
+
+    def _load_profile_from(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Corpus Profile", self._dir_edit.text(),
+            "Corpus profiles (*.json);;All Files (*)")
+        if not path:
+            return
+        try:
+            profile = CorpusProfile.load(path)
+        except ProfileError as e:
+            QMessageBox.warning(self, "Cannot Load Profile", str(e))
+            return
+        self.apply_profile(profile)
+        self._refresh_profile_status()
+
+    def _save_profile_as(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Corpus Profile As",
+            os.path.join(self._dir_edit.text(), corpus_profile.PROFILE_NAME),
+            "Corpus profiles (*.json);;All Files (*)")
+        if not path:
+            return
+        try:
+            self.profile().save(path)
+        except OSError as e:
+            QMessageBox.warning(self, "Cannot Save Profile", str(e))
+
+    def _non_speech_labels(self):
+        return corpus_profile.parse_labels(self._non_speech_edit.text())
+
+    def label_policies(self):
+        """How each tier's labels are judged, from the rules table.
+
+        A notation with an inventory accepts just that inventory; without
+        one it accepts whatever the built-in chart recognises, diacritics
+        and diphthongs included.  Raises when the chart cannot be read.
+        """
+        policies = {}
+        for rule in self._rules_table.rules():
+            if rule.kind == corpus_profile.ONLY_LISTED:
+                policies[rule.tier] = label_check.LabelPolicy.only(rule.labels)
+            elif rule.labels:
+                policies[rule.tier] = label_check.LabelPolicy.only(
+                    rule.labels, label_check.NOT_IN_INVENTORY)
+            else:
+                policies[rule.tier] = _chart_policy(rule.kind)
+        return policies
 
     def options(self):
         """The enabled checks, as a :class:`label_check.CheckOptions`."""
         return label_check.CheckOptions(
             unlabelled_tiers=(tuple(self._unlabelled_tiers.selected_keys())
                               if self._unlabelled_cb.isChecked() else ()),
-            symbol_tiers=(tuple(self._symbol_tiers.selected_keys())
-                          if self._symbol_cb.isChecked() else ()),
+            label_policies=(self.label_policies()
+                            if self._labels_cb.isChecked() else {}),
             boundary_tiers=(tuple(self._boundary_tiers.selected_keys())
                             if self._boundary_cb.isChecked() else ()),
             reference_tier=(self._ref_combo.currentText()
                             if self._boundary_cb.isChecked() else ""),
             tolerance_s=self._tolerance_spin.value() / 1000.0,
-            notation=self._notation_combo.currentText().lower().replace(
-                "-", ""),
-            inventory=self._inventory_symbols(),
+            non_speech=self._non_speech_labels(),
         )
 
     # ------------------------------------------------------------------
@@ -8139,21 +8538,27 @@ class _LabelCheckDialog(QDialog):
             QMessageBox.warning(self, "No Folder",
                                 "Choose a folder of TextGrid files first.")
             return
-        options = self.options()
-        if not (options.unlabelled_tiers or options.symbol_tiers
+        empty_lists = [r.tier for r in self._rules_table.rules()
+                       if r.kind == corpus_profile.ONLY_LISTED and not r.labels]
+        if self._labels_cb.isChecked() and empty_lists:
+            QMessageBox.warning(
+                self, "No Labels Listed",
+                "These tiers allow only the labels listed, but none are: "
+                + ", ".join(empty_lists) + ".")
+            return
+        try:
+            options = self.options()
+        except Exception as e:
+            QMessageBox.critical(self, "Cannot Load Symbol Chart", str(e))
+            return
+        if not (options.unlabelled_tiers or options.label_policies
                 or options.boundary_tiers):
             QMessageBox.information(
                 self, "Nothing to Check",
-                "Tick at least one check, and at least one tier for it.")
+                "Tick at least one check, and at least one tier for it. "
+                "For mislabelled segments, give a tier a rule other than "
+                "Any label.")
             return
-
-        accept = candidates = None
-        if options.symbol_tiers:
-            try:
-                accept, candidates = self._symbol_policy()
-            except Exception as e:
-                QMessageBox.critical(self, "Cannot Load Symbol Chart", str(e))
-                return
 
         progress = QProgressDialog("Checking label files...", "Cancel", 0, 1,
                                    self)
@@ -8173,7 +8578,6 @@ class _LabelCheckDialog(QDialog):
         try:
             issues, unreadable = label_check.check_directory(
                 directory, options, TextGrid.from_file,
-                accept=accept, candidates=candidates or (),
                 progress=on_progress)
         except OSError as e:
             progress.close()
@@ -8660,6 +9064,7 @@ class BuildCSVWizard(QWizard):
         self.audio_dir = ""
         self.textgrid_dir = ""
         self.formants_dir = ""
+        self.non_speech_labels = corpus_profile.DEFAULT_NON_SPEECH
         self.example_textgrid = None
         self.selected_tier_info = []  # [(name, tier_class), ...]
         self.primary_tier_name = None  # tier that defines one row each
@@ -9856,6 +10261,7 @@ class MainWindow(QMainWindow):
 
         try:
             headers, rows = _build_csv_data(
+                non_speech_labels=wizard.non_speech_labels,
                 audio_dir=wizard.audio_dir,
                 textgrid_dir=wizard.textgrid_dir,
                 formants_dir=wizard.formants_dir,
@@ -10368,7 +10774,8 @@ class MainWindow(QMainWindow):
             return [(iv.xmin, iv.xmax, iv.text) for iv in tier.intervals]
 
         phonemes, allophones = spans(phoneme_name), spans(allophone_name)
-        problems = divergence.validate(phonemes, allophones)
+        empty = self._corpus_non_speech()
+        problems = divergence.validate(phonemes, allophones, empty)
 
         if problems:
             shown = "\n".join(f"  • {p}" for p in problems[:12])
@@ -10383,7 +10790,7 @@ class MainWindow(QMainWindow):
             return
 
         counts = divergence.summarise(
-            divergence.resolve(phonemes, allophones))
+            divergence.resolve(phonemes, allophones, empty))
         order = [divergence.MATCH, divergence.SUBSTITUTION,
                  divergence.INSERTION, divergence.DELETION,
                  divergence.NOT_ANALYSED, divergence.UNANNOTATED]
@@ -10449,6 +10856,20 @@ class MainWindow(QMainWindow):
             self.status.showMessage(
                 "No recording found for this TextGrid \u2014 "
                 "File \u2192 Open Recording for TextGrid\u2026 to add it")
+
+    def _corpus_non_speech(self):
+        """The open TextGrid's corpus non-speech labels, or the defaults.
+
+        An unreadable profile falls back to the defaults here: a single-file
+        check is advisory, and Label Check reports the broken file.
+        """
+        if self._textgrid_path:
+            try:
+                return CorpusProfile.for_folder(
+                    os.path.dirname(self._textgrid_path)).non_speech_labels
+            except ProfileError:
+                pass
+        return corpus_profile.DEFAULT_NON_SPEECH
 
     def _is_open_textgrid(self, path):
         """Whether *path* is the TextGrid open now."""

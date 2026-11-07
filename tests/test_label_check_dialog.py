@@ -67,10 +67,20 @@ def test_tiers_are_discovered_from_the_folder(dlg):
     assert dlg._ref_combo.count() == 3
 
 
+def _rule(dlg, tier, kind, labels=""):
+    """Set *tier*'s row in the rules table."""
+    table = dlg._rules_table
+    row = table._tiers.index(tier)
+    combo = table.cellWidget(row, 1)
+    combo.setCurrentIndex(combo.findData(kind))
+    table.cellWidget(row, 2).setText(labels)
+
+
 def test_an_unticked_check_contributes_no_tiers(dlg):
-    dlg._symbol_cb.setChecked(False)
+    _rule(dlg, "phones", "ipa")
+    dlg._labels_cb.setChecked(False)
     opts = dlg.options()
-    assert opts.symbol_tiers == ()
+    assert opts.label_policies == {}
     assert opts.unlabelled_tiers, "the other checks are unaffected"
 
 
@@ -84,28 +94,60 @@ def test_the_tolerance_is_reported_in_seconds(dlg):
     assert dlg.options().tolerance_s == pytest.approx(0.0125)
 
 
-def test_the_inventory_accepts_spaces_or_commas(dlg):
-    dlg._inventory_edit.setText("p, t ,k  a")
-    assert dlg.options().inventory == frozenset({"p", "t", "k", "a"})
+def test_every_tier_gets_a_row_and_starts_unchecked(dlg):
+    """A fresh corpus judges no labels until a tier is given a rule."""
+    assert dlg._rules_table._tiers == ["phones", "allo", "targets"]
+    assert dlg.options().label_policies == {}
 
 
-def test_without_an_inventory_the_policy_falls_back_to_the_chart(dlg):
-    accept, candidates = dlg._symbol_policy()
-    assert accept("t") and accept("θ"), "both are valid IPA"
-    assert len(candidates) > 100, "the whole chart is the candidate pool"
+def test_a_notation_without_an_inventory_accepts_the_chart(dlg):
+    _rule(dlg, "phones", "ipa")
+    policy = dlg.options().label_policies["phones"]
+    assert policy.accept("t") and policy.accept("\u03B8")
+    assert policy.kind == lc.UNKNOWN_SYMBOL
+    assert len(policy.candidates) > 100
 
 
-def test_an_inventory_overrides_the_chart(dlg):
-    dlg._inventory_edit.setText("p t k a e i o u")
-    accept, candidates = dlg._symbol_policy()
-    assert accept("t")
-    assert not accept("θ"), "valid IPA, but not in this corpus"
-    assert candidates == frozenset({"p", "t", "k", "a", "e", "i", "o", "u"})
+def test_an_inventory_narrows_the_notation(dlg):
+    _rule(dlg, "phones", "ipa", "p, t ,k  a")
+    policy = dlg.options().label_policies["phones"]
+    assert policy.accept("t")
+    assert not policy.accept("\u03B8"), "valid IPA, but not in this corpus"
+    assert policy.candidates == frozenset({"p", "t", "k", "a"})
+    assert policy.kind == lc.NOT_IN_INVENTORY
 
 
-def test_the_notation_choice_reaches_the_options(dlg):
-    dlg._notation_combo.setCurrentText("X-SAMPA")
-    assert dlg.options().notation == "xsampa"
+def test_each_tier_can_use_its_own_notation(dlg):
+    _rule(dlg, "phones", "ipa")
+    _rule(dlg, "allo", "xsampa")
+    policies = dlg.options().label_policies
+    assert policies["allo"].accept("t_h")
+    assert not policies["phones"].accept("t_h")
+
+
+def test_a_tier_can_list_its_own_labels(dlg):
+    _rule(dlg, "targets", "list", "T, T1, T2")
+    policy = dlg.options().label_policies["targets"]
+    assert policy.accept("T1")
+    assert not policy.accept("t1"), "lists are case-sensitive"
+    assert policy.kind == lc.NOT_ALLOWED
+
+
+def test_the_labels_field_is_off_until_a_rule_is_chosen(dlg):
+    row = dlg._rules_table._tiers.index("targets")
+    assert not dlg._rules_table.cellWidget(row, 2).isEnabled()
+    _rule(dlg, "targets", "list", "T")
+    assert dlg._rules_table.cellWidget(row, 2).isEnabled()
+
+
+def test_rules_for_tiers_this_corpus_lacks_are_kept(dlg):
+    """A profile shared from another corpus loses nothing on saving."""
+    foreign = cp.LabelRule("syllables", "list", ("S", "W"))
+    dlg._rules_table.set_rules((cp.LabelRule("phones", "ipa"), foreign))
+    assert foreign in dlg._rules_table.rules()
+    # Still applied: tiers are listed from the first files only, and a tier
+    # missing there may yet turn up further into the corpus.
+    assert "syllables" in dlg.options().label_policies
 
 
 # ---------------------------------------------------------------------------
@@ -227,20 +269,20 @@ def test_the_table_tick_boxes_are_styled(dlg):
 # End to end, against real files
 # ---------------------------------------------------------------------------
 
-def test_the_configured_run_finds_all_three_fault_kinds(dlg, corpus):
-    dlg._inventory_edit.setText("t a t0")
-    accept, candidates = dlg._symbol_policy()
+def test_the_configured_run_finds_every_fault_kind(dlg, corpus):
+    _rule(dlg, "phones", "ipa", "t a")
+    _rule(dlg, "targets", "list", "T2")
     issues, unreadable = lc.check_directory(
-        corpus, dlg.options(), TextGrid.from_file,
-        accept=accept, candidates=candidates)
+        corpus, dlg.options(), TextGrid.from_file)
     assert not unreadable
     assert {i.kind for i in issues} == {
-        lc.UNLABELLED, lc.NOT_IN_INVENTORY, lc.BOUNDARY_DRIFT}
+        lc.UNLABELLED, lc.NOT_IN_INVENTORY, lc.NOT_ALLOWED,
+        lc.BOUNDARY_DRIFT}
 
 
 def test_accepted_fixes_reach_the_file_and_clear_the_fault(dlg, corpus):
     dlg._boundary_cb.setChecked(True)
-    dlg._symbol_cb.setChecked(False)
+    dlg._labels_cb.setChecked(False)
     dlg._unlabelled_cb.setChecked(False)
     issues, _ = lc.check_directory(corpus, dlg.options(), TextGrid.from_file)
     dlg._populate(issues)
@@ -254,3 +296,139 @@ def test_accepted_fixes_reach_the_file_and_clear_the_fault(dlg, corpus):
     again, _ = lc.check_directory(corpus, dlg.options(), TextGrid.from_file)
     assert again == []
     assert os.path.exists(path + lc.BACKUP_SUFFIX)
+
+
+# ---------------------------------------------------------------------------
+# The corpus profile
+# ---------------------------------------------------------------------------
+
+import corpus_profile as cp  # noqa: E402
+from corpus_profile import CorpusProfile  # noqa: E402
+
+
+def _saved(corpus, **check):
+    profile = CorpusProfile(
+        non_speech_labels=("-", "<noise>"), audio_dir="D:/audio",
+    ).with_label_check(**check)
+    profile.save_to_folder(corpus)
+    return profile
+
+
+def test_a_saved_profile_sets_up_the_dialog(qapp, corpus):
+    _saved(corpus, label_rules=(cp.LabelRule("phones", "sampa", ("t", "a")),
+                                cp.LabelRule("targets", "list", ("T1",))),
+           tolerance_ms=7.5, boundaries=False, reference_tier="allo")
+    d = _LabelCheckDialog(corpus)
+    assert d._non_speech_edit.text() == "-, <noise>"
+    assert d._audio_dir_edit.text() == "D:/audio"
+    table = d._rules_table
+    assert table.cellWidget(0, 1).currentData() == "sampa"
+    assert table.cellWidget(0, 2).text() == "t a"
+    assert table.cellWidget(2, 2).text() == "T1"
+    assert table.cellWidget(1, 1).currentData() == ""
+    assert d._tolerance_spin.value() == 7.5
+    assert not d._boundary_cb.isChecked()
+    assert d._ref_combo.currentText() == "allo"
+
+
+def test_what_is_shown_is_what_was_saved(qapp, corpus):
+    saved = _saved(corpus, unlabelled_tiers=("phones", "targets"),
+                   label_rules=(cp.LabelRule("phones", "ipa", ("a", "t")),),
+                   reference_tier="phones")
+    d = _LabelCheckDialog(corpus)
+    assert d.profile() == saved
+
+
+def test_the_non_speech_labels_reach_the_check(dlg):
+    dlg._non_speech_edit.setText("-, <p:>")
+    assert dlg.options().non_speech == ("-", "<p:>")
+
+
+def test_save_to_corpus_creates_the_profile(dlg, corpus):
+    assert not os.path.exists(cp.profile_path(corpus))
+    _rule(dlg, "targets", "list", "T, T1, T2")
+    dlg._non_speech_edit.setText("<p:>")
+    dlg._save_to_corpus()
+    saved = CorpusProfile.for_folder(corpus)
+    assert saved.non_speech_labels == ("<p:>",)
+    assert cp.LabelRule("targets", "list", ("T", "T1", "T2")) in \
+        saved.label_check.label_rules
+
+
+def test_running_a_check_saves_nothing(dlg, corpus, monkeypatch):
+    """Saving is the user's explicit choice, never a side effect."""
+    from PyQt6.QtWidgets import QMessageBox
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(
+        lambda *a, **k: None))
+    _rule(dlg, "targets", "list", "T")
+    dlg._run()
+    assert not os.path.exists(cp.profile_path(corpus))
+
+
+def test_the_status_says_when_there_is_no_profile(dlg):
+    assert "none saved yet" in dlg._profile_status.text()
+
+
+def test_the_status_tracks_unsaved_changes(dlg):
+    dlg._save_to_corpus()
+    assert "saved with this corpus" in dlg._profile_status.text()
+    _rule(dlg, "targets", "list", "T")
+    assert "unsaved changes" in dlg._profile_status.text()
+    dlg._save_to_corpus()
+    assert "saved with this corpus" in dlg._profile_status.text()
+
+
+def test_a_list_with_no_labels_is_refused_at_run(dlg, monkeypatch):
+    from PyQt6.QtWidgets import QMessageBox
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(
+        lambda *a, **k: warned.append(a)))
+    _rule(dlg, "targets", "list", "")
+    dlg._run()
+    assert warned and "targets" in warned[0][2]
+
+
+def test_a_broken_profile_is_reported_not_overwritten(
+        qapp, corpus, monkeypatch):
+    from PyQt6.QtWidgets import QMessageBox
+    path = cp.profile_path(corpus)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("{broken")
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(
+        lambda *a, **k: warned.append(a)))
+    d = _LabelCheckDialog(corpus)
+    assert warned
+    assert "unreadable" in d._profile_status.text()
+    assert open(path, encoding="utf-8").read() == "{broken"
+
+
+def test_a_profile_can_be_loaded_from_another_corpus(
+        dlg, tmp_path, monkeypatch):
+    from PyQt6.QtWidgets import QFileDialog
+    other = tmp_path / "elsewhere.json"
+    CorpusProfile(non_speech_labels=("<sil>",)).save(str(other))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(
+        lambda *a, **k: (str(other), "")))
+    dlg._load_profile_from()
+    assert dlg._non_speech_labels() == ("<sil>",)
+
+
+def test_save_as_writes_the_settings_on_screen(dlg, tmp_path, monkeypatch):
+    from PyQt6.QtWidgets import QFileDialog
+    target = tmp_path / "shared.json"
+    dlg._non_speech_edit.setText("-, <noise>")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(
+        lambda *a, **k: (str(target), "")))
+    dlg._save_profile_as()
+    assert CorpusProfile.load(str(target)) == dlg.profile()
+
+
+def test_a_loaded_profile_is_not_an_unsaved_change(qapp, corpus):
+    """Settings the file leaves open, like the reference tier, are filled
+    in on screen; that alone must not read as unsaved."""
+    CorpusProfile().with_label_check(
+        label_rules=(cp.LabelRule("targets", "list", ("T",)),)
+    ).save_to_folder(corpus)
+    d = _LabelCheckDialog(corpus)
+    assert "saved with this corpus" in d._profile_status.text()

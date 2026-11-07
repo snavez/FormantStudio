@@ -22,6 +22,9 @@ from collections import namedtuple
 # combination: "-" against a label is an insertion, "-" against "-" is a stretch
 # with nothing to analyse.
 EMPTY = "-"
+# Every label that means EMPTY.  A corpus may name several (see
+# ``corpus_profile``); the functions below take them as *empty*.
+EMPTIES = (EMPTY,)
 
 ABSORB_RIGHT = ">"
 ABSORB_LEFT = "<"
@@ -49,26 +52,27 @@ def _text(interval):
     return interval[2].strip()
 
 
-def is_empty(label):
+def is_empty(label, empty=EMPTIES):
     """True if *label* deliberately marks an interval as having no content."""
-    return label.strip() == EMPTY
+    return label.strip() in empty
 
 
 def is_arrow(label):
     return label.strip() in ARROWS
 
 
-def is_anchor(label):
+def is_anchor(label, empty=EMPTIES):
     """True if *label* is a realised sound rather than a marker or a blank."""
     t = label.strip()
-    return bool(t) and t not in ARROWS and t != EMPTY
+    return bool(t) and t not in ARROWS and t not in empty
 
 
-def validate(phonemes, allophones):
+def validate(phonemes, allophones, empty=EMPTIES):
     """Return a list of problems with a phoneme/allophone tier pair.
 
     An empty list means the annotation is structurally sound. Problems are
     reported rather than raised so a caller can show all of them at once.
+    *empty* are the labels that mean EMPTY.
     """
     problems = []
 
@@ -101,9 +105,9 @@ def validate(phonemes, allophones):
             j = i + step
             while 0 <= j < len(labels):
                 other = labels[j]
-                if is_anchor(other):
+                if is_anchor(other, empty):
                     break
-                if other == EMPTY or not other:
+                if other in empty or not other:
                     problems.append(
                         f"interval {i + 1}: '{lab}' cannot reach a sound — "
                         f"interval {j + 1} has nothing in it")
@@ -138,11 +142,12 @@ def _extent(allophones, index):
     return allophones[start][0], allophones[end][1]
 
 
-def resolve(phonemes, allophones):
+def resolve(phonemes, allophones, empty=EMPTIES):
     """One :class:`Divergence` per expected sound.
 
     *phonemes* and *allophones* are sequences of ``(xmin, xmax, label)``. Their
     boundaries must match; call :func:`validate` first if that is not certain.
+    *empty* are the labels that mean EMPTY.
     """
     if len(phonemes) != len(allophones):
         raise AnnotationError(
@@ -152,16 +157,16 @@ def resolve(phonemes, allophones):
     for i, (p, a) in enumerate(zip(phonemes, allophones)):
         expected, realised = _text(p), _text(a)
 
-        if is_empty(expected) and is_empty(realised):
+        if is_empty(expected, empty) and is_empty(realised, empty):
             # Nothing was expected and nothing produced: a pause or a stretch
             # deliberately left out of the analysis.
             kind, xmin, xmax = NOT_ANALYSED, p[0], p[1]
-        elif is_arrow(realised) or (expected and is_empty(realised)):
+        elif is_arrow(realised) or (expected and is_empty(realised, empty)):
             # Expected but not produced. An arrow says a neighbour took its
             # time; a "-" says nothing analysable is there. Either way the
             # sound has no span of its own, so there is nothing to measure.
             kind, xmin, xmax = DELETION, None, None
-        elif is_empty(expected) and is_anchor(realised):
+        elif is_empty(expected, empty) and is_anchor(realised, empty):
             kind, (xmin, xmax) = INSERTION, _extent(allophones, i)
         elif not expected or not realised:
             kind, xmin, xmax = UNANNOTATED, p[0], p[1]
